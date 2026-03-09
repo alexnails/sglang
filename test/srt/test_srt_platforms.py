@@ -15,7 +15,19 @@ class TestPlatformEnums(unittest.TestCase):
     def test_platform_enum_members(self):
         from sglang.platforms.interface import PlatformEnum
 
-        for name in ("CUDA", "ROCM", "CPU", "NPU", "XPU", "MUSA", "HPU", "MPS", "TPU", "OOT", "UNSPECIFIED"):
+        for name in (
+            "CUDA",
+            "ROCM",
+            "CPU",
+            "NPU",
+            "XPU",
+            "MUSA",
+            "HPU",
+            "MPS",
+            "TPU",
+            "OOT",
+            "UNSPECIFIED",
+        ):
             self.assertTrue(hasattr(PlatformEnum, name))
 
     def test_cpu_arch_enum(self):
@@ -82,7 +94,9 @@ class TestDiscoverPlatforms(unittest.TestCase):
 
         mod._discovered = None
 
-        env = {"SGLANG_PLATFORM_PLUGIN": "mydev:sglang.srt.platforms.cpu.CPUSRTPlatform"}
+        env = {
+            "SGLANG_PLATFORM_PLUGIN": "mydev:sglang.srt.platforms.cpu.CPUSRTPlatform"
+        }
         with patch.dict(os.environ, env):
             from sglang.srt.platforms import discover_platforms
             from sglang.srt.platforms.cpu import CPUSRTPlatform
@@ -160,10 +174,7 @@ class TestCPUSRTPlatform(unittest.TestCase):
         self.assertEqual(self.plat.get_distributed_backend(), "gloo")
 
     def test_graph_runner_class(self):
-        try:
-            cls = self.plat.get_graph_runner_class()
-        except ImportError:
-            self.skipTest("CPUGraphRunner deps (triton, etc.) not available")
+        cls = self.plat.get_graph_runner_class()
         from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 
         self.assertIs(cls, CPUGraphRunner)

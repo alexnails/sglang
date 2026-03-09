@@ -49,7 +49,6 @@ from sglang.srt.utils import (
     get_int_env_var,
     get_local_ip_auto,
     is_cpu,
-    is_cuda_alike,
     is_hip,
     is_musa,
     is_npu,

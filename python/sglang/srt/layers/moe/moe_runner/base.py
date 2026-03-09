@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Optional, Tuple, TypeGuard
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, TypeGuard
 
 import torch
 
@@ -74,6 +74,26 @@ class MoeQuantInfo(ABC):
     """Moe quantization data."""
 
     pass
+
+
+@dataclass
+class TritonMoeQuantInfo(MoeQuantInfo):
+    w13_weight: torch.Tensor
+    w2_weight: torch.Tensor
+    b13: Optional[torch.Tensor] = None
+    b2: Optional[torch.Tensor] = None
+    use_fp8_w8a8: bool = False
+    use_int8_w8a8: bool = False
+    use_int8_w8a16: bool = False
+    use_int4_w4a16: bool = False
+    per_channel_quant: bool = False
+    w13_scale: Optional[torch.Tensor] = None
+    w2_scale: Optional[torch.Tensor] = None
+    w13_zp: Optional[torch.Tensor] = None
+    w2_zp: Optional[torch.Tensor] = None
+    a13_scale: Optional[torch.Tensor] = None
+    a2_scale: Optional[torch.Tensor] = None
+    block_shape: Optional[List[int]] = None
 
 
 class MoeRunnerCore(ABC):

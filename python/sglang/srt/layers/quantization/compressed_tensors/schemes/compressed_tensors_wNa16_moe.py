@@ -453,7 +453,7 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
         layer: torch.nn.Module,
         dispatch_output: "StandardDispatchOutput",
     ) -> "CombineInput":
-        from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+        from sglang.srt.layers.moe.moe_runner.base import TritonMoeQuantInfo
 
         assert (
             self.moe_runner_config.activation == "silu"

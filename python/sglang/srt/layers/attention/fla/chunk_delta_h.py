@@ -8,6 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.attention.fla.common import FLA_CHUNK_SIZE as CHUNK_SIZE
 from sglang.srt.layers.attention.fla.index import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
@@ -16,7 +17,6 @@ from sglang.srt.layers.attention.fla.op import exp, safe_exp
 from sglang.srt.layers.attention.fla.utils import is_nvidia_hopper
 
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
-CHUNK_SIZE = 64
 
 
 # @triton.autotune(

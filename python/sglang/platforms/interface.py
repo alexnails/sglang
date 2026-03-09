@@ -11,7 +11,6 @@ import enum
 import platform as _platform
 import random
 from abc import ABC
-from functools import lru_cache
 from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
@@ -155,9 +154,7 @@ class BasePlatform(ABC):
         """Return ``(free_bytes, total_bytes)``."""
         raise NotImplementedError
 
-    def get_current_memory_usage(
-        self, device: torch.device | None = None
-    ) -> float:
+    def get_current_memory_usage(self, device: torch.device | None = None) -> float:
         """Return current memory usage in bytes."""
         raise NotImplementedError
 

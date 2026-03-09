@@ -100,9 +100,7 @@ class SRTPlatform(BasePlatform):
     # Quantization
     # ------------------------------------------------------------------
 
-    def get_quant_method_override(
-        self, quant_name: str, layer: Any
-    ) -> Any | None:
+    def get_quant_method_override(self, quant_name: str, layer: Any) -> Any | None:
         """Return a platform-specific quant method, or ``None`` for default."""
         return None
 
@@ -116,7 +114,10 @@ class SRTPlatform(BasePlatform):
     def get_profiler_activities(self) -> list:
         import torch.profiler
 
-        return [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+        return [
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
 
     # ------------------------------------------------------------------
     # Registry hooks

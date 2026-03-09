@@ -24,7 +24,6 @@ import os
 import socket
 import threading
 import time
-from collections import defaultdict
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple, Union
 
@@ -120,7 +119,6 @@ from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.cuda_graph_runner import (
-    CudaGraphRunner,
     DecodeInputBuffers,
     set_torch_compile_config,
 )

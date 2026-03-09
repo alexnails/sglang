@@ -10,7 +10,7 @@ from sglang.platforms.interface import DeviceCapability, PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
 
 if TYPE_CHECKING:
-    from sglang.srt.server_args import ServerArgs
+    pass
 
 
 class CUDASRTPlatform(SRTPlatform):
@@ -57,9 +57,7 @@ class CUDASRTPlatform(SRTPlatform):
     def get_available_memory(self, device_id: int = 0) -> tuple[int, int]:
         return torch.cuda.mem_get_info(device_id)
 
-    def get_current_memory_usage(
-        self, device: torch.device | None = None
-    ) -> float:
+    def get_current_memory_usage(self, device: torch.device | None = None) -> float:
         torch.cuda.reset_peak_memory_stats()
         return torch.cuda.max_memory_allocated(device)
 

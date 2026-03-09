@@ -10,8 +10,6 @@ from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Tuple, Union
 import numpy
 import torch
 
-from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
-
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
@@ -154,6 +152,8 @@ def requantize_with_max_scale(
         for idx, logical_width in enumerate(logical_widths):
             end = start + logical_width
             weight_dq = per_tensor_dequantize(weight[start:end, :], weight_scale[idx])
+            from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
+
             weight[start:end, :], _ = scaled_fp8_quant(weight_dq, max_w_scale)
             start = end
 

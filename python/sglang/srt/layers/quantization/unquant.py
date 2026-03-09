@@ -16,7 +16,6 @@ from sglang.srt.layers.moe import (
     MoeRunnerConfig,
     get_moe_runner_backend,
 )
-from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     LinearMethodBase,
@@ -438,6 +437,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 )
                 return StandardCombineInput(hidden_states=output)
             else:
+                from sglang.srt.layers.moe.moe_runner.base import (
+                    TritonMoeQuantInfo,
+                )
+
                 quant_info = TritonMoeQuantInfo(
                     w13_weight=layer.w13_weight,
                     w2_weight=layer.w2_weight,
@@ -535,6 +538,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 moe_runner_config.activation == "silu"
             ), f"activation = {moe_runner_config.activation} is not supported \
             for Triton PATH, please set ENV SGLANG_USE_SGL_XPU=1."
+
+            from sglang.srt.layers.moe.moe_runner.base import (
+                TritonMoeQuantInfo,
+            )
 
             quant_info = TritonMoeQuantInfo(
                 w13_weight=layer.w13_weight,

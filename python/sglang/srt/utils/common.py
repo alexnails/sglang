@@ -81,7 +81,6 @@ import requests
 import torch
 import torch.distributed
 import torch.distributed as dist
-import triton
 import zmq
 from packaging import version as pkg_version
 from PIL import Image
@@ -1521,7 +1520,12 @@ def dump_to_file(dirpath, name, value):
 
 
 def is_triton_3():
-    return triton.__version__.startswith("3.")
+    try:
+        import triton
+
+        return triton.__version__.startswith("3.")
+    except ImportError:
+        return False
 
 
 def maybe_torch_compile(*args, **kwargs):
@@ -2768,7 +2772,12 @@ def round_up(x: int, y: int) -> int:
     return ((x - 1) // y + 1) * y
 
 
-setattr(triton, "next_power_of_2", next_power_of_2)
+try:
+    import triton as _triton_for_patch
+
+    setattr(_triton_for_patch, "next_power_of_2", next_power_of_2)
+except ImportError:
+    pass
 
 
 class EmptyContextManager:
@@ -3920,6 +3929,8 @@ class CachedKernel:
     """
 
     def __init__(self, fn, key_fn=None):
+        import triton
+
         self.fn = fn
         assert isinstance(fn, triton.runtime.jit.JITFunction)
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import builtins
+import importlib
 import inspect
 from typing import TYPE_CHECKING, Dict, Optional, Type
 
@@ -16,86 +17,146 @@ class DummyConfig:
 
 CompressedTensorsConfig = DummyConfig
 
-from sglang.srt.layers.quantization.auto_round import AutoRoundConfig
-from sglang.srt.layers.quantization.awq import AWQConfig, AWQMarlinConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.quantization.bitsandbytes import BitsAndBytesConfig
-from sglang.srt.layers.quantization.blockwise_int8 import BlockInt8Config
-from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
-    CompressedTensorsConfig,
-)
-from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.layers.quantization.fpgemm_fp8 import FBGEMMFp8Config
-from sglang.srt.layers.quantization.gguf import GGUFConfig
-from sglang.srt.layers.quantization.gptq import GPTQConfig, GPTQMarlinConfig
-from sglang.srt.layers.quantization.modelopt_quant import (
-    ModelOptFp4Config,
-    ModelOptFp8Config,
-)
-from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
-from sglang.srt.layers.quantization.moe_wna16 import MoeWNA16Config
-from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
-from sglang.srt.layers.quantization.petit import PetitNvFp4Config
-from sglang.srt.layers.quantization.qoq import QoQConfig
-from sglang.srt.layers.quantization.quark.quark import QuarkConfig
-from sglang.srt.layers.quantization.quark_int4fp8_moe import QuarkInt4Fp8Config
-from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
-from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
-from sglang.srt.layers.quantization.w8a8_int8 import W8A8Int8Config
-from sglang.srt.utils import is_cuda, is_hip, is_npu, mxfp_supported
-
-_is_mxfp_supported = mxfp_supported()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.topk import TopKOutput
 
-# Base quantization methods
-BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
-    "fp8": Fp8Config,
-    "mxfp8": Fp8Config,
-    "blockwise_int8": BlockInt8Config,
-    "modelopt": ModelOptFp8Config,  # Auto-detect, defaults to FP8
-    "modelopt_fp8": ModelOptFp8Config,
-    "modelopt_fp4": ModelOptFp4Config,
-    "w8a8_int8": W8A8Int8Config,
-    "w8a8_fp8": W8A8Fp8Config,
-    "awq": AWQConfig,
-    "awq_marlin": AWQMarlinConfig,
-    "bitsandbytes": BitsAndBytesConfig,
-    "gguf": GGUFConfig,
-    "gptq": GPTQConfig,
-    "gptq_marlin": GPTQMarlinConfig,
-    "moe_wna16": MoeWNA16Config,
-    "compressed-tensors": CompressedTensorsConfig,
-    "qoq": QoQConfig,
-    "w4afp8": W4AFp8Config,
-    "petit_nvfp4": PetitNvFp4Config,
-    "fbgemm_fp8": FBGEMMFp8Config,
-    "quark": QuarkConfig,
-    "auto-round": AutoRoundConfig,
-    "modelslim": ModelSlimConfig,
-    "quark_int4fp8_moe": QuarkInt4Fp8Config,
+# Lazy quantization config registry: maps method name -> (module_path, class_name)
+# Configs are only imported when get_quantization_config() is called.
+_LAZY_QUANTIZATION_METHODS: Dict[str, tuple[str, str]] = {
+    "fp8": ("sglang.srt.layers.quantization.fp8", "Fp8Config"),
+    "mxfp8": ("sglang.srt.layers.quantization.fp8", "Fp8Config"),
+    "blockwise_int8": (
+        "sglang.srt.layers.quantization.blockwise_int8",
+        "BlockInt8Config",
+    ),
+    "modelopt": (
+        "sglang.srt.layers.quantization.modelopt_quant",
+        "ModelOptFp8Config",
+    ),
+    "modelopt_fp8": (
+        "sglang.srt.layers.quantization.modelopt_quant",
+        "ModelOptFp8Config",
+    ),
+    "modelopt_fp4": (
+        "sglang.srt.layers.quantization.modelopt_quant",
+        "ModelOptFp4Config",
+    ),
+    "w8a8_int8": ("sglang.srt.layers.quantization.w8a8_int8", "W8A8Int8Config"),
+    "w8a8_fp8": ("sglang.srt.layers.quantization.w8a8_fp8", "W8A8Fp8Config"),
+    "awq": ("sglang.srt.layers.quantization.awq", "AWQConfig"),
+    "awq_marlin": ("sglang.srt.layers.quantization.awq", "AWQMarlinConfig"),
+    "bitsandbytes": (
+        "sglang.srt.layers.quantization.bitsandbytes",
+        "BitsAndBytesConfig",
+    ),
+    "gguf": ("sglang.srt.layers.quantization.gguf", "GGUFConfig"),
+    "gptq": ("sglang.srt.layers.quantization.gptq", "GPTQConfig"),
+    "gptq_marlin": ("sglang.srt.layers.quantization.gptq", "GPTQMarlinConfig"),
+    "moe_wna16": ("sglang.srt.layers.quantization.moe_wna16", "MoeWNA16Config"),
+    "compressed-tensors": (
+        "sglang.srt.layers.quantization.compressed_tensors.compressed_tensors",
+        "CompressedTensorsConfig",
+    ),
+    "qoq": ("sglang.srt.layers.quantization.qoq", "QoQConfig"),
+    "w4afp8": ("sglang.srt.layers.quantization.w4afp8", "W4AFp8Config"),
+    "petit_nvfp4": ("sglang.srt.layers.quantization.petit", "PetitNvFp4Config"),
+    "fbgemm_fp8": ("sglang.srt.layers.quantization.fpgemm_fp8", "FBGEMMFp8Config"),
+    "quark": ("sglang.srt.layers.quantization.quark.quark", "QuarkConfig"),
+    "auto-round": ("sglang.srt.layers.quantization.auto_round", "AutoRoundConfig"),
+    "modelslim": (
+        "sglang.srt.layers.quantization.modelslim.modelslim",
+        "ModelSlimConfig",
+    ),
+    "quark_int4fp8_moe": (
+        "sglang.srt.layers.quantization.quark_int4fp8_moe",
+        "QuarkInt4Fp8Config",
+    ),
+    "mxfp4": ("sglang.srt.layers.quantization.mxfp4", "Mxfp4Config"),
 }
 
+_resolved_cache: Dict[str, Type[QuantizationConfig]] = {}
 
-if is_cuda() or (_is_mxfp_supported and is_hip()):
-    BASE_QUANTIZATION_METHODS.update(
-        {
-            "mxfp4": Mxfp4Config,
-        }
-    )
 
-QUANTIZATION_METHODS = {**BASE_QUANTIZATION_METHODS}
+def _resolve(method: str) -> Type[QuantizationConfig]:
+    if method in _resolved_cache:
+        return _resolved_cache[method]
+    if method not in _LAZY_QUANTIZATION_METHODS:
+        raise ValueError(
+            f"Invalid quantization method: {method}. "
+            f"Available methods: {list(_LAZY_QUANTIZATION_METHODS.keys())}"
+        )
+    module_path, class_name = _LAZY_QUANTIZATION_METHODS[method]
+    mod = importlib.import_module(module_path)
+    cls = getattr(mod, class_name)
+    _resolved_cache[method] = cls
+    return cls
 
 
 def get_quantization_config(quantization: str) -> Type[QuantizationConfig]:
-    if quantization not in QUANTIZATION_METHODS:
-        raise ValueError(
-            f"Invalid quantization method: {quantization}. "
-            f"Available methods: {list(QUANTIZATION_METHODS.keys())}"
-        )
+    return _resolve(quantization)
 
-    return QUANTIZATION_METHODS[quantization]
+
+# Backwards-compat: some code does `from sglang.srt.layers.quantization import Fp8Config`
+# We support that via __getattr__ lazy loading.
+_ATTR_TO_METHOD = {
+    "Fp8Config": "fp8",
+    "BlockInt8Config": "blockwise_int8",
+    "ModelOptFp8Config": "modelopt_fp8",
+    "ModelOptFp4Config": "modelopt_fp4",
+    "W8A8Int8Config": "w8a8_int8",
+    "W8A8Fp8Config": "w8a8_fp8",
+    "AWQConfig": "awq",
+    "AWQMarlinConfig": "awq_marlin",
+    "BitsAndBytesConfig": "bitsandbytes",
+    "GGUFConfig": "gguf",
+    "GPTQConfig": "gptq",
+    "GPTQMarlinConfig": "gptq_marlin",
+    "MoeWNA16Config": "moe_wna16",
+    "CompressedTensorsConfig": "compressed-tensors",
+    "QoQConfig": "qoq",
+    "W4AFp8Config": "w4afp8",
+    "PetitNvFp4Config": "petit_nvfp4",
+    "FBGEMMFp8Config": "fbgemm_fp8",
+    "QuarkConfig": "quark",
+    "AutoRoundConfig": "auto-round",
+    "ModelSlimConfig": "modelslim",
+    "QuarkInt4Fp8Config": "quark_int4fp8_moe",
+    "Mxfp4Config": "mxfp4",
+}
+
+
+def __getattr__(name: str):
+    if name in _ATTR_TO_METHOD:
+        return _resolve(_ATTR_TO_METHOD[name])
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+# Keep QUANTIZATION_METHODS as a lazy-resolving dict for backwards compat
+class _LazyQuantDict(dict):
+    def __missing__(self, key):
+        if key in _LAZY_QUANTIZATION_METHODS:
+            cls = _resolve(key)
+            self[key] = cls
+            return cls
+        raise KeyError(key)
+
+    def __contains__(self, key):
+        return key in _LAZY_QUANTIZATION_METHODS or super().__contains__(key)
+
+    def keys(self):
+        return _LAZY_QUANTIZATION_METHODS.keys()
+
+    def items(self):
+        return ((k, self[k]) for k in _LAZY_QUANTIZATION_METHODS)
+
+    def values(self):
+        return (self[k] for k in _LAZY_QUANTIZATION_METHODS)
+
+
+QUANTIZATION_METHODS = _LazyQuantDict()
+BASE_QUANTIZATION_METHODS = QUANTIZATION_METHODS
 
 
 original_isinstance = builtins.isinstance

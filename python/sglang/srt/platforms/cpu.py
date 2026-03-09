@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING
 
 import psutil
@@ -61,9 +60,7 @@ class CPUSRTPlatform(SRTPlatform):
         total = mem.total // max(n_numa, 1)
         return (free, total)
 
-    def get_current_memory_usage(
-        self, device: torch.device | None = None
-    ) -> float:
+    def get_current_memory_usage(self, device: torch.device | None = None) -> float:
         return 0.0
 
     # ------------------------------------------------------------------

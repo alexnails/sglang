@@ -9,9 +9,6 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
     PermuteMethodPool,
 )
-from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmRunnerCore
-from sglang.srt.layers.moe.moe_runner.triton import TritonRunnerCore
-from sglang.srt.layers.moe.moe_runner.triton_kernels import TritonKernelsRunnerCore
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
 if TYPE_CHECKING:
@@ -32,10 +29,18 @@ class MoeRunner:
         self.fused_func = None
 
         if runner_backend.is_triton():
+            from sglang.srt.layers.moe.moe_runner.triton import TritonRunnerCore
+
             self.runner_core = TritonRunnerCore(config)
         elif runner_backend.is_triton_kernels():
+            from sglang.srt.layers.moe.moe_runner.triton_kernels import (
+                TritonKernelsRunnerCore,
+            )
+
             self.runner_core = TritonKernelsRunnerCore(config)
         elif runner_backend.is_deep_gemm():
+            from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmRunnerCore
+
             self.runner_core = DeepGemmRunnerCore(config)
         elif runner_backend.is_marlin():
             self.runner_core = None  # Marlin only supports fused path
