@@ -89,7 +89,6 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
-from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
@@ -120,7 +119,6 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import (
     CudaGraphRunner,
     DecodeInputBuffers,
@@ -310,6 +308,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Parse args
         self.mem_fraction_static = mem_fraction_static
         self.device = server_args.device
+        from sglang.srt.platforms import get_platform
+
+        self.platform = get_platform(self.device)
         self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.tp_size = tp_size
@@ -2180,29 +2181,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         tic = time.perf_counter()
         before_mem = get_available_gpu_memory(self.device, self.gpu_id)
-        graph_backend = defaultdict(
-            lambda: "cuda graph",
-            {
-                "cpu": "cpu graph",
-                "npu": "npu graph",
-            },
-        )
+        graph_backend_name = self.platform.graph_backend_name
         logger.info(
-            f"Capture {graph_backend[self.device]} begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
+            f"Capture {graph_backend_name} begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
         )
-        graph_runners = defaultdict(
-            lambda: CudaGraphRunner,
-            {
-                "cpu": CPUGraphRunner,
-                "npu": NPUGraphRunner,
-            },
-        )
-        self.graph_runner = graph_runners[self.device](self)
+        graph_runner_cls = self.platform.get_graph_runner_class()
+        self.graph_runner = graph_runner_cls(self)
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         self.graph_mem_usage = before_mem - after_mem
         logger.info(
-            f"Capture {graph_backend[self.device]} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
+            f"Capture {graph_backend_name} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
             f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
         )
 

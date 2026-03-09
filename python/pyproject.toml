@@ -166,6 +166,8 @@ vsa = ["torch", "setuptools"]
 [project.scripts]
 sglang = "sglang.cli.main:main"
 
+[project.entry-points."sglang.platforms"]
+
 [tool.setuptools.package-data]
 "sglang" = [
   "srt/**/*",

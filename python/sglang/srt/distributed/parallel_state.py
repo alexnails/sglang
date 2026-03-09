@@ -260,19 +260,9 @@ class GroupCoordinator:
         self.cpu_group = None
         self.local_size = get_int_env_var("LOCAL_SIZE", 0)
 
-        if is_cuda_alike():
-            device_id = (
-                0 if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() else local_rank
-            )
-            self.device = torch.device(f"cuda:{device_id}")
-        elif _is_npu:
-            self.device = torch.device(f"npu:{local_rank}")
-        elif _is_xpu:
-            self.device = torch.device(f"xpu:{local_rank}")
-        elif _is_musa:
-            self.device = torch.device(f"musa:{local_rank}")
-        else:
-            self.device = torch.device("cpu")
+        from sglang.srt.platforms import current_platform
+
+        self.device = current_platform.get_device(local_rank)
         self.device_module = torch.get_device_module(self.device)
 
         for ranks in group_ranks:

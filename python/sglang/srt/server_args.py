@@ -745,7 +745,9 @@ class ServerArgs:
 
         # Handle device-specific backends.
         self._handle_hpu_backends()
-        self._handle_cpu_backends()
+        from sglang.srt.platforms import get_platform
+
+        get_platform(self.device).configure_server_args(self)
         self._handle_npu_backends()
 
         # Handle piecewise CUDA graph.
