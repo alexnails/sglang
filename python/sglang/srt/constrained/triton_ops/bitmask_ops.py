@@ -4,13 +4,12 @@
 from typing import List, Optional, Union
 
 import torch
-import triton
-import triton.language as tl
 
 from sglang.srt.utils import get_device_core_count
+from sglang.srt.utils.triton_compat import tl, triton, triton_jit
 
 
-@triton.jit
+@triton_jit
 def apply_token_bitmask_inplace_kernel(
     logits_ptr,
     bitmask_ptr,

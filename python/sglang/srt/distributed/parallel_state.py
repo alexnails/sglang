@@ -88,7 +88,7 @@ def get_torch_distributed_pg_options(group_name=None):
 
 @dataclass
 class GraphCaptureContext:
-    stream: torch.get_device_module().Stream
+    stream: Any
 
 
 @dataclass

@@ -560,9 +560,13 @@ def get_available_gpu_memory(
         free_gpu_memory, total_gpu_memory = torch.hpu.mem_get_info()
 
     elif device == "cpu":
-        # TODO: rename the variables in the current function to be not GPU specific
         total_free_memory = psutil.virtual_memory().available
-        n_numa_node: int = len(get_cpu_ids_by_node())
+        try:
+            n_numa_node = len(get_cpu_ids_by_node())
+        except (RuntimeError, OSError, AttributeError):
+            n_numa_node = 0
+        if n_numa_node == 0:
+            n_numa_node = 1
         free_gpu_memory = round(total_free_memory / n_numa_node, 3)
     elif device == "npu":
         num_gpus = torch.npu.device_count()
@@ -1841,9 +1845,12 @@ def get_cpu_memory_capacity():
     # Per-rank memory capacity cannot be determined for customized core settings
     if os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", ""):
         return None
-    n_numa_node: int = len(get_cpu_ids_by_node())
+    try:
+        n_numa_node: int = len(get_cpu_ids_by_node())
+    except (RuntimeError, OSError, AttributeError):
+        n_numa_node = 0
     if n_numa_node == 0:
-        # Cannot determine NUMA config, fallback to total memory and avoid ZeroDivisionError.
+        # Cannot determine NUMA config (or non-Linux), fallback to total memory.
         return float(psutil.virtual_memory().total // (1 << 20))
     try:
         numa_mem_list = list()
@@ -3418,8 +3425,11 @@ def ceil_div(x: int, y: int) -> int:
 
 
 def parse_lscpu_topology():
+    if sys.platform != "linux":
+        raise RuntimeError(
+            f"parse_lscpu_topology() requires Linux (current platform: {sys.platform})"
+        )
     try:
-        # Get CPU topology: CPU,Core,Socket,Node
         output = subprocess.check_output(
             ["lscpu", "-p=CPU,Core,Socket,Node"], text=True
         )

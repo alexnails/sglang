@@ -13,6 +13,7 @@
 # ==============================================================================
 """A scheduler that manages a tensor parallel GPU worker."""
 
+import contextlib
 import faulthandler
 import logging
 import os
@@ -1231,7 +1232,12 @@ class Scheduler(
         self.schedule_stream = self.device_module.Stream(priority=0)
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
-        with CudaStreamContext(self.schedule_stream):
+        stream_ctx = (
+            contextlib.nullcontext()
+            if self.device == "cpu"
+            else CudaStreamContext(self.schedule_stream)
+        )
+        with stream_ctx:
             dispatch_event_loop(self)
 
     @DynamicGradMode()

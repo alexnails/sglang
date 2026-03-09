@@ -313,5 +313,51 @@ class TestBasePlatformDetection(unittest.TestCase):
         self.assertIn(arch, list(CpuArchEnum))
 
 
+class TestCPUImportChain(unittest.TestCase):
+    """Validate that the CPU startup path imports without GPU packages."""
+
+    def test_critical_modules_import_without_gpu_packages(self):
+        """Engine, Scheduler, ModelRunner, CPUGraphRunner should all be
+        importable when triton/flashinfer/sgl_kernel are absent.
+
+        Uses a subprocess to get a fresh Python process where no modules
+        are pre-imported and the env var takes effect before any module
+        evaluation.
+        """
+        import subprocess
+        import sys
+
+        script = """
+import builtins, sys
+real_import = builtins.__import__
+blocked = {"triton", "flashinfer", "sgl_kernel", "vllm", "deep_gemm"}
+def blocking_import(name, *args, **kwargs):
+    if name.split(".")[0] in blocked:
+        raise ImportError(f"{name} blocked for test")
+    return real_import(name, *args, **kwargs)
+builtins.__import__ = blocking_import
+from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
+from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.entrypoints.engine import Engine
+print("OK")
+"""
+        env = os.environ.copy()
+        env["SGLANG_USE_CPU_ENGINE"] = "1"
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"Import chain failed:\n{result.stderr}",
+        )
+        self.assertIn("OK", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -782,11 +782,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if not self.is_draft_worker:
             if self.device == "cpu":
-                if _is_cpu_amx_available or _is_cpu_arm64:
-                    # Bind OpenMP threads to CPU cores
+                _has_cpu_ops = hasattr(torch.ops, "sgl_kernel") and hasattr(
+                    torch.ops.sgl_kernel, "init_cpu_threads_env"
+                )
+                if (_is_cpu_amx_available or _is_cpu_arm64) and _has_cpu_ops:
                     torch.ops.sgl_kernel.init_cpu_threads_env(self.local_omp_cpuid)
 
-                    # Set local size to hint SGLang to use shared memory based AllReduce
                     os.environ["LOCAL_SIZE"] = str(self.tp_size)
                     torch.ops.sgl_kernel.initialize(self.tp_size, self.tp_rank)
 
@@ -795,9 +796,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         return torch.cat([data] * self.tp_size, dim=dim)
 
                 else:
-                    logger.warning(
-                        "init_cpu_threads_env and shared memory based AllReduce is disabled, only intel amx backend and arm64 are supported"
-                    )
+                    if not _has_cpu_ops:
+                        logger.warning(
+                            "sgl_kernel CPU ops not available; skipping thread binding and shared-memory AllReduce."
+                        )
+                    else:
+                        logger.warning(
+                            "init_cpu_threads_env and shared memory based AllReduce is disabled, only intel amx backend and arm64 are supported"
+                        )
 
             # Only initialize the distributed environment on the target model worker.
             init_distributed_environment(
@@ -2284,8 +2290,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     def init_threads_binding(self):
         omp_cpuids = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "all")
-        cpu_ids_by_node = get_cpu_ids_by_node()
-        n_numa_node = len(cpu_ids_by_node)
+
+        try:
+            cpu_ids_by_node = get_cpu_ids_by_node()
+            n_numa_node = len(cpu_ids_by_node)
+        except (RuntimeError, OSError, AttributeError):
+            cpu_ids_by_node = None
+            n_numa_node = 0
+
+        if cpu_ids_by_node is None or n_numa_node == 0:
+            import multiprocessing
+
+            n_cpus = multiprocessing.cpu_count()
+            self.local_omp_cpuid = ",".join(str(i) for i in range(n_cpus))
+            logger.info(
+                f"NUMA detection unavailable (non-Linux); binding to all {n_cpus} CPUs."
+            )
+            return
+
         if omp_cpuids == "all":
             assert self.tp_size <= n_numa_node, (
                 f"SGLANG_CPU_OMP_THREADS_BIND is not set, in this case, "
