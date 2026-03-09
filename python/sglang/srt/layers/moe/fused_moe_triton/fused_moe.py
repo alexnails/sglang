@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import torch.nn.functional as F
-import triton.language as tl
 
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.utils import (
@@ -24,6 +23,7 @@ from sglang.srt.utils import (
     use_intel_xpu_backend,
 )
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.utils.triton_compat import tl
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
 from .fused_moe_triton_kernels import (

@@ -20,12 +20,12 @@ from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-import triton
-import triton.language as tl
+
+from sglang.srt.utils.triton_compat import tl, triton, triton_jit
 
 try:
     from triton.tools.tensor_descriptor import TensorDescriptor
-except:
+except Exception:
     pass
 
 from sglang.srt.layers import deep_gemm_wrapper
@@ -120,7 +120,7 @@ def deep_gemm_fp8_fp8_bf16_nt(
     deep_gemm_wrapper.gemm_nt_f8f8bf16((A, As), (B, Bs), C)
 
 
-@triton.jit
+@triton_jit
 def _per_token_group_quant_8bit(
     # Pointers to inputs and output
     y_ptr,
@@ -163,7 +163,7 @@ def _per_token_group_quant_8bit(
     tl.store(y_s_ptr, y_s)
 
 
-@triton.jit
+@triton_jit
 def _per_token_group_quant_8bit_colmajor(
     # Pointers to inputs and output
     y_ptr,
@@ -603,7 +603,7 @@ def sglang_per_token_quant_fp8(
     return x_q, x_s
 
 
-@triton.jit
+@triton_jit
 def _static_quant_fp8(
     # Pointers to inputs and output
     y_ptr,
@@ -702,7 +702,7 @@ def static_quant_fp8(
     return x_q, x_s
 
 
-@triton.jit
+@triton_jit
 def _w8a8_block_fp8_matmul(
     # Pointers to inputs and output
     A,
@@ -793,7 +793,7 @@ def _w8a8_block_fp8_matmul(
     tl.store(c_ptrs, c, mask=c_mask)
 
 
-@triton.jit
+@triton_jit
 def _w8a8_block_fp8_matmul_unrolledx4(
     # Pointers to inputs and output
     A,
@@ -1208,7 +1208,7 @@ def w8a8_block_fp8_matmul(
 
 
 # Copied and adapted from https://github.com/triton-lang/triton/blob/main/python/tutorials/10-block-scaled-matmul.py
-@triton.jit
+@triton_jit
 def _mxfp8_block_scaled_matmul_kernel(  #
     a_desc,  #
     a_scale_desc,  #
@@ -1348,7 +1348,7 @@ def mxfp8_block_scaled_matmul_triton(
     return output
 
 
-@triton.jit
+@triton_jit
 def _per_tensor_quant_mla_fp8_stage1(
     x_ptr,
     x_s_ptr,
@@ -1371,7 +1371,7 @@ def _per_tensor_quant_mla_fp8_stage1(
     tl.atomic_max(x_s_ptr, _absmax / fp8_max)
 
 
-@triton.jit
+@triton_jit
 def _per_tensor_quant_mla_fp8_stage2(
     x_ptr,
     x_s_ptr,
@@ -1446,7 +1446,7 @@ def per_tensor_quant_mla_fp8(
     return x_q, x_s_out
 
 
-@triton.jit
+@triton_jit
 def _per_token_group_quant_mla_deep_gemm_masked_fp8(
     y_ptr,
     y_q_ptr,
@@ -1684,17 +1684,20 @@ else:
         return output, scale
 
 
-fp8_autotune = triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_M": block_m}, num_warps=num_warps)
-        for block_m in [16, 32, 64, 128]
-        for num_warps in [2, 4, 8]
-    ],
-    key=["K", "BLOCK_K", "M_ALIGNMENT"],
-)
+if triton is not None:
+    fp8_autotune = triton.autotune(
+        configs=[
+            triton.Config({"BLOCK_M": block_m}, num_warps=num_warps)
+            for block_m in [16, 32, 64, 128]
+            for num_warps in [2, 4, 8]
+        ],
+        key=["K", "BLOCK_K", "M_ALIGNMENT"],
+    )
+else:
+    fp8_autotune = lambda fn: fn
 
 
-@triton.jit
+@triton_jit
 def _per_token_group_quant_fp8_hopper_moe_mn_major(
     a,  # (M, K):(K, 1)
     expert_offsets,  # (num_experts,)
@@ -1777,7 +1780,7 @@ def per_token_group_quant_fp8_hopper_moe_mn_major(
     return a_q, sfa
 
 
-@triton.jit
+@triton_jit
 def _per_group_transpose(
     data_ptr: torch.Tensor,
     trans_data_ptr: torch.Tensor,
@@ -1844,7 +1847,7 @@ def is_weak_contiguous(x: torch.Tensor):
     return is_transpose or is_not_transpose
 
 
-@triton.jit
+@triton_jit
 def scaled_mm_kernel(
     a_ptr,
     b_ptr,

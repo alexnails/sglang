@@ -11,13 +11,13 @@
 import math
 
 import torch
-import triton
-import triton.language as tl
+
+from sglang.srt.utils.triton_compat import tl, triton, triton_jit
 
 from .mamba_ssm import softplus
 
 
-@triton.jit
+@triton_jit
 def _chunk_cumsum_fwd_kernel(
     # Pointers to matrices
     dt_ptr,
@@ -109,7 +109,7 @@ def _chunk_cumsum_fwd_kernel(
     )
 
 
-@triton.jit
+@triton_jit
 def _chunk_state_fwd_kernel(
     # Pointers to matrices
     x_ptr,
@@ -259,7 +259,7 @@ def _chunk_state_fwd_kernel(
     tl.store(states_ptrs, states, mask=c_mask)
 
 
-@triton.jit
+@triton_jit
 def _chunk_state_varlen_kernel(
     # Pointers to matrices
     x_ptr,

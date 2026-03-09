@@ -5,10 +5,9 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-import triton
-import triton.language as tl
 
 from sglang.srt.utils import get_device_name, is_cuda
+from sglang.srt.utils.triton_compat import tl, triton, triton_jit
 
 _is_cuda = is_cuda()
 if _is_cuda:
@@ -25,7 +24,7 @@ if _is_cuda:
 logger = logging.getLogger(__name__)
 
 
-@triton.jit
+@triton_jit
 def _per_token_quant_int8(
     x_ptr,
     xq_ptr,
@@ -89,7 +88,7 @@ def per_token_quant_int8(x, scale_dtype=torch.float32, cal_sum=False):
         return x_q, scales
 
 
-@triton.jit
+@triton_jit
 def _per_token_group_quant_int8(
     # Pointers to inputs and output
     y_ptr,
@@ -225,7 +224,7 @@ def sglang_per_token_group_quant_int8(
     return x_q, x_s
 
 
-@triton.jit
+@triton_jit
 def _w8a8_block_int8_matmul(
     # Pointers to inputs and output
     A,

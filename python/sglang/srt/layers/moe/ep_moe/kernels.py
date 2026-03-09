@@ -1,9 +1,9 @@
 import logging
 
 import torch
-import triton
 
 from sglang.srt.utils import ceil_div, is_cuda
+from sglang.srt.utils.triton_compat import tl, triton, triton_jit
 
 logger = logging.getLogger(__name__)
 
@@ -12,8 +12,6 @@ if _is_cuda:
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8 as per_token_group_quant_fp8,
     )
-
-import triton.language as tl
 
 
 def _get_launch_config_1d(device, numel):
@@ -70,7 +68,7 @@ def _get_launch_config_2d(device, m, n):
     return (grid_dim_y, grid_dim_x), block_dim
 
 
-@triton.jit
+@triton_jit
 def deepep_permute_triton_kernel(
     input_ptr,
     gateup_input_ptr,
@@ -101,7 +99,7 @@ def deepep_permute_triton_kernel(
                 tl.store(dst_ptr + offset, in_data, mask=mask)
 
 
-@triton.jit
+@triton_jit
 def deepep_post_reorder_triton_kernel(
     down_output_ptr,
     output_ptr,
@@ -134,7 +132,7 @@ def deepep_post_reorder_triton_kernel(
         tl.store(store_ptr + offset, sum_vec, mask=mask)
 
 
-@triton.jit
+@triton_jit
 def compute_src2dst_triton_kernel(
     reorder_ids, src2dst, num_toks, BLOCK_SIZE: tl.constexpr
 ):
@@ -145,7 +143,7 @@ def compute_src2dst_triton_kernel(
     tl.store(src2dst + src_id, dst_id, mask=mask)
 
 
-@triton.jit
+@triton_jit
 def deepep_compute_src2dst_triton_kernel(
     reorder_ids, src2dst, num_toks, num_minus_one, BLOCK_SIZE: tl.constexpr
 ):
@@ -179,7 +177,7 @@ def deepep_run_moe_deep_preprocess(topk_ids: torch.Tensor, num_experts: int):
     return reorder_topk_ids, src2dst, seg_indptr
 
 
-@triton.jit
+@triton_jit
 def compute_seg_indptr_triton_kernel(reorder_topk_ids, seg_indptr, num_toks):
     expert_id_minus_1 = tl.program_id(0) - 1
     low = 0
@@ -209,7 +207,7 @@ def cutlass_w4_run_moe_ep_preproess(topk_ids: torch.Tensor):
     return src2dst
 
 
-@triton.jit
+@triton_jit
 def pre_reorder_triton_kernel_for_cutlass_moe(
     input_ptr,
     gateup_input_ptr,
@@ -283,7 +281,7 @@ def pre_reorder_for_cutlass_moe(
 
 
 # copy from https://github.com/ModelTC/lightllm/blob/a000ab69098654df4731f5b12587dd4e7f0a4f41/lightllm/common/fused_moe/moe_silu_and_mul_mix_quant_ep.py
-@triton.jit
+@triton_jit
 def _silu_and_mul_post_quant_kernel(
     input_ptr,
     stride_input_0,
@@ -429,7 +427,7 @@ def silu_and_mul_masked_post_quant_fwd(
     return
 
 
-@triton.jit
+@triton_jit
 def silu_mul_static_tensorwise_quant_triton_kernel_for_cutlass_moe(
     input_ptr,
     output_ptr,
@@ -485,7 +483,7 @@ def silu_mul_static_tensorwise_quant_for_cutlass_moe(
     )
 
 
-@triton.jit
+@triton_jit
 def post_reorder_triton_kernel_for_cutlass_moe(
     down_output_ptr,
     output_ptr,
@@ -565,7 +563,7 @@ def post_reorder_for_cutlass_moe(
     )
 
 
-@triton.jit
+@triton_jit
 def post_reorder_triton_kernel(
     down_output_ptr,
     output_ptr,
@@ -605,7 +603,7 @@ def post_reorder_triton_kernel(
         tl.store(store_ptr + offset, sum_vec, mask=mask)
 
 
-@triton.jit
+@triton_jit
 def _fwd_kernel_ep_scatter_1(
     num_recv_tokens_per_expert,
     expert_start_loc,
@@ -638,7 +636,7 @@ def _fwd_kernel_ep_scatter_1(
         )
 
 
-@triton.jit
+@triton_jit
 def _fwd_kernel_ep_scatter_2(
     total_token_num,
     expert_start_loc,
@@ -787,7 +785,7 @@ def ep_scatter(
     return
 
 
-@triton.jit
+@triton_jit
 def _fwd_kernel_ep_gather(
     total_token_num,
     input_tensor,
@@ -912,7 +910,7 @@ def get_tma_aligned_size(x: int, element_size: int) -> int:
     return ceil_div(x, alignment) * alignment
 
 
-@triton.jit
+@triton_jit
 def _tma_align_input_scale_kernel(
     input_scale_ptr,
     output_ptr,
@@ -968,7 +966,7 @@ def tma_align_input_scale(input_scale: torch.Tensor):
     return output.t()[:m]
 
 
-@triton.jit
+@triton_jit
 def compute_masked_m_triton_kernel(seg_indptr, masked_m):
     expert_id = tl.program_id(0)
     start = tl.load(seg_indptr + expert_id)
@@ -976,7 +974,7 @@ def compute_masked_m_triton_kernel(seg_indptr, masked_m):
     tl.store(masked_m + expert_id, (end - start))
 
 
-@triton.jit
+@triton_jit
 def deepgemm_compute_src2dst_triton_kernel(
     topk_ids,
     reorder_ids,
@@ -997,7 +995,7 @@ def deepgemm_compute_src2dst_triton_kernel(
     tl.store(src2dst + src_id, dst_id, mask=mask)
 
 
-@triton.jit
+@triton_jit
 def fill_gateup_input_triton_kernel(
     input_ptr,
     scale_ptr,
@@ -1115,7 +1113,7 @@ def moe_ep_deepgemm_preprocess(
     )
 
 
-@triton.jit
+@triton_jit
 def compute_identity_kernel(
     top_k,
     hidden_states_ptr,
@@ -1189,7 +1187,7 @@ def zero_experts_compute_triton(
     return output
 
 
-@triton.jit
+@triton_jit
 def compute_problem_sizes_w4a8_kernel(
     masked_m_ptr,
     problem_sizes1_ptr,
@@ -1261,7 +1259,7 @@ def deepep_ll_get_cutlass_w4a8_moe_mm_data(
     )
 
 
-@triton.jit
+@triton_jit
 def _silu_and_mul_post_per_tensor_quant_kernel(
     input_ptr,
     stride_input_expert,

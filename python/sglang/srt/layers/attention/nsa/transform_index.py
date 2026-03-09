@@ -1,8 +1,8 @@
 from typing import List, Optional
 
 import torch
-import triton
-import triton.language as tl
+
+from sglang.srt.utils.triton_compat import tl, triton_jit
 
 
 def transform_index_page_table_prefill(**kwargs):
@@ -13,7 +13,7 @@ def transform_index_page_table_decode(**kwargs):
     return transform_index_page_table_decode_ref(**kwargs)
 
 
-@triton.jit
+@triton_jit
 def transform_index_page_table_decode_kernel(
     page_table_ptr: torch.Tensor,
     topk_indices_ptr: torch.Tensor,

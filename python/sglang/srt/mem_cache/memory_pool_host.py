@@ -23,12 +23,13 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     NSATokenToKVPool,
 )
-from sglang.srt.utils import is_cuda, is_npu, is_xpu
+from sglang.srt.utils import is_cpu, is_cuda, is_npu, is_xpu
 
+_is_cpu = is_cpu()
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
-if not (_is_npu or _is_xpu):
+if not (_is_cpu or _is_npu or _is_xpu):
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer,
         transfer_kv_all_layer_direct_lf_pf,

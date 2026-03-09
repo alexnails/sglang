@@ -2093,7 +2093,17 @@ def get_device(device_id: Optional[int] = None) -> str:
             return "musa"
         return "musa:{}".format(device_id)
 
-    raise RuntimeError("No accelerator (CUDA, XPU, HPU, NPU, MUSA) is available.")
+    is_host_cpu_supported = is_host_cpu_x86() or is_host_cpu_arm64()
+    if is_host_cpu_supported:
+        os.environ["SGLANG_USE_CPU_ENGINE"] = "1"
+        is_cpu.cache_clear()
+        logger.warning("No accelerator detected, falling back to CPU inference.")
+        return "cpu"
+
+    raise RuntimeError(
+        "No accelerator (CUDA, XPU, HPU, NPU, MUSA) is available "
+        "and CPU architecture is not supported."
+    )
 
 
 @lru_cache(maxsize=1)

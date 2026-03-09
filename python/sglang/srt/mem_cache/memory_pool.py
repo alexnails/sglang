@@ -33,8 +33,6 @@ from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
-import triton
-import triton.language as tl
 
 from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
@@ -62,6 +60,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+from sglang.srt.utils.triton_compat import tl, triton_jit
 
 store_cache = register_custom_op(store_cache, mutates_args=["k_cache", "v_cache"])
 
@@ -2016,7 +2015,7 @@ def move_kv_cache_native(
         v_cache[tgt_loc_flat] = v_cache[src_loc_flat]
 
 
-@triton.jit
+@triton_jit
 def copy_all_layer_kv_cache_tiled(
     data_ptrs,
     strides,

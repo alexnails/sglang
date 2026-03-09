@@ -7,8 +7,6 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
-import triton
-import triton.language as tl
 from huggingface_hub import snapshot_download
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
@@ -21,6 +19,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.common import get_last_loc
 from sglang.srt.server_args import ServerArgs, get_global_server_args
 from sglang.srt.utils import is_cuda, is_hip, is_npu, next_power_of_2
+from sglang.srt.utils.triton_compat import tl, triton_jit
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -57,7 +56,7 @@ def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
     return not server_args.enable_multi_layer_eagle
 
 
-@triton.jit
+@triton_jit
 def create_extend_after_decode_spec_info(
     verified_id,
     seq_lens,
@@ -83,7 +82,7 @@ def create_extend_after_decode_spec_info(
     tl.store(new_verified_id + pid, verified_id_data)
 
 
-@triton.jit
+@triton_jit
 def assign_req_to_token_pool(
     req_pool_indices,
     req_to_token,
@@ -137,7 +136,7 @@ def assign_req_to_token_pool_func(
     )
 
 
-@triton.jit
+@triton_jit
 def assign_draft_cache_locs(
     req_pool_indices,
     req_to_token,
@@ -246,7 +245,7 @@ def assign_draft_cache_locs(
             )
 
 
-@triton.jit
+@triton_jit
 def generate_draft_decode_kv_indices(
     req_pool_indices,
     req_to_token,
@@ -327,7 +326,7 @@ def generate_draft_decode_kv_indices(
     tl.store(kv_indptr + zid, base + zid * iters)
 
 
-@triton.jit
+@triton_jit
 def align_evict_mask_to_page_size(
     seq_lens,
     evict_mask,
@@ -352,7 +351,7 @@ def align_evict_mask_to_page_size(
         tl.store(evict_mask + bid * num_draft_tokens + i, False)
 
 
-@triton.jit
+@triton_jit
 def get_target_cache_loc(
     tgt_cache_loc,
     to_free_slots,
@@ -418,7 +417,7 @@ def get_src_tgt_cache_loc(
     return src_cache_loc, tgt_cache_loc, to_free_num_slots
 
 
-@triton.jit
+@triton_jit
 def filter_finished_cache_loc_kernel(
     out_cache_loc,
     tgt_cache_loc,

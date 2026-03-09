@@ -1,12 +1,12 @@
 from typing import Optional, Tuple
 
 import torch
-import triton
-import triton.language as tl
+
+from sglang.srt.utils.triton_compat import tl, triton, triton_jit
 
 
 # Triton implementation
-@triton.jit
+@triton_jit
 def _act_quant_kernel(
     X_ptr,
     Y_ptr,
@@ -136,7 +136,7 @@ def act_quant(
     return y, s
 
 
-@triton.jit
+@triton_jit
 def _get_valid_kv_indices_kernel(
     page_table_ptr,  # [bs, topk]
     kv_indptr_ptr,  # [bs + 1]

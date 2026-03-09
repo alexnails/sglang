@@ -7,48 +7,54 @@
 # Adapted from https://github.com/state-spaces/mamba/blob/v2.2.4/mamba_ssm/ops/triton/selective_state_update.py
 
 import torch
-import triton
-import triton.language as tl
 from packaging import version
+
+from sglang.srt.utils.triton_compat import tl, triton, triton_jit
 
 PAD_SLOT_ID = -1
 
-TRITON3 = version.parse(triton.__version__) >= version.parse("3.0.0")
+if triton is not None:
+    TRITON3 = version.parse(triton.__version__) >= version.parse("3.0.0")
+else:
+    TRITON3 = False
+
+
+def _heuristics(d):
+    return triton.heuristics(d) if triton is not None else (lambda fn: fn)
+
 
 if TRITON3:
 
-    @triton.jit
+    @triton_jit
     def softplus(dt):
         dt = tl.where(dt <= 20.0, tl.math.log(tl.math.exp(dt) + 1), dt)
         return dt
 
 else:
 
-    @triton.jit
+    @triton_jit
     def softplus(dt):
         dt = tl.where(dt <= 20.0, tl.math.log1p(tl.exp(dt)), dt)
         return dt
 
 
-@triton.heuristics({"HAS_DT_BIAS": lambda args: args["dt_bias_ptr"] is not None})
-@triton.heuristics({"HAS_D": lambda args: args["D_ptr"] is not None})
-@triton.heuristics({"HAS_Z": lambda args: args["z_ptr"] is not None})
-@triton.heuristics(
+@_heuristics({"HAS_DT_BIAS": lambda args: args["dt_bias_ptr"] is not None})
+@_heuristics({"HAS_D": lambda args: args["D_ptr"] is not None})
+@_heuristics({"HAS_Z": lambda args: args["z_ptr"] is not None})
+@_heuristics(
     {
         "HAS_STATE_BATCH_INDICES": lambda args: args["state_batch_indices_ptr"]
         is not None
     }
 )
-@triton.heuristics(
-    {"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])}
-)
-@triton.heuristics(
+@_heuristics({"BLOCK_SIZE_DSTATE": lambda args: triton.next_power_of_2(args["dstate"])})
+@_heuristics(
     {
         "CACHE_INTERMEDIATE_STATES": lambda args: args["intermediate_states_buffer"]
         is not None
     }
 )
-@triton.heuristics(
+@_heuristics(
     {
         "HAS_EAGLE_TREE_CUSTOM_ATTN_MASK": lambda args: args[
             "retrieve_parent_token_ptr"
@@ -56,7 +62,7 @@ else:
         is not None
     }
 )
-@triton.heuristics(
+@_heuristics(
     {
         "HAS_INTERMEDIATE_STATE_INDICES": lambda args: args[
             "intermediate_state_indices_ptr"
@@ -64,7 +70,7 @@ else:
         is not None
     }
 )
-@triton.jit(do_not_specialize=["T"])
+@(triton.jit(do_not_specialize=["T"]) if triton is not None else triton_jit)
 def _selective_scan_update_kernel(
     # Pointers to matrices
     state_ptr,

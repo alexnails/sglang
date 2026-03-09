@@ -4,13 +4,17 @@
 # Adapted from https://github.com/state-spaces/mamba/blob/60dadf2e0ee730ac337035d5533de10bc26e4847/mamba_ssm/ops/triton/layernorm_gated.py
 
 import torch
-import triton
-import triton.language as tl
+
+from sglang.srt.utils.triton_compat import tl, triton, triton_jit
 
 
-@triton.heuristics({"HAS_BIAS": lambda args: args["B"] is not None})
-@triton.heuristics({"HAS_Z": lambda args: args["Z"] is not None})
-@triton.jit
+def _heuristics(d):
+    return triton.heuristics(d) if triton is not None else (lambda fn: fn)
+
+
+@_heuristics({"HAS_BIAS": lambda args: args["B"] is not None})
+@_heuristics({"HAS_Z": lambda args: args["Z"] is not None})
+@triton_jit
 def _layer_norm_fwd_1pass_kernel(
     X,  # pointer to the input
     Y,  # pointer to the output

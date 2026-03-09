@@ -1,11 +1,10 @@
 from typing import TYPE_CHECKING
 
 import torch
-import triton
-import triton.language as tl
 
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.utils import is_hip
+from sglang.srt.utils.triton_compat import tl, triton_jit
 
 _is_hip = is_hip()
 _is_fp8_fnuz = is_fp8_fnuz()
@@ -398,7 +397,7 @@ def _set_k_and_s_triton(
     )
 
 
-@triton.jit
+@triton_jit
 def _set_k_and_s_triton_kernel(
     buf_fp8_ptr,
     buf_fp32_ptr,
@@ -479,7 +478,7 @@ def _get_k_triton(
     return out
 
 
-@triton.jit
+@triton_jit
 def _get_k_triton_kernel(
     buf_ptr,
     page_indices_ptr,
@@ -557,7 +556,7 @@ def _get_s_triton(
     return out
 
 
-@triton.jit
+@triton_jit
 def _get_s_triton_kernel(
     buf_ptr,
     page_indices_ptr,
@@ -641,7 +640,7 @@ def _get_k_and_s_triton(
     return k_out, s_out
 
 
-@triton.jit
+@triton_jit
 def _get_k_and_s_triton_kernel(
     buf_ptr,
     page_indices_ptr,

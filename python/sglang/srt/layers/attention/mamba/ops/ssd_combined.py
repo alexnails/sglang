@@ -9,16 +9,20 @@
 # ruff: noqa: E501
 
 import torch
-import triton
 from einops import rearrange
 from packaging import version
+
+from sglang.srt.utils.triton_compat import triton
 
 from .ssd_bmm import _bmm_chunk_fwd
 from .ssd_chunk_scan import _chunk_scan_fwd
 from .ssd_chunk_state import _chunk_cumsum_fwd, _chunk_state_fwd, chunk_state_varlen
 from .ssd_state_passing import _state_passing_fwd
 
-TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
+if triton is not None:
+    TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
+else:
+    TRITON_22 = False
 
 
 def is_int_pow_2(n):

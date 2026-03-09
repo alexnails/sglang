@@ -1,16 +1,15 @@
 from typing import Optional, Tuple
 
 import torch
-import triton
-import triton.language as tl
 
 from sglang.srt.layers.moe.topk import fused_topk
 from sglang.srt.utils import is_hip
+from sglang.srt.utils.triton_compat import tl, triton, triton_jit
 
 _is_hip = is_hip()
 
 
-@triton.jit
+@triton_jit
 def fused_moe_router_cudacore_kernel(
     input_ptr,  # input (bs, hidden_dim)
     moe_router_weight_ptr,  # input (num_experts, hidden_dim)
@@ -156,7 +155,7 @@ def fused_moe_router_cudacore(
     return topk_weights, topk_ids
 
 
-@triton.jit
+@triton_jit
 def fused_moe_router_tensorcore_kernel(
     a_ptr,  # input (bs, hidden_dim)
     b_ptr,  # input (num_experts, hidden_dim)

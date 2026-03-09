@@ -4,8 +4,6 @@ import logging
 from typing import TYPE_CHECKING
 
 import torch
-import triton
-import triton.language as tl
 
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
@@ -13,6 +11,7 @@ from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import support_triton
 from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.triton_compat import tl, triton, triton_jit
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -24,7 +23,7 @@ MAMBA_STATE_PER_REQ_NO_CACHE = 1
 logger = logging.getLogger(__name__)
 
 
-@triton.jit
+@triton_jit
 def write_req_to_token_pool_triton(
     req_to_token_ptr,  # [max_batch, max_context_len]
     req_pool_indices,
@@ -152,7 +151,7 @@ def get_last_loc_torch(
     )
 
 
-@triton.jit
+@triton_jit
 def get_last_loc_kernel(
     req_to_token,
     req_pool_indices_tensor,

@@ -5,13 +5,13 @@
 from typing import List, Optional, Union
 
 import torch
-import triton
-import triton.language as tl
+
+from sglang.srt.utils.triton_compat import tl, triton, triton_jit
 
 PAD_SLOT_ID = -1
 
 
-@triton.jit()
+@triton_jit
 def _causal_conv1d_fwd_kernel(  # continuous batching
     # Pointers to matrices
     x_ptr,  # (dim, cu_seqlen) holding `batch` of actual sequences + padded sequences
@@ -567,7 +567,7 @@ def causal_conv1d_fn(
 # When calculating token 3's convolution, it should conv to token 1 (parent) and token 0 (grand-parent)
 # When calculating token 2's convolution, it should conv to token 0 (parent)
 # This kernel is a fused kernel which will also produce retrieve_parent_token based on retrieve_next_token & retrieve_next_sibling
-@triton.jit()
+@triton_jit
 def _causal_conv1d_update_kernel(
     # Pointers to matrices
     x_ptr,  # (batch, dim, seqlen)

@@ -16,13 +16,12 @@
 from typing import Any, List, Optional, Tuple
 
 import torch
-import triton
-import triton.language as tl
 
 from sglang.srt.environ import envs
+from sglang.srt.utils.triton_compat import tl, triton, triton_jit
 
 
-@triton.jit
+@triton_jit
 def set_mla_kv_buffer_kernel(
     kv_buffer_ptr,
     cache_k_nope_ptr,
@@ -109,7 +108,7 @@ def set_mla_kv_buffer_triton(
     )
 
 
-@triton.jit
+@triton_jit
 def set_mla_kv_scale_buffer_kernel(
     kv_buffer_ptr,
     cache_k_nope_ptr,
@@ -176,7 +175,7 @@ def set_mla_kv_scale_buffer_triton(
     )
 
 
-@triton.jit
+@triton_jit
 def get_mla_kv_buffer_kernel(
     kv_buffer_ptr,
     cache_k_nope_ptr,

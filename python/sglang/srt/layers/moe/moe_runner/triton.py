@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
-import triton.language as tl
 
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
@@ -19,6 +18,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_hip, is_xpu
+from sglang.srt.utils.triton_compat import tl
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.standard import (

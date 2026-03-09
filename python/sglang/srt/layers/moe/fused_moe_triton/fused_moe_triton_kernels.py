@@ -6,8 +6,6 @@ from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
 import torch
-import triton
-import triton.language as tl
 
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.layers.quantization.fp8_kernel import (
@@ -28,6 +26,7 @@ from sglang.srt.utils import (
     is_hip,
     is_sm90_supported,
 )
+from sglang.srt.utils.triton_compat import tl, triton, triton_jit
 
 try:
     from triton.tools.tensor_descriptor import TensorDescriptor
@@ -68,7 +67,7 @@ def should_enable_swap_ab(
     return is_sm90_supported() and BLOCK_SIZE_M < 64 and BLOCK_SIZE_N >= 64
 
 
-@triton.jit
+@triton_jit
 def write_zeros_to_output(
     c_ptr,
     stride_cm,
@@ -88,7 +87,7 @@ def write_zeros_to_output(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
-@triton.jit
+@triton_jit
 def fused_moe_kernel_gptq_awq(
     # Pointers to matrices
     a_ptr,
@@ -320,7 +319,7 @@ def fused_moe_kernel_gptq_awq(
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
-@triton.jit
+@triton_jit
 def fused_moe_kernel(
     # Pointers to matrices
     a_ptr,
@@ -907,12 +906,12 @@ def invoke_fused_moe_kernel(
         )
 
 
-@triton.jit
+@triton_jit
 def tanh(x):
     return 2 * tl.sigmoid(2 * x) - 1
 
 
-@triton.jit
+@triton_jit
 def _apply_activation(x, ACTIVATION_TYPE: tl.constexpr):
     """
     Apply activation function based on compile-time constant.
@@ -934,7 +933,7 @@ def _apply_activation(x, ACTIVATION_TYPE: tl.constexpr):
         raise ValueError(f"Unsupported activation: {ACTIVATION_TYPE}")
 
 
-@triton.jit
+@triton_jit
 def act_and_mul_kernel(
     gateup_output,
     down_input,
@@ -1014,7 +1013,7 @@ def act_and_mul_triton(
 
 
 # _moe_sum_reduce_kernel kernel modified from https://github.com/ModelTC/lightllm/blob/main/lightllm/common/fused_moe/moe_sum_reduce.py
-@triton.jit
+@triton_jit
 def _moe_sum_reduce_kernel(
     input_ptr,
     input_stride_0,
@@ -1102,7 +1101,7 @@ def moe_sum_reduce_triton(
     return
 
 
-@triton.jit
+@triton_jit
 def _fused_append_shared_experts_kernel(
     topk_ids_ptr,
     topk_weights_ptr,

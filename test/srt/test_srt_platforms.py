@@ -186,13 +186,18 @@ class TestCPUSRTPlatform(unittest.TestCase):
         self.assertTrue(self.plat.supports_torch_compile())
 
     def test_configure_server_args_sets_defaults(self):
+        from sglang.srt.utils.common import cpu_has_amx_support
+
         class FakeArgs:
             attention_backend = None
             sampling_backend = None
 
         args = FakeArgs()
         self.plat.configure_server_args(args)
-        self.assertEqual(args.attention_backend, "intel_amx")
+        if cpu_has_amx_support():
+            self.assertEqual(args.attention_backend, "intel_amx")
+        else:
+            self.assertEqual(args.attention_backend, "torch_native")
         self.assertEqual(args.sampling_backend, "pytorch")
 
     def test_configure_server_args_preserves_existing_attention(self):

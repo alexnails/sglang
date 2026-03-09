@@ -14,8 +14,8 @@
 """Logits processing."""
 
 import torch
-import triton
-import triton.language as tl
+
+from sglang.srt.utils.triton_compat import tl, triton, triton_jit
 
 FMIX32_C1 = 0x85EBCA6B
 FMIX32_C2 = 0xC2B2AE35
@@ -23,12 +23,12 @@ POS_C1 = 0x27D4EB2D
 POS_C2 = 0x165667B1
 
 
-@triton.jit
+@triton_jit
 def _rotl32(x, r: tl.constexpr):
     return (x << r) | (x >> (32 - r))
 
 
-@triton.jit
+@triton_jit
 def _fmix32(x, C1: tl.constexpr, C2: tl.constexpr):
     c1 = tl.full((), C1, tl.uint32)
     c2 = tl.full((), C2, tl.uint32)
@@ -40,7 +40,7 @@ def _fmix32(x, C1: tl.constexpr, C2: tl.constexpr):
     return x
 
 
-@triton.jit
+@triton_jit
 def hash_tiles32_kernel_blocked(
     in_ptr,
     out_ptr,
@@ -104,7 +104,7 @@ def hash_tiles32_kernel_blocked(
     tl.store(out_ptr + pid, out)
 
 
-@triton.jit
+@triton_jit
 def add_tree_reduce_u64_kernel(in_ptr, out_ptr, n_elems, CHUNK: tl.constexpr):
     pid = tl.program_id(axis=0)
     start = pid * CHUNK

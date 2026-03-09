@@ -9,14 +9,17 @@
 # ruff: noqa: E501,SIM102
 
 import torch
-import triton
-import triton.language as tl
 from packaging import version
 
-TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
+from sglang.srt.utils.triton_compat import tl, triton, triton_jit
+
+if triton is not None:
+    TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
+else:
+    TRITON_22 = False
 
 
-@triton.jit
+@triton_jit
 def _chunk_scan_fwd_kernel(
     # Pointers to matrices
     cb_ptr,

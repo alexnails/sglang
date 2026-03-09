@@ -5,11 +5,10 @@ from enum import IntEnum
 from typing import Optional
 
 import torch
-import triton
-import triton.language as tl
 
 from sglang.srt.utils import get_bool_env_var, is_hip
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.utils.triton_compat import tl, triton, triton_jit
 
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -118,7 +117,7 @@ def rocm_fused_experts_tkw1(
         assert False, "This should not be called."
 
 
-@triton.jit
+@triton_jit
 def upscale_kernel(
     A_ptr,  # *fp16 / *fp32
     scale_ptr,  # *fp16 / *fp32
@@ -189,7 +188,7 @@ def upscale(hidden_state, hidden_state_scale, recv_token_num, output_dtype):
     return Out
 
 
-@triton.jit
+@triton_jit
 def upscale_fp4x2_block32_kernel(
     A_u8_ptr,  # *uint8  (view from float4_e2m1fn_x2)
     S_u8_ptr,  # *uint8  (view from float8_e8m0fnu), shape (M, N_fp4/32)

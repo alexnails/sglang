@@ -1,40 +1,41 @@
 from typing import Optional, Tuple
 
 import torch
-import triton
-import triton.language as tl
 
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.utils.triton_compat import tl, triton, triton_jit
 
 _is_hip = is_hip()
 
+if triton is not None:
+    fused_softcap_autotune = triton.autotune(
+        configs=[
+            triton.Config(kwargs={"BLOCK_SIZE": 128}, num_warps=4),
+            triton.Config(kwargs={"BLOCK_SIZE": 128}, num_warps=8),
+            triton.Config(kwargs={"BLOCK_SIZE": 128}, num_warps=16),
+            triton.Config(kwargs={"BLOCK_SIZE": 256}, num_warps=4),
+            triton.Config(kwargs={"BLOCK_SIZE": 256}, num_warps=8),
+            triton.Config(kwargs={"BLOCK_SIZE": 512}, num_warps=4),
+            triton.Config(kwargs={"BLOCK_SIZE": 512}, num_warps=8),
+            triton.Config(kwargs={"BLOCK_SIZE": 512}, num_warps=16),
+            triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=4),
+            triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=8),
+            triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=16),
+            triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=32),
+            triton.Config(kwargs={"BLOCK_SIZE": 2048}, num_warps=32),
+            triton.Config(kwargs={"BLOCK_SIZE": 4096}, num_warps=32),
+            triton.Config(kwargs={"BLOCK_SIZE": 8192}, num_warps=32),
+            triton.Config(kwargs={"BLOCK_SIZE": 16384}, num_warps=32),
+            triton.Config(kwargs={"BLOCK_SIZE": 32768}, num_warps=32),
+        ],
+        key=["n_ele"],
+    )
+else:
+    fused_softcap_autotune = lambda fn: fn
 
-fused_softcap_autotune = triton.autotune(
-    configs=[
-        triton.Config(kwargs={"BLOCK_SIZE": 128}, num_warps=4),
-        triton.Config(kwargs={"BLOCK_SIZE": 128}, num_warps=8),
-        triton.Config(kwargs={"BLOCK_SIZE": 128}, num_warps=16),
-        triton.Config(kwargs={"BLOCK_SIZE": 256}, num_warps=4),
-        triton.Config(kwargs={"BLOCK_SIZE": 256}, num_warps=8),
-        triton.Config(kwargs={"BLOCK_SIZE": 512}, num_warps=4),
-        triton.Config(kwargs={"BLOCK_SIZE": 512}, num_warps=8),
-        triton.Config(kwargs={"BLOCK_SIZE": 512}, num_warps=16),
-        triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=4),
-        triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=8),
-        triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=16),
-        triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=32),
-        triton.Config(kwargs={"BLOCK_SIZE": 2048}, num_warps=32),
-        triton.Config(kwargs={"BLOCK_SIZE": 4096}, num_warps=32),
-        triton.Config(kwargs={"BLOCK_SIZE": 8192}, num_warps=32),
-        triton.Config(kwargs={"BLOCK_SIZE": 16384}, num_warps=32),
-        triton.Config(kwargs={"BLOCK_SIZE": 32768}, num_warps=32),
-    ],
-    key=["n_ele"],
-)
 
-
-@triton.jit
+@triton_jit
 def fused_softcap_kernel(
     output_ptr,
     input_ptr,
@@ -93,49 +94,52 @@ class Softcap:
         return fused_softcap(x, self.softcap_const, autotune=autotune)
 
 
-rmsnorm_autotune = triton.autotune(
-    configs=[
-        triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=4, num_stages=1),
-        triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=8, num_stages=1),
-        triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=16, num_stages=1),
-        triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=4),
-        triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=8),
-        triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=16),
-        triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=4, num_stages=4),
-        triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=8, num_stages=4),
-        triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=16, num_stages=4),
-        triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=8, num_stages=8),
-        triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=16, num_stages=8),
-        triton.Config(kwargs={"BLOCK_SIZE": 2048}, num_warps=8),
-        triton.Config(kwargs={"BLOCK_SIZE": 2048}, num_warps=16),
-        triton.Config(kwargs={"BLOCK_SIZE": 2048}, num_warps=8, num_stages=4),
-        triton.Config(kwargs={"BLOCK_SIZE": 2048}, num_warps=16, num_stages=4),
-        triton.Config(kwargs={"BLOCK_SIZE": 4096}, num_warps=8),
-        triton.Config(kwargs={"BLOCK_SIZE": 4096}, num_warps=16),
-        triton.Config(kwargs={"BLOCK_SIZE": 8192}, num_warps=8),
-        triton.Config(kwargs={"BLOCK_SIZE": 8192}, num_warps=16),
-        triton.Config(kwargs={"BLOCK_SIZE": 8192}, num_warps=32),
-        triton.Config(kwargs={"BLOCK_SIZE": 8192}, num_warps=8, num_stages=1),
-        triton.Config(kwargs={"BLOCK_SIZE": 8192}, num_warps=16, num_stages=1),
-        triton.Config(kwargs={"BLOCK_SIZE": 8192}, num_warps=32, num_stages=1),
-        triton.Config(kwargs={"BLOCK_SIZE": 8192}, num_warps=8, num_stages=4),
-        triton.Config(kwargs={"BLOCK_SIZE": 8192}, num_warps=16, num_stages=4),
-        triton.Config(kwargs={"BLOCK_SIZE": 8192}, num_warps=32, num_stages=4),
-        triton.Config(kwargs={"BLOCK_SIZE": 16384}, num_warps=8),
-        triton.Config(kwargs={"BLOCK_SIZE": 16384}, num_warps=16),
-        triton.Config(kwargs={"BLOCK_SIZE": 16384}, num_warps=32),
-        triton.Config(kwargs={"BLOCK_SIZE": 16384}, num_warps=8, num_stages=1),
-        triton.Config(kwargs={"BLOCK_SIZE": 16384}, num_warps=16, num_stages=1),
-        triton.Config(kwargs={"BLOCK_SIZE": 16384}, num_warps=32, num_stages=1),
-        triton.Config(kwargs={"BLOCK_SIZE": 16384}, num_warps=8, num_stages=4),
-        triton.Config(kwargs={"BLOCK_SIZE": 16384}, num_warps=16, num_stages=4),
-        triton.Config(kwargs={"BLOCK_SIZE": 16384}, num_warps=32, num_stages=4),
-    ],
-    key=["hidden_dim"],
-)
+if triton is not None:
+    rmsnorm_autotune = triton.autotune(
+        configs=[
+            triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=4, num_stages=1),
+            triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=8, num_stages=1),
+            triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=16, num_stages=1),
+            triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=4),
+            triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=8),
+            triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=16),
+            triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=4, num_stages=4),
+            triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=8, num_stages=4),
+            triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=16, num_stages=4),
+            triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=8, num_stages=8),
+            triton.Config(kwargs={"BLOCK_SIZE": 1024}, num_warps=16, num_stages=8),
+            triton.Config(kwargs={"BLOCK_SIZE": 2048}, num_warps=8),
+            triton.Config(kwargs={"BLOCK_SIZE": 2048}, num_warps=16),
+            triton.Config(kwargs={"BLOCK_SIZE": 2048}, num_warps=8, num_stages=4),
+            triton.Config(kwargs={"BLOCK_SIZE": 2048}, num_warps=16, num_stages=4),
+            triton.Config(kwargs={"BLOCK_SIZE": 4096}, num_warps=8),
+            triton.Config(kwargs={"BLOCK_SIZE": 4096}, num_warps=16),
+            triton.Config(kwargs={"BLOCK_SIZE": 8192}, num_warps=8),
+            triton.Config(kwargs={"BLOCK_SIZE": 8192}, num_warps=16),
+            triton.Config(kwargs={"BLOCK_SIZE": 8192}, num_warps=32),
+            triton.Config(kwargs={"BLOCK_SIZE": 8192}, num_warps=8, num_stages=1),
+            triton.Config(kwargs={"BLOCK_SIZE": 8192}, num_warps=16, num_stages=1),
+            triton.Config(kwargs={"BLOCK_SIZE": 8192}, num_warps=32, num_stages=1),
+            triton.Config(kwargs={"BLOCK_SIZE": 8192}, num_warps=8, num_stages=4),
+            triton.Config(kwargs={"BLOCK_SIZE": 8192}, num_warps=16, num_stages=4),
+            triton.Config(kwargs={"BLOCK_SIZE": 8192}, num_warps=32, num_stages=4),
+            triton.Config(kwargs={"BLOCK_SIZE": 16384}, num_warps=8),
+            triton.Config(kwargs={"BLOCK_SIZE": 16384}, num_warps=16),
+            triton.Config(kwargs={"BLOCK_SIZE": 16384}, num_warps=32),
+            triton.Config(kwargs={"BLOCK_SIZE": 16384}, num_warps=8, num_stages=1),
+            triton.Config(kwargs={"BLOCK_SIZE": 16384}, num_warps=16, num_stages=1),
+            triton.Config(kwargs={"BLOCK_SIZE": 16384}, num_warps=32, num_stages=1),
+            triton.Config(kwargs={"BLOCK_SIZE": 16384}, num_warps=8, num_stages=4),
+            triton.Config(kwargs={"BLOCK_SIZE": 16384}, num_warps=16, num_stages=4),
+            triton.Config(kwargs={"BLOCK_SIZE": 16384}, num_warps=32, num_stages=4),
+        ],
+        key=["hidden_dim"],
+    )
+else:
+    rmsnorm_autotune = lambda fn: fn
 
 
-@triton.jit
+@triton_jit
 def fused_dual_residual_rmsnorm_kernel(
     output_ptr,
     mid_ptr,
@@ -221,7 +225,7 @@ def fused_dual_residual_rmsnorm(x, residual, weight1, weight2, eps, autotune=Fal
     return output, mid
 
 
-@triton.jit
+@triton_jit
 def fused_rmsnorm_kernel(
     output_ptr,
     activ_ptr,
@@ -328,7 +332,7 @@ class FusedDualResidualRMSNorm:
         return self.rmsnorm2.forward_native(residual), residual
 
 
-@triton.jit
+@triton_jit
 def experts_combine_kernel(
     out_hidden_states,
     moe_hidden_states,
@@ -404,7 +408,7 @@ def experts_combine_triton(
 
 
 # gelu on first half of vector
-@triton.jit
+@triton_jit
 def gelu_and_mul_kernel(
     out_hidden_states_ptr,  # (bs, hidden_dim)
     out_scales_ptr,  # (bs,)
@@ -498,7 +502,7 @@ def gelu_and_mul_triton(
 
 
 # silu on first half of vector
-@triton.jit
+@triton_jit
 def silu_and_mul_kernel(
     out_hidden_states_ptr,  # (bs, hidden_dim)
     out_scales_ptr,  # (bs,)

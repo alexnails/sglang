@@ -1,6 +1,6 @@
 import torch
-import triton
-import triton.language as tl
+
+from sglang.srt.utils.triton_compat import tl, triton, triton_jit
 
 
 def dequantize_k_cache(quant_k_cache):
@@ -117,7 +117,7 @@ def _dequantize_k_cache_fast(quant_k_cache, group_size: int = 128):
     return output
 
 
-@triton.jit
+@triton_jit
 def _dequantize_k_cache_fast_kernel(
     output_ptr,
     input_nope_q_ptr,
@@ -231,7 +231,7 @@ def dequantize_k_cache_paged(
     return output
 
 
-@triton.jit
+@triton_jit
 def _dequantize_k_cache_paged_kernel(
     output_ptr,
     input_nope_q_ptr,

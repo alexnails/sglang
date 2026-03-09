@@ -1,9 +1,9 @@
 import torch
-import triton
-import triton.language as tl
+
+from sglang.srt.utils.triton_compat import tl, triton, triton_jit
 
 
-@triton.jit
+@triton_jit
 def rotl32(x, r: tl.constexpr) -> tl.uint32:
     """
     rotate left 32-bit integer x by r bits
@@ -13,7 +13,7 @@ def rotl32(x, r: tl.constexpr) -> tl.uint32:
     return ((x << r) | (x >> (32 - r))) & 0xFFFFFFFF
 
 
-@triton.jit
+@triton_jit
 def fmix32(h: tl.uint32) -> tl.uint32:
     """
     final mix of 32-bit hash value for MurmurHash
@@ -26,7 +26,7 @@ def fmix32(h: tl.uint32) -> tl.uint32:
     return h
 
 
-@triton.jit
+@triton_jit
 def murmur3_mix(h: tl.uint32, k: tl.uint32) -> tl.uint32:
     """
     Mixes a 32-bit key into the hash state.
@@ -47,7 +47,7 @@ def murmur3_mix(h: tl.uint32, k: tl.uint32) -> tl.uint32:
     return h
 
 
-@triton.jit
+@triton_jit
 def murmur_hash32_kernel(
     seed_ptr,
     positions_ptr,

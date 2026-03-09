@@ -5,11 +5,11 @@ from __future__ import annotations
 from typing import List
 
 import torch
-import triton
-import triton.language as tl
+
+from sglang.srt.utils.triton_compat import tl, triton, triton_jit
 
 
-@triton.jit
+@triton_jit
 def _triton_mrope_forward_fused(
     q_ptr,
     k_ptr,
@@ -141,7 +141,7 @@ def triton_mrope_fused(
     )
 
 
-@triton.jit
+@triton_jit
 def _triton_ernie45_rope_qk_fused(
     q_ptr,
     k_ptr,

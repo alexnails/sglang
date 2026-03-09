@@ -914,6 +914,9 @@ class ServerArgs:
             self.served_model_name = self.model_path
         if self.device is None:
             self.device = get_device()
+        if self.device == "cpu":
+            os.environ["SGLANG_USE_CPU_ENGINE"] = "1"
+            is_cpu.cache_clear()
         if self.random_seed is None:
             self.random_seed = random.randint(0, 1 << 30)
         if self.mm_process_config is None:

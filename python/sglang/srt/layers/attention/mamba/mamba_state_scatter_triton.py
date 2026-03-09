@@ -7,11 +7,11 @@ avoiding multiple `index_elementwise_kernel` launches.
 """
 
 import torch
-import triton
-import triton.language as tl
+
+from sglang.srt.utils.triton_compat import tl, triton, triton_jit
 
 
-@triton.jit
+@triton_jit
 def _fused_mamba_state_scatter_with_mask_kernel(
     src_ptr,
     dst_ptr,

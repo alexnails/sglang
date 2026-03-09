@@ -11,11 +11,11 @@
 import math
 
 import torch
-import triton
-import triton.language as tl
+
+from sglang.srt.utils.triton_compat import tl, triton, triton_jit
 
 
-@triton.jit
+@triton_jit
 def _bmm_chunk_fwd_kernel(
     # Pointers to matrices
     a_ptr,

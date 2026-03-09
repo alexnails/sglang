@@ -1,6 +1,6 @@
 import torch
-import triton
-import triton.language as tl
+
+from sglang.srt.utils.triton_compat import tl, triton, triton_jit
 
 
 def quantize_k_cache(cache_k):
@@ -264,7 +264,7 @@ def _quantize_k_cache_fast_separate(k_nope, k_rope, group_size: int = 128):
     return nope_part_u8.unsqueeze(1), rope_part_u8.unsqueeze(1)
 
 
-@triton.jit
+@triton_jit
 def _quantize_k_cache_fast_kernel(
     output_nope_q_ptr,
     output_nope_s_ptr,

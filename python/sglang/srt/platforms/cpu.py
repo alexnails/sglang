@@ -26,7 +26,12 @@ class CPUSRTPlatform(SRTPlatform):
 
     def configure_server_args(self, server_args: ServerArgs) -> None:
         if server_args.attention_backend is None:
-            server_args.attention_backend = "intel_amx"
+            from sglang.srt.utils.common import cpu_has_amx_support
+
+            if cpu_has_amx_support():
+                server_args.attention_backend = "intel_amx"
+            else:
+                server_args.attention_backend = "torch_native"
         server_args.sampling_backend = "pytorch"
 
     # ------------------------------------------------------------------

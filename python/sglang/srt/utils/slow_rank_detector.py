@@ -3,7 +3,6 @@ from typing import Any, Dict, List
 
 import torch
 import torch.distributed as dist
-import triton
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +50,8 @@ _BENCH_NAMES = list(_EXECUTOR_CLS_OF_BENCH.keys())
 
 
 def _compute_local_metric(bench_name):
+    import triton
+
     executor = _EXECUTOR_CLS_OF_BENCH[bench_name]()
     ms = triton.testing.do_bench_cudagraph(executor, return_mode="mean", rep=20)
     return ms

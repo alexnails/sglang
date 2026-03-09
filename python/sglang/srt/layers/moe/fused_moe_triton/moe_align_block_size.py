@@ -3,9 +3,9 @@ from __future__ import annotations
 from typing import Tuple
 
 import torch
-import triton
 
 from sglang.srt.utils import is_cuda, is_hip, is_xpu
+from sglang.srt.utils.triton_compat import triton
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()

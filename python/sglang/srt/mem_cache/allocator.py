@@ -23,10 +23,9 @@ import abc
 from typing import TYPE_CHECKING
 
 import torch
-import triton
-import triton.language as tl
 
 from sglang.srt.utils import get_bool_env_var, get_num_new_pages, next_power_of_2
+from sglang.srt.utils.triton_compat import tl, triton_jit
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
@@ -231,7 +230,7 @@ def alloc_extend_naive(
             ).view(-1)
 
 
-@triton.jit
+@triton_jit
 def alloc_extend_kernel(
     pre_lens_ptr,
     seq_lens_ptr,
@@ -280,9 +279,6 @@ def alloc_extend_kernel(
         return
 
     # Part 2: fill the new full pages using a dynamic blocked loop.
-    # The loop bound is derived from num_part2 (runtime value), so Triton
-    # generates a real loop instead of unrolling — no constexpr dependency
-    # on extend size and only one kernel compilation.
     num_part2 = (
         seq_len // page_size * page_size
         - (pre_len + page_size - 1) // page_size * page_size
@@ -317,7 +313,7 @@ def alloc_extend_kernel(
     )
 
 
-@triton.jit
+@triton_jit
 def alloc_decode_kernel(
     seq_lens_ptr,
     last_loc_ptr,

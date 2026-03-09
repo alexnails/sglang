@@ -7,10 +7,10 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-import triton
 
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_device_name, is_hip
+from sglang.srt.utils.triton_compat import triton
 
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()

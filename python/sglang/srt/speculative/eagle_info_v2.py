@@ -5,8 +5,6 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
-import triton
-import triton.language as tl
 
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch, ScheduleBatch
@@ -30,6 +28,7 @@ from sglang.srt.speculative.spec_utils import (
     generate_simulated_accept_index,
 )
 from sglang.srt.utils.common import is_cuda, is_hip, is_npu, next_power_of_2
+from sglang.srt.utils.triton_compat import tl, triton_jit
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -50,7 +49,7 @@ if is_cuda():
     )
 
 
-@triton.jit
+@triton_jit
 def assign_draft_cache_locs_page_size_1(
     req_pool_indices,
     req_to_token,
@@ -388,7 +387,7 @@ class EagleVerifyInputV2Mixin:
         return predict, accept_length, accept_index
 
 
-@triton.jit
+@triton_jit
 def fill_new_verified_id(
     verified_id,
     accept_lens,
@@ -405,7 +404,7 @@ def fill_new_verified_id(
     tl.store(new_verified_id + pid, verified_id_data)
 
 
-@triton.jit
+@triton_jit
 def fill_accepted_out_cache_loc(
     accept_index,
     out_cache_loc,
@@ -423,7 +422,7 @@ def fill_accepted_out_cache_loc(
         tl.store(accepted_out_cache_loc + dst, value)
 
 
-@triton.jit
+@triton_jit
 def assign_extend_cache_locs(
     req_pool_indices,
     req_to_token,
