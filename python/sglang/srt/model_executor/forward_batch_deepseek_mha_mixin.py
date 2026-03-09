@@ -6,6 +6,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.utils.triton_compat import tl, triton_jit
 
 
 class ForwardBatchDeepSeekMHAMixin:
@@ -193,47 +194,38 @@ class ForwardBatchDeepSeekMHAMixin:
         return kv_indices
 
 
-try:
-    import triton
-    import triton.language as tl
+@triton_jit
+def create_chunked_prefix_cache_kv_indices(
+    req_to_token_ptr,  # (max_batch, max_context_len,)
+    req_pool_indices_ptr,  # (batch_size,)
+    chunk_start_idx_ptr,  # (batch_size,)
+    chunk_seq_lens_ptr,  # (batch_size,)
+    chunk_cu_seq_lens_ptr,  # (batch_size + 1,)
+    chunk_kv_indices_ptr,  # (num_chunk_tokens,)
+    req_to_token_ptr_stride: tl.constexpr,
+):
+    BLOCK_SIZE: tl.constexpr = 512
+    pid = tl.program_id(axis=0)
 
-    @triton.jit
-    def create_chunked_prefix_cache_kv_indices(
-        req_to_token_ptr,  # (max_batch, max_context_len,)
-        req_pool_indices_ptr,  # (batch_size,)
-        chunk_start_idx_ptr,  # (batch_size,)
-        chunk_seq_lens_ptr,  # (batch_size,)
-        chunk_cu_seq_lens_ptr,  # (batch_size + 1,)
-        chunk_kv_indices_ptr,  # (num_chunk_tokens,)
-        req_to_token_ptr_stride: tl.constexpr,
-    ):
-        BLOCK_SIZE: tl.constexpr = 512
-        pid = tl.program_id(axis=0)
+    req_pool_index = tl.load(req_pool_indices_ptr + pid)
+    chunk_kv_indices_offset = tl.load(chunk_cu_seq_lens_ptr + pid)
 
-        # find the req pool idx, this is for batch to token
-        req_pool_index = tl.load(req_pool_indices_ptr + pid)
-        chunk_kv_indices_offset = tl.load(chunk_cu_seq_lens_ptr + pid)
+    chunk_start_pos = tl.load(chunk_start_idx_ptr + pid).to(tl.int32)
+    chunk_seq_len = tl.load(chunk_seq_lens_ptr + pid).to(tl.int32)
 
-        # get the token positions of current chunk
-        chunk_start_pos = tl.load(chunk_start_idx_ptr + pid).to(tl.int32)
-        chunk_seq_len = tl.load(chunk_seq_lens_ptr + pid).to(tl.int32)
-
-        num_loop = tl.cdiv(chunk_seq_len, BLOCK_SIZE)
-        for i in range(num_loop):
-            offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
-            mask = offset < chunk_seq_len
-            data = tl.load(
-                req_to_token_ptr
-                + req_pool_index * req_to_token_ptr_stride
-                + chunk_start_pos
-                + offset,
-                mask=mask,
-            )
-            tl.store(
-                chunk_kv_indices_ptr + chunk_kv_indices_offset + offset,
-                data,
-                mask=mask,
-            )
-
-except ImportError:
-    pass
+    num_loop = tl.cdiv(chunk_seq_len, BLOCK_SIZE)
+    for i in range(num_loop):
+        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
+        mask = offset < chunk_seq_len
+        data = tl.load(
+            req_to_token_ptr
+            + req_pool_index * req_to_token_ptr_stride
+            + chunk_start_pos
+            + offset,
+            mask=mask,
+        )
+        tl.store(
+            chunk_kv_indices_ptr + chunk_kv_indices_offset + offset,
+            data,
+            mask=mask,
+        )

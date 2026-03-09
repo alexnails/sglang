@@ -25,6 +25,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils.triton_compat import has_triton, tl, triton, triton_jit
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -390,38 +391,30 @@ def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.
     return forward_batch.dp_local_start_pos, forward_batch.dp_local_num_tokens
 
 
-try:
-    import triton
-    import triton.language as tl
+@triton_jit
+def memcpy_triton_kernel(
+    dst_ptr,
+    src_ptr,
+    offset_ptr,
+    sz_ptr,
+    offset_src: tl.constexpr,
+    chunk_size,  # multiplied for offset and sz
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(axis=0).to(tl.int64)
+    offset = tl.load(offset_ptr).to(tl.int64) * chunk_size
+    sz = tl.load(sz_ptr).to(tl.int64) * chunk_size
 
-    @triton.jit
-    def memcpy_triton_kernel(
-        dst_ptr,
-        src_ptr,
-        offset_ptr,
-        sz_ptr,
-        offset_src: tl.constexpr,
-        chunk_size,  # multiplied for offset and sz
-        BLOCK_SIZE: tl.constexpr,
-    ):
-        pid = tl.program_id(axis=0).to(tl.int64)
-        offset = tl.load(offset_ptr).to(tl.int64) * chunk_size
-        sz = tl.load(sz_ptr).to(tl.int64) * chunk_size
+    start_index = pid * BLOCK_SIZE
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = start_index + offs < sz
 
-        start_index = pid * BLOCK_SIZE
-        offs = tl.arange(0, BLOCK_SIZE)
-        mask = start_index + offs < sz
-
-        if offset_src:
-            data = tl.load(src_ptr + offset + start_index + offs, mask=mask)
-            tl.store(dst_ptr + start_index + offs, data, mask=mask)
-        else:
-            data = tl.load(src_ptr + start_index + offs, mask=mask)
-            tl.store(dst_ptr + offset + start_index + offs, data, mask=mask)
-
-    _HAS_TRITON = True
-except ImportError:
-    _HAS_TRITON = False
+    if offset_src:
+        data = tl.load(src_ptr + offset + start_index + offs, mask=mask)
+        tl.store(dst_ptr + start_index + offs, data, mask=mask)
+    else:
+        data = tl.load(src_ptr + start_index + offs, mask=mask)
+        tl.store(dst_ptr + offset + start_index + offs, data, mask=mask)
 
 
 def prod(x):
@@ -429,7 +422,7 @@ def prod(x):
 
 
 def memcpy_triton(dst, src, dim, offset, sz, offset_src):
-    if not _HAS_TRITON:
+    if not has_triton():
         raise RuntimeError("memcpy_triton requires triton to be installed")
     max_size = min(src.numel(), dst.numel())
     assert dim == 0, "dim != 0 unsupported"

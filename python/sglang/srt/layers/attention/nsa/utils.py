@@ -20,6 +20,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import ceil_align, ceil_div
+from sglang.srt.utils.triton_compat import tl, triton_jit
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -213,33 +214,26 @@ def cp_split_and_rebuild_position(forward_batch, positions: torch.Tensor):
     return positions
 
 
-try:
-    import triton
-    import triton.language as tl
-
-    @triton.jit
-    def nsa_cp_round_robin_split_q_seqs_kernel(
-        in_seqs_ptr,
-        out_seqs_ptr,
-        bs_idx_ptr,
-        tokens: tl.constexpr,
-        cp_size: tl.constexpr,
-        cp_rank: tl.constexpr,
-    ):
-        extra_seq = 0
-        bs_idx = 0
-        for bs in range(tokens):
-            cur_len = tl.load(in_seqs_ptr + bs)
-            cur_len += extra_seq
-            cur_seq = cur_len // cp_size + (cur_len % cp_size > cp_rank)
-            if cur_seq > 0:
-                tl.store(bs_idx_ptr + bs_idx, bs)
-                tl.store(out_seqs_ptr + bs_idx, cur_seq)
-                bs_idx += 1
-            extra_seq = cur_len - cur_seq * cp_size
-
-except ImportError:
-    pass
+@triton_jit
+def nsa_cp_round_robin_split_q_seqs_kernel(
+    in_seqs_ptr,
+    out_seqs_ptr,
+    bs_idx_ptr,
+    tokens: tl.constexpr,
+    cp_size: tl.constexpr,
+    cp_rank: tl.constexpr,
+):
+    extra_seq = 0
+    bs_idx = 0
+    for bs in range(tokens):
+        cur_len = tl.load(in_seqs_ptr + bs)
+        cur_len += extra_seq
+        cur_seq = cur_len // cp_size + (cur_len % cp_size > cp_rank)
+        if cur_seq > 0:
+            tl.store(bs_idx_ptr + bs_idx, bs)
+            tl.store(out_seqs_ptr + bs_idx, cur_seq)
+            bs_idx += 1
+        extra_seq = cur_len - cur_seq * cp_size
 
 
 def nsa_cp_round_robin_split_q_seqs_cpu(extend_seqs):

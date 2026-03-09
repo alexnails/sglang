@@ -55,6 +55,7 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_compiler_backend, is_hip, is_npu, support_triton
+from sglang.srt.utils.triton_compat import tl, triton_jit
 from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
@@ -1114,41 +1115,33 @@ def compute_position_triton(
     return positions, extend_start_loc
 
 
-try:
-    import triton
-    import triton.language as tl
+@triton_jit
+def compute_position_kernel(
+    positions,
+    extend_start_loc,
+    extend_prefix_lens,
+    extend_seq_lens,
+    has_prefix: tl.constexpr,
+):
+    BLOCK_SIZE: tl.constexpr = 512
+    pid = tl.program_id(0).to(tl.int64)
 
-    @triton.jit
-    def compute_position_kernel(
-        positions,
-        extend_start_loc,
-        extend_prefix_lens,
-        extend_seq_lens,
-        has_prefix: tl.constexpr,
-    ):
-        BLOCK_SIZE: tl.constexpr = 512
-        pid = tl.program_id(0).to(tl.int64)
+    prefix_len = tl.load(extend_prefix_lens + pid) if has_prefix else 0
+    seq_len = tl.load(extend_seq_lens + pid)
 
-        prefix_len = tl.load(extend_prefix_lens + pid) if has_prefix else 0
-        seq_len = tl.load(extend_seq_lens + pid)
+    cumsum_start = tl.cast(0, tl.int64)
+    for i in range(pid):
+        cumsum_start += tl.load(extend_seq_lens + i)
 
-        # NOTE: This can be slow for large bs
-        cumsum_start = tl.cast(0, tl.int64)
-        for i in range(pid):
-            cumsum_start += tl.load(extend_seq_lens + i)
-
-        num_loop = tl.cdiv(seq_len, BLOCK_SIZE)
-        for i in range(num_loop):
-            offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
-            tl.store(
-                positions + cumsum_start + offset,
-                prefix_len + offset,
-                mask=offset < seq_len,
-            )
-        tl.store(extend_start_loc + pid, cumsum_start)
-
-except ImportError:
-    pass
+    num_loop = tl.cdiv(seq_len, BLOCK_SIZE)
+    for i in range(num_loop):
+        offset = tl.arange(0, BLOCK_SIZE) + i * BLOCK_SIZE
+        tl.store(
+            positions + cumsum_start + offset,
+            prefix_len + offset,
+            mask=offset < seq_len,
+        )
+    tl.store(extend_start_loc + pid, cumsum_start)
 
 
 def compute_position_torch(

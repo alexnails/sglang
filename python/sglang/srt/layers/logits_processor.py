@@ -54,6 +54,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils.common import is_npu, use_intel_amx_backend
+from sglang.srt.utils.triton_compat import has_triton, tl, triton, triton_jit
 
 logger = logging.getLogger(__name__)
 
@@ -1080,44 +1081,32 @@ class LogitsProcessor(nn.Module):
         )
 
 
-try:
-    import triton
-    import triton.language as tl
+@triton_jit
+def fused_softcap_kernel(
+    full_logits_ptr,
+    softcapping_value,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid = tl.program_id(0).to(tl.int64)
+    block_start = pid * BLOCK_SIZE
+    offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_elements
 
-    @triton.jit
-    def fused_softcap_kernel(
-        full_logits_ptr,
-        softcapping_value,
-        n_elements,
-        BLOCK_SIZE: tl.constexpr,
-    ):
-        pid = tl.program_id(0).to(tl.int64)
-        block_start = pid * BLOCK_SIZE
-        offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < n_elements
+    x = tl.load(full_logits_ptr + offsets, mask=mask)
 
-        # Load values
-        x = tl.load(full_logits_ptr + offsets, mask=mask)
+    x = x / softcapping_value
 
-        # Perform operations in-place
-        x = x / softcapping_value
+    exp2x = tl.exp(2 * x)
+    x = (exp2x - 1) / (exp2x + 1)
 
-        # Manual tanh implementation using exp
-        exp2x = tl.exp(2 * x)
-        x = (exp2x - 1) / (exp2x + 1)
+    x = x * softcapping_value
 
-        x = x * softcapping_value
-
-        # Store result
-        tl.store(full_logits_ptr + offsets, x, mask=mask)
-
-    _HAS_TRITON = True
-except ImportError:
-    _HAS_TRITON = False
+    tl.store(full_logits_ptr + offsets, x, mask=mask)
 
 
 def fused_softcap(full_logits, final_logit_softcapping):
-    if _HAS_TRITON:
+    if has_triton():
         n_elements = full_logits.numel()
         BLOCK_SIZE = 1024
         grid = ((n_elements + BLOCK_SIZE - 1) // BLOCK_SIZE, 1, 1)
