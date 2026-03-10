@@ -1,5 +1,6 @@
 from typing import Callable
 
+import torch
 from torch import nn
 
 from sglang.srt.utils import (
@@ -19,6 +20,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
+_is_mps = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
 
 
 class MultiPlatformOp(nn.Module):
@@ -97,6 +99,9 @@ class MultiPlatformOp(nn.Module):
     def forward_cpu(self, *args, **kwargs):
         return self.forward_native(*args, **kwargs)
 
+    def forward_mps(self, *args, **kwargs):
+        return self.forward_native(*args, **kwargs)
+
     def dispatch_forward(self):
         if _is_cuda:
             return self.forward_cuda
@@ -110,5 +115,7 @@ class MultiPlatformOp(nn.Module):
             return self.forward_xpu
         elif _is_musa:
             return self.forward_musa
+        elif _is_mps:
+            return self.forward_mps
         else:
             return self.forward_native

@@ -580,6 +580,11 @@ def get_available_gpu_memory(
         if empty_cache:
             torch.npu.empty_cache()
         free_gpu_memory, total_gpu_memory = torch.npu.mem_get_info()
+    elif device == "mps":
+        recommended = torch.mps.recommended_max_memory()
+        allocated = torch.mps.current_allocated_memory()
+        free_gpu_memory = max(recommended - allocated, 0)
+
     elif device == "musa":
         num_gpus = torch.musa.device_count()
         assert gpu_id < num_gpus
@@ -616,6 +621,20 @@ def is_pin_memory_available(device=None) -> bool:
     if device is not None and str(device) == "cpu":
         return False
     return True
+
+
+def should_use_non_blocking(device=None) -> bool:
+    """Whether non_blocking=True is safe for CPU<->device tensor transfers.
+
+    On MPS, non_blocking transfers cause data races: the destination tensor
+    may be read (via .tolist(), .item(), or indexing) before the async copy
+    completes, returning garbage values.  CUDA avoids this because pinned-
+    memory copies are properly stream-ordered.
+    """
+    if device is None:
+        return True
+    device_type = str(device).split(":")[0]
+    return device_type != "mps"
 
 
 class LayerFn(Protocol):
@@ -2100,6 +2119,9 @@ def get_device(device_id: Optional[int] = None) -> str:
             return "musa"
         return "musa:{}".format(device_id)
 
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return "mps"
+
     is_host_cpu_supported = is_host_cpu_x86() or is_host_cpu_arm64()
     if is_host_cpu_supported:
         os.environ["SGLANG_USE_CPU_ENGINE"] = "1"
@@ -2108,7 +2130,7 @@ def get_device(device_id: Optional[int] = None) -> str:
         return "cpu"
 
     raise RuntimeError(
-        "No accelerator (CUDA, XPU, HPU, NPU, MUSA) is available "
+        "No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS) is available "
         "and CPU architecture is not supported."
     )
 
@@ -2135,6 +2157,9 @@ def get_device_count() -> int:
                 return torch.hpu.device_count()
         except (ImportError, RuntimeError):
             return 0
+
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return 1
 
     return 0  # No accelerators available
 

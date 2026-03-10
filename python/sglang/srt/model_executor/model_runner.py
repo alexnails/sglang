@@ -400,7 +400,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         pre_model_load_memory = self.init_torch_distributed()
 
         # Init forward stream for overlap schedule
-        self.forward_stream = torch.get_device_module(self.device).Stream()
+        device_module = torch.get_device_module(self.device)
+        if hasattr(device_module, "Stream"):
+            self.forward_stream = device_module.Stream()
+        else:
+            self.forward_stream = None
 
         # CPU offload
         set_offloader(create_offloader_from_server_args(server_args, dp_rank=dp_rank))
@@ -741,13 +745,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         tic = time.perf_counter()
         logger.info("Init torch distributed begin.")
 
-        try:
-            torch.get_device_module(self.device).set_device(self.gpu_id)
-        except Exception:
-            logger.warning(
-                f"Context: {self.device=} {self.gpu_id=} {os.environ.get('CUDA_VISIBLE_DEVICES')=} {self.tp_rank=} {self.tp_size=}"
-            )
-            raise
+        device_module = torch.get_device_module(self.device)
+        if hasattr(device_module, "set_device"):
+            try:
+                device_module.set_device(self.gpu_id)
+            except Exception:
+                logger.warning(
+                    f"Context: {self.device=} {self.gpu_id=} {os.environ.get('CUDA_VISIBLE_DEVICES')=} {self.tp_rank=} {self.tp_size=}"
+                )
+                raise
 
         backend = get_default_distributed_backend(self.device)
         if self.device == "cuda" and self.server_args.elastic_ep_backend == "mooncake":

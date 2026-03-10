@@ -1033,13 +1033,20 @@ class Scheduler(
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
 
-        self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
-            self.forward_stream
-        )
-        self.copy_stream: CudaStream = self.device_module.Stream()
-        self.copy_stream_ctx: CudaStreamContext = self.device_module.stream(
-            self.copy_stream
-        )
+        if hasattr(self.device_module, "stream") and hasattr(
+            self.device_module, "Stream"
+        ):
+            self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
+                self.forward_stream
+            )
+            self.copy_stream: CudaStream = self.device_module.Stream()
+            self.copy_stream_ctx: CudaStreamContext = self.device_module.stream(
+                self.copy_stream
+            )
+        else:
+            self.forward_stream_ctx = contextlib.nullcontext()
+            self.copy_stream = None
+            self.copy_stream_ctx = contextlib.nullcontext()
 
         if not self.enable_overlap:
             self.future_map = None
@@ -1229,12 +1236,15 @@ class Scheduler(
         Sets up the schedule stream and dispatches to the appropriate event loop.
         The event loop blocks until shutdown.
         """
-        self.schedule_stream = self.device_module.Stream(priority=0)
-        if self.device == "cpu":
-            self.schedule_stream.synchronize = lambda: None  # No-op for CPU
+        if hasattr(self.device_module, "Stream"):
+            self.schedule_stream = self.device_module.Stream(priority=0)
+            if self.device == "cpu":
+                self.schedule_stream.synchronize = lambda: None  # No-op for CPU
+        else:
+            self.schedule_stream = None
         stream_ctx = (
             contextlib.nullcontext()
-            if self.device == "cpu"
+            if self.device in ("cpu", "mps")
             else CudaStreamContext(self.schedule_stream)
         )
         with stream_ctx:
@@ -2596,7 +2606,8 @@ class Scheduler(
             return
 
         with self.forward_stream_ctx:
-            self.forward_stream.wait_stream(self.schedule_stream)
+            if self.forward_stream is not None:
+                self.forward_stream.wait_stream(self.schedule_stream)
             _batch_result = batch_result.delay_sample_func()
             assert _batch_result is batch_result
             self.future_map.store_to_map(batch_result.future_indices, batch_result)

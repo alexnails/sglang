@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils.common import ceil_align, is_pin_memory_available
+from sglang.srt.utils.common import (
+    ceil_align,
+    is_pin_memory_available,
+    should_use_non_blocking,
+)
 
 # Copyright 2023-2024 SGLang Team
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -1365,6 +1369,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     def prepare_encoder_info_extend(self, input_ids: List[int], seq_lens: List[int]):
         _pin = is_pin_memory_available(self.device)
+        _nb = should_use_non_blocking(self.device)
         self.encoder_lens_cpu = []
         self.encoder_cached = []
 
@@ -1383,7 +1388,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         self.encoder_lens = torch.tensor(
             self.encoder_lens_cpu, dtype=torch.int64, pin_memory=_pin
-        ).to(self.device, non_blocking=True)
+        ).to(self.device, non_blocking=_nb)
 
         # Strip encoder infos
         pt = 0
@@ -1414,22 +1419,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Reassign
         self.input_ids = torch.tensor(
             sum(input_ids, []), dtype=torch.int64, pin_memory=_pin
-        ).to(self.device, non_blocking=True)
+        ).to(self.device, non_blocking=_nb)
         self.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
-            self.device, non_blocking=True
+            self.device, non_blocking=_nb
         )
         self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
 
         if not decoder_out_cache_loc:
             self.out_cache_loc = torch.zeros(0, dtype=torch.int64).to(
-                self.device, non_blocking=True
+                self.device, non_blocking=_nb
             )
         else:
             self.out_cache_loc = torch.cat(decoder_out_cache_loc)
 
         if not encoder_out_cache_loc:
             self.encoder_out_cache_loc = torch.zeros(0, dtype=torch.int64).to(
-                self.device, non_blocking=True
+                self.device, non_blocking=_nb
             )
         else:
             self.encoder_out_cache_loc = torch.cat(encoder_out_cache_loc)
@@ -1468,22 +1473,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ]
 
         _pin = is_pin_memory_available(self.device)
+        _nb = should_use_non_blocking(self.device)
         input_ids_tensor = torch.tensor(
             list(chain.from_iterable(input_ids)), dtype=torch.int64, pin_memory=_pin
-        ).to(self.device, non_blocking=True)
+        ).to(self.device, non_blocking=_nb)
         seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int64, pin_memory=_pin).to(
-            self.device, non_blocking=True
+            self.device, non_blocking=_nb
         )
         seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
         orig_seq_lens_tensor = torch.tensor(
             orig_seq_lens, dtype=torch.int32, pin_memory=_pin
-        ).to(self.device, non_blocking=True)
+        ).to(self.device, non_blocking=_nb)
 
         token_type_ids_tensor = None
         if len(token_type_ids) > 0:
             token_type_ids_tensor = torch.tensor(
                 sum(token_type_ids, []), dtype=torch.int64, pin_memory=_pin
-            ).to(self.device, non_blocking=True)
+            ).to(self.device, non_blocking=_nb)
 
         # Set batch fields needed by alloc_for_extend
         self.prefix_lens = prefix_lens
@@ -1621,7 +1627,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.out_cache_loc = out_cache_loc
         self.input_embeds = (
             torch.tensor(input_embeds, pin_memory=_pin).to(
-                self.device, non_blocking=True
+                self.device, non_blocking=_nb
             )
             if input_embeds
             else None
@@ -1632,7 +1638,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             for mm_item in mm_input.mm_items:
                 pixel_values = getattr(mm_item, "feature", None)
                 if isinstance(pixel_values, torch.Tensor):
-                    mm_item.feature = pixel_values.to(self.device, non_blocking=True)
+                    mm_item.feature = pixel_values.to(self.device, non_blocking=_nb)
                 elif isinstance(pixel_values, CudaIpcTensorTransportProxy):
                     mm_item.feature = pixel_values.reconstruct_on_target_device(
                         torch.cuda.current_device()
@@ -1646,7 +1652,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     )
                     if isinstance(precomputed_embeddings, torch.Tensor):
                         mm_item.precomputed_embeddings = precomputed_embeddings.to(
-                            self.device, non_blocking=True
+                            self.device, non_blocking=_nb
                         )
         self.multimodal_inputs = multimodal_inputs
         self.token_type_ids = token_type_ids_tensor
@@ -2086,7 +2092,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             keep_indices,
             dtype=torch.int64,
             pin_memory=is_pin_memory_available(self.device),
-        ).to(self.device, non_blocking=True)
+        ).to(self.device, non_blocking=should_use_non_blocking(self.device))
 
         if self.model_config.is_encoder_decoder:
             self.encoder_lens = self.encoder_lens[keep_indices_device]

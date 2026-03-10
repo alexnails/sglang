@@ -10,6 +10,7 @@ import sglang.srt.sampling.penaltylib as penaltylib
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils.common import should_use_non_blocking
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -136,7 +137,7 @@ class SamplingBatchInfo:
                     # The mask tensor for the requests that use this custom logit processor
                     torch.zeros(len(reqs), dtype=torch.bool)
                     .scatter_(0, torch.tensor(true_indices), True)
-                    .to(device, non_blocking=True),
+                    .to(device, non_blocking=should_use_non_blocking(device)),
                 )
                 for processor_str, true_indices in processor_dict.items()
             }

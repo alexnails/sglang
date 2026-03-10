@@ -29,7 +29,8 @@ _is_cpu = is_cpu()
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
-if not (_is_cpu or _is_npu or _is_xpu):
+_is_mps = hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+if not (_is_cpu or _is_npu or _is_xpu or _is_mps):
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer,
         transfer_kv_all_layer_direct_lf_pf,

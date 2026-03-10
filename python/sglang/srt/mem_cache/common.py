@@ -10,7 +10,7 @@ from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPoo
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import support_triton
-from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.common import ceil_align, should_use_non_blocking
 from sglang.srt.utils.triton_compat import tl, triton, triton_jit
 
 if TYPE_CHECKING:
@@ -341,17 +341,18 @@ def alloc_for_extend(
     prefix_tensors = [r.prefix_indices for r in batch.reqs]
 
     # Create tensors for allocation
+    _nb = should_use_non_blocking(batch.device)
     prefix_lens_cpu = torch.tensor(batch.prefix_lens, dtype=torch.int64)
     extend_lens_cpu = torch.tensor(batch.extend_lens, dtype=torch.int64)
-    prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
-    extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
+    prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=_nb)
+    extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=_nb)
 
     # Allocate req slots
     req_pool_indices = alloc_req_slots(
         batch.req_to_token_pool, batch.reqs, batch.tree_cache
     )
     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
-    req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
+    req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=_nb)
 
     # Allocate KV cache (throws exception on failure)
     if batch.tree_cache.page_size == 1:

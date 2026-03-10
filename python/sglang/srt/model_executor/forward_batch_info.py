@@ -55,8 +55,8 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import get_compiler_backend, is_hip, is_npu, support_triton
+from sglang.srt.utils.common import ceil_align, should_use_non_blocking
 from sglang.srt.utils.triton_compat import tl, triton_jit
-from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -469,16 +469,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             rids=[req.rid for req in batch.reqs],
         )
         device = model_runner.device
+        _nb = should_use_non_blocking(device)
 
         if batch.extend_input_logprob_token_ids is not None:
             ret.extend_input_logprob_token_ids_gpu = (
-                batch.extend_input_logprob_token_ids.to(device, non_blocking=True)
+                batch.extend_input_logprob_token_ids.to(device, non_blocking=_nb)
             )
 
         if enable_num_token_non_padded(model_runner.server_args):
             ret.num_token_non_padded = torch.tensor(
                 len(batch.input_ids), dtype=torch.int32
-            ).to(device, non_blocking=True)
+            ).to(device, non_blocking=_nb)
         ret.num_token_non_padded_cpu = len(batch.input_ids)
 
         # For MLP sync
@@ -499,12 +500,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.global_num_tokens_cpu = global_num_tokens
             ret.global_num_tokens_gpu = torch.tensor(
                 global_num_tokens, dtype=torch.int64
-            ).to(device, non_blocking=True)
+            ).to(device, non_blocking=_nb)
 
             ret.global_num_tokens_for_logprob_cpu = global_num_tokens_for_logprob
             ret.global_num_tokens_for_logprob_gpu = torch.tensor(
                 global_num_tokens_for_logprob, dtype=torch.int64
-            ).to(device, non_blocking=True)
+            ).to(device, non_blocking=_nb)
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), dtype=torch.int64, device=device)
@@ -522,7 +523,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     for i in range(block_offset, block_offset + block_size)
                 ],
                 dtype=positions_dtype,
-            ).to(device, non_blocking=True)
+            ).to(device, non_blocking=_nb)
         elif (
             ret.spec_info is not None
             and getattr(ret.spec_info, "positions", None) is not None
@@ -538,10 +539,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             assert isinstance(batch.extend_prefix_lens, list)
             ret.extend_seq_lens = torch.tensor(
                 batch.extend_seq_lens, dtype=torch.int32
-            ).to(device, non_blocking=True)
+            ).to(device, non_blocking=_nb)
             ret.extend_prefix_lens = torch.tensor(
                 batch.extend_prefix_lens, dtype=torch.int32
-            ).to(device, non_blocking=True)
+            ).to(device, non_blocking=_nb)
             ret.extend_num_tokens = batch.extend_num_tokens
             positions, ret.extend_start_loc = compute_position(
                 model_runner.server_args.attention_backend,
@@ -783,7 +784,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.mrope_positions = torch.cat(
             [pos for pos in mrope_positions_list],
             dim=1,
-        ).to(dtype=torch.int64, device=model_runner.device, non_blocking=True)
+        ).to(
+            dtype=torch.int64,
+            device=model_runner.device,
+            non_blocking=should_use_non_blocking(model_runner.device),
+        )
 
     def _pad_tensor_to_size(self, tensor: torch.Tensor, size: int, *, value: int = 0):
         if value == 0:

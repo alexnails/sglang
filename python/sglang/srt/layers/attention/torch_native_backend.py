@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 from torch.nn.functional import scaled_dot_product_attention
@@ -38,14 +38,19 @@ class TorchNativeAttnBackend(AttentionBackend):
         scaling=None,
         enable_gqa=False,
         causal=False,
+        seq_lens_cpu: Optional[torch.Tensor] = None,
+        extend_prefix_lens_cpu: Optional[List[int]] = None,
+        extend_seq_lens_cpu: Optional[List[int]] = None,
     ):
         """Run the extend forward by using torch native sdpa op.
+
+        Pre-computes loop indices on CPU to avoid per-iteration GPU->CPU syncs.
 
         Args:
             query: [num_tokens, num_heads, head_size]
             output: [num_tokens, num_heads, head_size]
-            k_cache: [max_total_num_tokens, num_heads, head_size]
-            v_cache: [max_total_num_tokens, num_heads, head_size]
+            k_cache: [max_total_num_tokens, num_kv_heads, head_size]
+            v_cache: [max_total_num_tokens, num_kv_heads, head_size]
             req_to_token: [max_num_reqs, max_context_len]
             req_pool_indices: [num_seqs]
             seq_lens: [num_seqs]
@@ -54,47 +59,61 @@ class TorchNativeAttnBackend(AttentionBackend):
             scaling: float or None
             enable_gqa: bool
             causal: bool
+            seq_lens_cpu: optional CPU tensor to avoid GPU sync
+            extend_prefix_lens_cpu: optional CPU list to avoid GPU sync
+            extend_seq_lens_cpu: optional CPU list to avoid GPU sync
 
         Returns:
             output: [num_tokens, num_heads, head_size]
         """
+        num_seqs = seq_lens.shape[0]
+        if num_seqs == 0:
+            return output
 
-        assert seq_lens.shape[0] == extend_prefix_lens.shape[0]
-        assert seq_lens.shape[0] == extend_seq_lens.shape[0]
+        assert num_seqs == extend_prefix_lens.shape[0]
+        assert num_seqs == extend_seq_lens.shape[0]
+
+        # Pre-compute all loop-control values on CPU (one sync instead of N)
+        if extend_seq_lens_cpu is None:
+            extend_seq_lens_cpu = extend_seq_lens.tolist()
+        if extend_prefix_lens_cpu is None:
+            extend_prefix_lens_cpu = extend_prefix_lens.tolist()
+        if seq_lens_cpu is not None:
+            seq_lens_list = (
+                seq_lens_cpu.tolist()
+                if isinstance(seq_lens_cpu, torch.Tensor)
+                else list(seq_lens_cpu)
+            )
+        else:
+            seq_lens_list = seq_lens.tolist()
+        req_pool_indices_list = req_pool_indices.tolist()
 
         # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
         query = query.movedim(0, query.dim() - 2)
 
-        start_q, start_kv = 0, 0
-        for seq_idx in range(seq_lens.shape[0]):
-            # TODO: this loop process a sequence per iter, this is inefficient.
-            # Need optimize the performance later.
+        start_q = 0
+        for seq_idx in range(num_seqs):
+            ext_len = extend_seq_lens_cpu[seq_idx]
+            prefix_len = extend_prefix_lens_cpu[seq_idx]
+            seq_len = seq_lens_list[seq_idx]
+            req_idx = req_pool_indices_list[seq_idx]
 
-            extend_seq_len_q = extend_seq_lens[seq_idx]
-            prefill_seq_len_q = extend_prefix_lens[seq_idx]
-
-            seq_len_kv = seq_lens[seq_idx]
-            end_q = start_q + extend_seq_len_q
-            end_kv = start_kv + seq_len_kv
+            end_q = start_q + ext_len
 
             per_req_query = query[:, start_q:end_q, :]
             per_req_query_redudant = torch.empty(
-                (per_req_query.shape[0], seq_len_kv, per_req_query.shape[2]),
+                (per_req_query.shape[0], seq_len, per_req_query.shape[2]),
                 dtype=per_req_query.dtype,
                 device=per_req_query.device,
             )
 
-            per_req_query_redudant[:, prefill_seq_len_q:, :] = per_req_query
+            per_req_query_redudant[:, prefix_len:, :] = per_req_query
 
-            # get key and value from cache. per_req_tokens contains the kv cache
-            # index for each token in the sequence.
-            req_pool_idx = req_pool_indices[seq_idx]
-            per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv]
+            per_req_tokens = req_to_token[req_idx, :seq_len]
             per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
             per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
 
             if not (per_req_query.dtype == per_req_key.dtype == per_req_value.dtype):
-                # scaled_dot_product_attention() expects query, key, and value to have the same dtype
                 per_req_key = per_req_key.to(per_req_query.dtype)
                 per_req_value = per_req_value.to(per_req_query.dtype)
 
@@ -110,8 +129,8 @@ class TorchNativeAttnBackend(AttentionBackend):
                 .squeeze(0)
                 .movedim(query.dim() - 2, 0)
             )
-            output[start_q:end_q, :, :] = per_req_out_redudant[prefill_seq_len_q:, :, :]
-            start_q, start_kv = end_q, end_kv
+            output[start_q:end_q, :, :] = per_req_out_redudant[prefix_len:, :, :]
+            start_q = end_q
         return output
 
     def _run_sdpa_forward_decode(
@@ -126,67 +145,96 @@ class TorchNativeAttnBackend(AttentionBackend):
         scaling=None,
         enable_gqa=False,
         causal=False,
+        seq_lens_cpu: Optional[torch.Tensor] = None,
     ):
-        """Run the decode forward by using torch native sdpa op.
+        """Batched decode forward: single vectorized SDPA call for all requests.
+
+        Instead of looping per-request (N separate SDPA calls with GPU syncs),
+        gathers all K/V into padded tensors and runs one batched SDPA.
 
         Args:
-            query: [num_tokens, num_heads, head_size]
-            output: [num_tokens, num_heads, head_size]
-            k_cache: [max_total_num_tokens, num_heads, head_size]
-            v_cache: [max_total_num_tokens, num_heads, head_size]
+            query: [batch_size, num_q_heads, qk_head_dim]
+            output: [batch_size, num_q_heads, v_head_dim]
+            k_cache: [max_total_num_tokens, num_kv_heads, qk_head_dim]
+            v_cache: [max_total_num_tokens, num_kv_heads, v_head_dim]
             req_to_token: [max_num_reqs, max_context_len]
-            req_pool_indices: [num_seqs]
-            seq_lens: [num_seqs]
+            req_pool_indices: [batch_size]
+            seq_lens: [batch_size]
             scaling: float or None
             enable_gqa: bool
-            causal: bool
+            causal: bool (unused, decode is never causal)
+            seq_lens_cpu: optional CPU tensor to avoid GPU sync
 
         Returns:
-            output: [num_tokens, num_heads, head_size]
+            output: [batch_size, num_q_heads, v_head_dim]
         """
+        bs = query.shape[0]
+        if bs == 0:
+            return output
 
-        # [num_tokens, num_heads, head_size] -> [num_heads, num_tokens, head_size]
-        query = query.movedim(0, query.dim() - 2)
+        device = query.device
 
-        start_q, start_kv = 0, 0
-        for seq_idx in range(seq_lens.shape[0]):
-            # TODO: this loop process a sequence per iter, this is inefficient.
-            # Need optimize the performance later.
+        # Compute max KV length from CPU tensor to avoid a GPU->CPU sync
+        if seq_lens_cpu is not None:
+            max_kv_len = int(seq_lens_cpu.max().item())
+        else:
+            max_kv_len = int(seq_lens.max().item())
 
-            seq_len_q = 1
-            seq_len_kv = seq_lens[seq_idx]
-            end_q = start_q + seq_len_q
-            end_kv = start_kv + seq_len_kv
+        if max_kv_len == 0:
+            return output
 
-            per_req_query = query[:, start_q:end_q, :]
+        # Vectorized KV index gathering: select the req_to_token rows for
+        # all requests at once, then truncate to max_kv_len.
+        gather_indices = req_to_token[req_pool_indices, :max_kv_len]  # [bs, max_kv_len]
 
-            # get key and value from cache. per_req_tokens contains the kv cache
-            # index for each token in the sequence.
-            req_pool_idx = req_pool_indices[seq_idx]
-            per_req_tokens = req_to_token[req_pool_idx, :seq_len_kv]
-            per_req_key = k_cache[per_req_tokens].movedim(0, query.dim() - 2)
-            per_req_value = v_cache[per_req_tokens].movedim(0, query.dim() - 2)
+        # Mask: True for valid KV positions, False for padding
+        arange = torch.arange(max_kv_len, device=device)
+        valid_mask = arange.unsqueeze(0) < seq_lens.unsqueeze(1)  # [bs, max_kv_len]
 
-            if not (per_req_query.dtype == per_req_key.dtype == per_req_value.dtype):
-                # scaled_dot_product_attention() expects query, key, and value to have the same dtype
-                per_req_key = per_req_key.to(per_req_query.dtype)
-                per_req_value = per_req_value.to(per_req_query.dtype)
+        # Zero out padding indices so gather doesn't hit out-of-bounds
+        gather_indices = gather_indices * valid_mask.long()
 
-            per_req_out = (
-                scaled_dot_product_attention(
-                    per_req_query.unsqueeze(0),
-                    per_req_key.unsqueeze(0),
-                    per_req_value.unsqueeze(0),
-                    enable_gqa=enable_gqa,
-                    scale=scaling,
-                    is_causal=causal,
-                )
-                .squeeze(0)
-                .movedim(query.dim() - 2, 0)
-            )
-            output[start_q:end_q, :, :] = per_req_out
-            start_q, start_kv = end_q, end_kv
+        # Batched gather: fetch all K/V in one operation
+        flat_idx = gather_indices.reshape(-1)  # [bs * max_kv_len]
+        num_kv_heads = k_cache.shape[1]
+        qk_head_dim = k_cache.shape[2]
+        v_head_dim = v_cache.shape[2]
 
+        # [bs * max_kv_len, num_kv_heads, head_dim] -> [bs, num_kv_heads, max_kv_len, head_dim]
+        gathered_k = (
+            k_cache[flat_idx]
+            .reshape(bs, max_kv_len, num_kv_heads, qk_head_dim)
+            .transpose(1, 2)
+        )
+        gathered_v = (
+            v_cache[flat_idx]
+            .reshape(bs, max_kv_len, num_kv_heads, v_head_dim)
+            .transpose(1, 2)
+        )
+
+        if gathered_k.dtype != query.dtype:
+            gathered_k = gathered_k.to(query.dtype)
+            gathered_v = gathered_v.to(query.dtype)
+
+        # Query: [bs, num_q_heads, qk_head_dim] -> [bs, num_q_heads, 1, qk_head_dim]
+        q = query.unsqueeze(2)
+
+        # Attention mask: [bs, 1, 1, max_kv_len]
+        attn_mask = valid_mask.unsqueeze(1).unsqueeze(1)
+
+        # Single batched SDPA call for ALL requests
+        attn_out = scaled_dot_product_attention(
+            q,
+            gathered_k,
+            gathered_v,
+            attn_mask=attn_mask,
+            enable_gqa=enable_gqa,
+            scale=scaling,
+            is_causal=False,
+        )
+
+        # [bs, num_q_heads, 1, v_head_dim] -> [bs, num_q_heads, v_head_dim]
+        output[:] = attn_out.squeeze(2)
         return output
 
     def forward_extend(
@@ -233,6 +281,9 @@ class TorchNativeAttnBackend(AttentionBackend):
             scaling=layer.scaling,
             enable_gqa=use_gqa,
             causal=causal,
+            seq_lens_cpu=forward_batch.seq_lens_cpu,
+            extend_prefix_lens_cpu=forward_batch.extend_prefix_lens_cpu,
+            extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
         )
         return o
 
@@ -278,9 +329,28 @@ class TorchNativeAttnBackend(AttentionBackend):
             scaling=layer.scaling,
             enable_gqa=use_gqa,
             causal=False,
+            seq_lens_cpu=forward_batch.seq_lens_cpu,
         )
 
         return o
+
+    def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
+        pass
+
+    def init_forward_metadata_capture_cpu_graph(
+        self,
+        bs: int,
+        num_tokens: int,
+        req_pool_indices,
+        seq_lens,
+        encoder_lens,
+        forward_mode,
+        spec_info,
+    ):
+        pass
+
+    def get_cpu_graph_seq_len_fill_value(self):
+        return 1
 
     def support_triton(self):
         return False

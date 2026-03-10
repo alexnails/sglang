@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sglang-mps"
+version = "0.1.0"
+description = "Apple MPS (Metal) platform plugin for SGLang"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: Apache Software License",
+  "Operating System :: MacOS",
+]
+dependencies = [
+  "sglang",
+  "psutil",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/sgl-project/sglang/tree/main/sglang-mps"
+"Bug Tracker" = "https://github.com/sgl-project/sglang/issues"
+
+[project.entry-points."sglang.platforms"]
+mps = "sglang_mps.platform:MPSSRTPlatform"
