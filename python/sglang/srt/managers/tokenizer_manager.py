@@ -1662,7 +1662,11 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                             state.last_text_offset = len(state.get_text())
                     else:
                         output_token_ids = state.output_ids.copy()
-                        output_text = state.get_text() if isinstance(recv_obj, BatchStrOutput) else None
+                        output_text = (
+                            state.get_text()
+                            if isinstance(recv_obj, BatchStrOutput)
+                            else None
+                        )
                     out_dict = {"output_ids": output_token_ids, "meta_info": meta_info}
                     if output_text is not None:
                         out_dict["text"] = output_text
