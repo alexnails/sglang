@@ -769,6 +769,51 @@ def _launch_server_process(
     return proc
 
 
+def _ensure_port_free(port: int, timeout: float = 10.0) -> None:
+    """Kill any process occupying *port* and wait until it is free.
+
+    In CI, stale server processes from previous jobs can linger on the test
+    port.  If _wait_for_server_health connects to such a stale server, the
+    health check passes immediately against the wrong process, and the actual
+    test fails with confusing errors (e.g. 404 on /v1/completions).
+    """
+    if is_port_available(port):
+        return
+
+    print(
+        f"Port {port} is already in use — killing the occupying process "
+        f"to avoid stale-server interference.",
+        flush=True,
+    )
+
+    # Find and kill the process holding the port.
+    try:
+        result = subprocess.run(
+            ["lsof", "-ti", f"tcp:{port}"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        pids = [int(p) for p in result.stdout.split() if p.strip()]
+        for pid in pids:
+            try:
+                os.kill(pid, 9)
+                print(f"  Killed PID {pid}", flush=True)
+            except OSError:
+                pass
+    except Exception as e:
+        print(f"  Warning: could not identify process on port {port}: {e}", flush=True)
+
+    # Wait for the port to become available.
+    deadline = time.perf_counter() + timeout
+    while time.perf_counter() < deadline:
+        if is_port_available(port):
+            return
+        time.sleep(0.5)
+
+    print(f"  Warning: port {port} still occupied after {timeout}s", flush=True)
+
+
 def _wait_for_server_health(
     proc: subprocess.Popen,
     base_url: str,
@@ -909,6 +954,11 @@ def popen_launch_server(
         command += ["--api-key", api_key]
 
     print(f"command={shlex.join(command)}")
+
+    # Ensure the target port is free before launching.  A stale process from
+    # a previous CI job/partition may still be listening, which would cause
+    # _wait_for_server_health to pass against the wrong server.
+    _ensure_port_free(int(port))
 
     # Track if offline mode was enabled for potential retry
     offline_enabled = env.get("HF_HUB_OFFLINE") == "1"
