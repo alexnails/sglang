@@ -563,12 +563,6 @@ class ModelConfig:
         self.num_key_value_heads = getattr(
             self.hf_text_config, "num_key_value_heads", None
         )
-        self.first_k_dense_replace = getattr(
-            self.hf_text_config, "first_k_dense_replace", None
-        )
-        self.full_attention_interval = getattr(
-            self.hf_text_config, "full_attention_interval", None
-        )
 
         # for Dbrx and MPT models
         if self.hf_config.model_type in ["dbrx", "mpt"]:
@@ -1317,6 +1311,7 @@ multimodal_model_archs = [
     "LlavaQwenForCausalLM",
     "LlavaForConditionalGeneration",
     "LlavaVidForCausalLM",
+    "Lfm2VlForConditionalGeneration",
     "LightOnOCRForConditionalGeneration",
     "MiniCPMO",
     "MiniCPMV",
