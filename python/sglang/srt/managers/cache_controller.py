@@ -267,8 +267,11 @@ class HiCacheController:
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 
         if isinstance(mem_pool_device, HybridLinearKVPool):
+            mem_pool_device = mem_pool_device.full_kv_pool
+        elif isinstance(mem_pool_device, SWAKVPool):
             mem_pool_device = mem_pool_device.full_kv_pool
         self.mem_pool_device = mem_pool_device
         self.mem_pool_host = mem_pool_host

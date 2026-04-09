@@ -42,6 +42,7 @@ from sglang.srt.mem_cache.radix_cache import (
     compute_node_hash_values,
     split_node_hash_value,
 )
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.mem_cache.utils import convert_to_bigram_key
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
 
@@ -60,7 +61,19 @@ class HiRadixCache(RadixCache):
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
-        if isinstance(self.kv_cache, MHATokenToKVPool):
+        if isinstance(self.kv_cache, SWAKVPool):
+            # For hybrid SWA models (e.g. GPT OSS), only cache full attention
+            # layers on the host. SWA layers are bounded by the sliding window.
+            full_kv_pool = self.kv_cache.full_kv_pool
+            self.token_to_kv_pool_host = MHATokenToKVPoolHost(
+                full_kv_pool,
+                server_args.hicache_ratio,
+                server_args.hicache_size,
+                self.page_size,
+                server_args.hicache_mem_layout,
+                allocator_type=server_args.hicache_storage_backend,
+            )
+        elif isinstance(self.kv_cache, MHATokenToKVPool):
             self.token_to_kv_pool_host = MHATokenToKVPoolHost(
                 self.kv_cache,
                 server_args.hicache_ratio,
@@ -88,7 +101,7 @@ class HiRadixCache(RadixCache):
                 allocator_type=server_args.hicache_storage_backend,
             )
         else:
-            raise ValueError(f"HiRadixCache only supports MHA and MLA yet")
+            raise ValueError(f"HiRadixCache only supports MHA, MLA, and SWA yet")
 
         self.tp_group = params.tp_cache_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
