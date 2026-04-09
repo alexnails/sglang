@@ -1,0 +1,107 @@
+name: Build CI Base Image
+
+# Builds the pre-baked CI runner image with all heavy dependencies.
+# Runs weekly (Sunday midnight UTC) and on manual dispatch.
+# The image is pushed to ghcr.io/sgl-project/sglang-ci:{tag}.
+
+on:
+  schedule:
+    - cron: "0 0 * * 0" # Weekly on Sunday at midnight UTC
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag (default: latest)"
+        required: false
+        default: "latest"
+      cuda_version:
+        description: "CUDA version"
+        required: false
+        default: "12.9.1"
+
+concurrency:
+  group: build-ci-image-${{ inputs.tag || 'latest' }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/sglang-ci
+
+jobs:
+  build:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: x64-docker-build-node
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Free disk space
+        run: rm -rf /opt/hostedtoolcache
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          docker-images: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags
+        id: tags
+        run: |
+          TAG="${{ inputs.tag || 'latest' }}"
+          DATE_TAG="$(date -u '+%Y%m%d')"
+          CUDA="${{ inputs.cuda_version || '12.9.1' }}"
+
+          FULL_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          # Lowercase (GHCR requirement)
+          FULL_IMAGE=$(echo "$FULL_IMAGE" | tr '[:upper:]' '[:lower:]')
+
+          TAGS="${FULL_IMAGE}:${TAG}"
+          TAGS="${TAGS},${FULL_IMAGE}:${DATE_TAG}"
+          # Add cuda-suffixed tag for non-default CUDA versions
+          if [ "$CUDA" != "12.9.1" ]; then
+            CU_SHORT=$(echo "$CUDA" | sed 's/\.//g' | sed 's/^/cu/')
+            TAGS="${TAGS},${FULL_IMAGE}:${TAG}-${CU_SHORT}"
+          fi
+
+          echo "tags=${TAGS}" >> $GITHUB_OUTPUT
+          echo "build_date=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
+          echo "Tags: ${TAGS}"
+
+      - name: Build and push CI image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile.ci
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: |
+            CUDA_VERSION=${{ inputs.cuda_version || '12.9.1' }}
+            CI_IMAGE_BUILD_DATE=${{ steps.tags.outputs.build_date }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+
+      - name: Verify image
+        run: |
+          FULL_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          FULL_IMAGE=$(echo "$FULL_IMAGE" | tr '[:upper:]' '[:lower:]')
+          docker pull "${FULL_IMAGE}:${{ inputs.tag || 'latest' }}"
+          docker run --rm "${FULL_IMAGE}:${{ inputs.tag || 'latest' }}" \
+            python3 -c "import torch; print('torch', torch.__version__); import flashinfer; print('flashinfer OK')"
+          echo "Image verification passed"

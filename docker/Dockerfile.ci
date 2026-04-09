@@ -1,0 +1,147 @@
+# CI base image for SGLang self-hosted GPU runners.
+#
+# Pre-bakes all heavy dependencies so that ci_install_dependency.sh only needs
+# to do a lightweight editable install of sglang itself.
+#
+# Build:
+#   docker buildx build -f docker/Dockerfile.ci -t ghcr.io/sgl-project/sglang-ci:latest .
+#
+# Usage (runner provisioning — replaces the bare nvidia/cuda image):
+#   docker run --shm-size 128g -it -v /tmp/huggingface:/hf_home --gpus all \
+#       ghcr.io/sgl-project/sglang-ci:latest /bin/bash
+
+ARG CUDA_VERSION=12.9.1
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04
+
+ARG CUDA_VERSION
+ARG TARGETARCH
+
+# Versions — keep in sync with python/pyproject.toml & ci_install_dependency.sh
+ARG TORCH_VERSION=2.9.1
+ARG TORCHAUDIO_VERSION=2.9.1
+ARG TORCHAO_VERSION=0.9.0
+ARG FLASHINFER_VERSION=0.6.7.post3
+ARG SGL_KERNEL_VERSION=0.4.1
+ARG NVIDIA_CUDNN_VERSION=9.16.0.29
+ARG NVIDIA_NVSHMEM_VERSION=3.4.5
+ARG MOONCAKE_VERSION=0.3.10.post1
+ARG PROTOC_VERSION=32.0
+ARG CU_VERSION=cu129
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CUDA_HOME=/usr/local/cuda \
+    SGLANG_CI_BASE_IMAGE=1
+
+# ─── APT packages ────────────────────────────────────────────────────────────
+# Matches ci_install_dependency.sh CI_APT_PACKAGES + extras needed by tests
+RUN --mount=type=cache,target=/var/cache/apt,id=ci-apt \
+    apt-get update && apt-get install -y --no-install-recommends \
+    # Core (from ci_install_dependency.sh)
+    python3 python3-pip python3-venv python3-dev \
+    git git-lfs curl wget unzip \
+    libnuma-dev libssl-dev pkg-config \
+    libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils \
+    ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev \
+    # Build tools (for protoc, human-eval, etc.)
+    build-essential cmake gcc g++ perl make \
+    # Useful for debugging on runners
+    vim htop tmux less lsof \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Allow pip to install globally (PEP 668 workaround for Ubuntu 24.04)
+RUN python3 -m pip config set global.break-system-packages true
+
+# ─── Protoc ──────────────────────────────────────────────────────────────────
+RUN PROTOC_ARCH=$([ "$(uname -m)" = "aarch64" ] || [ "$(uname -m)" = "arm64" ] && echo "aarch_64" || echo "x86_64") \
+    && wget -q "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${PROTOC_ARCH}.zip" -O /tmp/protoc.zip \
+    && unzip -o /tmp/protoc.zip -d /usr/local \
+    && rm /tmp/protoc.zip \
+    && protoc --version
+
+# ─── pip / uv setup ──────────────────────────────────────────────────────────
+RUN python3 -m pip install --upgrade pip setuptools wheel uv
+
+# ─── PyTorch ─────────────────────────────────────────────────────────────────
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install \
+    "torch==${TORCH_VERSION}" \
+    "torchaudio==${TORCHAUDIO_VERSION}" \
+    "torchvision" \
+    "torchao==${TORCHAO_VERSION}" \
+    --extra-index-url "https://download.pytorch.org/whl/${CU_VERSION}"
+
+# ─── NVIDIA wheels (cudnn & nvshmem — PyPI returns no-store) ─────────────────
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install \
+    "nvidia-cudnn-cu12==${NVIDIA_CUDNN_VERSION}" \
+    "nvidia-nvshmem-cu12==${NVIDIA_NVSHMEM_VERSION}" \
+    "nvidia-cutlass-dsl>=4.4.1" \
+    "nvidia-cutlass-dsl-libs-base>=4.4.1" \
+    "nvidia-cuda-nvrtc-cu12"
+
+# ─── FlashInfer ──────────────────────────────────────────────────────────────
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install \
+    "flashinfer-python==${FLASHINFER_VERSION}" \
+    "flashinfer-cubin==${FLASHINFER_VERSION}"
+
+# FlashInfer JIT cache (1.2+ GB — the single largest download)
+RUN --mount=type=cache,target=/root/.cache/flashinfer-wheels \
+    pip download "flashinfer-jit-cache==${FLASHINFER_VERSION}" \
+    --index-url "https://flashinfer.ai/whl/${CU_VERSION}" \
+    -d /root/.cache/flashinfer-wheels \
+    && pip install /root/.cache/flashinfer-wheels/flashinfer_jit_cache-${FLASHINFER_VERSION}*.whl
+
+# ─── sglang-kernel & sglang-router ──────────────────────────────────────────
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install \
+    "sglang-kernel==${SGL_KERNEL_VERSION}" \
+    "sglang-router"
+
+# ─── CI test dependencies ───────────────────────────────────────────────────
+# Packages from the "Install extra dependency" section of ci_install_dependency.sh
+# plus pyproject.toml [test] extras
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python3 -m pip install \
+    "mooncake-transfer-engine==${MOONCAKE_VERSION}" \
+    py-spy scipy pytest \
+    "huggingface_hub[hf_xet]" \
+    "setuptools==70.0.0" \
+    accelerate bitsandbytes expecttest jsonlines \
+    "lm-eval[api]>=0.4.9.2" \
+    matplotlib pandas parameterized "peft>=0.18.0" polars \
+    pytest-cov diff-cover sentence_transformers tabulate \
+    "granian>=2.6.0" kernels
+
+# ─── human-eval ──────────────────────────────────────────────────────────────
+RUN git clone https://github.com/merrymercy/human-eval.git /opt/human-eval \
+    && cd /opt/human-eval \
+    && pip install -e . --no-build-isolation
+
+# ─── lmms-eval ───────────────────────────────────────────────────────────────
+RUN git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git /opt/lmms-eval \
+    && pip install -e /opt/lmms-eval/
+
+# ─── kernels community lock ─────────────────────────────────────────────────
+RUN mkdir -p /root/.cache/sglang \
+    && kernels download python || true \
+    && kernels lock python || true \
+    && mv python/kernels.lock /root/.cache/sglang 2>/dev/null || true
+
+# ─── Stamp the image with build metadata ────────────────────────────────────
+ARG CI_IMAGE_BUILD_DATE
+ENV CI_IMAGE_BUILD_DATE=${CI_IMAGE_BUILD_DATE:-unknown} \
+    CI_IMAGE_TORCH_VERSION=${TORCH_VERSION} \
+    CI_IMAGE_FLASHINFER_VERSION=${FLASHINFER_VERSION} \
+    CI_IMAGE_SGL_KERNEL_VERSION=${SGL_KERNEL_VERSION} \
+    CI_IMAGE_CUDNN_VERSION=${NVIDIA_CUDNN_VERSION} \
+    CI_IMAGE_NVSHMEM_VERSION=${NVIDIA_NVSHMEM_VERSION}
+
+# Verify critical imports work
+RUN python3 -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda)" \
+    && python3 -c "import cutlass; import cutlass.cute" \
+    && python3 -c "import flashinfer; print('flashinfer', flashinfer.__version__)" \
+    && echo "CI base image built successfully"
+
+CMD ["/bin/bash"]

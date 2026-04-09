@@ -1,6 +1,15 @@
 #!/bin/bash
 # Install the dependency in CI.
 #
+# When running inside the CI base image (SGLANG_CI_BASE_IMAGE=1, set by
+# docker/Dockerfile.ci), most heavy dependencies are already installed.
+# The script detects this and skips the slow download steps, only doing:
+#   - Kill existing processes
+#   - Editable install of sglang itself (pip install -e)
+#   - sglang-kernel install (may be custom-built for the PR)
+#   - Version-mismatch fixups
+#   - Runner preparation & import verification
+#
 # Structure (see section banners below):
 # - Configuration & timing
 # - Host / runner detection (arch, Blackwell, pip vs uv)
@@ -42,6 +51,16 @@ mark_step_done() {
         "${label}" "${step}" "${now}" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     _CI_MARK_PREV=${now}
 }
+
+# Detect CI base image (set by docker/Dockerfile.ci)
+USING_CI_IMAGE="${SGLANG_CI_BASE_IMAGE:-0}"
+if [ "$USING_CI_IMAGE" = "1" ]; then
+    echo "=== Running inside CI base image — skipping pre-installed dependencies ==="
+    echo "  Image build date: ${CI_IMAGE_BUILD_DATE:-unknown}"
+    echo "  Image torch:      ${CI_IMAGE_TORCH_VERSION:-unknown}"
+    echo "  Image flashinfer:  ${CI_IMAGE_FLASHINFER_VERSION:-unknown}"
+    echo "  Image sgl-kernel:  ${CI_IMAGE_SGL_KERNEL_VERSION:-unknown}"
+fi
 
 mark_step_done "Configuration"
 
@@ -104,50 +123,58 @@ mark_step_done "Kill existing processes"
 # ------------------------------------------------------------------------------
 # Install apt packages
 # ------------------------------------------------------------------------------
-# Install apt packages (including python3/pip which may be missing on some runners)
-# Use --no-install-recommends and ignore errors from unrelated broken packages on the runner
-# The NVIDIA driver packages may have broken dependencies that are unrelated to these packages
-# Run apt-get update first to refresh package index (stale index causes 404 on security.ubuntu.com)
-apt-get update || true
-CI_APT_PACKAGES=(
-    python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config
-    libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils
-    ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
-)
-apt-get install -y --no-install-recommends "${CI_APT_PACKAGES[@]}" || {
-    echo "Warning: apt-get install failed, checking if required packages are available..."
-    for pkg in "${CI_APT_PACKAGES[@]}"; do
-        if ! dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
-            echo "ERROR: Required package $pkg is not installed and apt-get failed"
-            exit 1
-        fi
-    done
-    echo "All required packages are already installed, continuing..."
-}
+if [ "$USING_CI_IMAGE" = "1" ]; then
+    echo "Skipping apt install (pre-installed in CI image)"
+else
+    # Install apt packages (including python3/pip which may be missing on some runners)
+    # Use --no-install-recommends and ignore errors from unrelated broken packages on the runner
+    # The NVIDIA driver packages may have broken dependencies that are unrelated to these packages
+    # Run apt-get update first to refresh package index (stale index causes 404 on security.ubuntu.com)
+    apt-get update || true
+    CI_APT_PACKAGES=(
+        python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config
+        libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils
+        ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
+    )
+    apt-get install -y --no-install-recommends "${CI_APT_PACKAGES[@]}" || {
+        echo "Warning: apt-get install failed, checking if required packages are available..."
+        for pkg in "${CI_APT_PACKAGES[@]}"; do
+            if ! dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
+                echo "ERROR: Required package $pkg is not installed and apt-get failed"
+                exit 1
+            fi
+        done
+        echo "All required packages are already installed, continuing..."
+    }
+fi
 
 mark_step_done "Install apt packages"
 
 # ------------------------------------------------------------------------------
 # Python package site hygiene & install protoc
 # ------------------------------------------------------------------------------
-# Clear torch compilation cache
+# Clear torch compilation cache (always — prevents stale caches between runs)
 python3 -c 'import os, shutil, tempfile, getpass; cache_dir = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "torchinductor_" + getpass.getuser()); shutil.rmtree(cache_dir, ignore_errors=True)'
 
-# Remove broken dist-info directories (missing METADATA per PEP 376)
-SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])")
-if [ -d "$SITE_PACKAGES" ]; then
-    { set +x; } 2>/dev/null
-    find "$SITE_PACKAGES" -maxdepth 1 -name "*.dist-info" -type d | while read -r d; do
-        if [ ! -f "$d/METADATA" ]; then
-            echo "Removing broken dist-info: $d"
-            rm -rf "$d"
-        fi
-    done
-    set -x
-fi
+if [ "$USING_CI_IMAGE" = "1" ]; then
+    echo "Skipping site hygiene & protoc install (pre-installed in CI image)"
+else
+    # Remove broken dist-info directories (missing METADATA per PEP 376)
+    SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])")
+    if [ -d "$SITE_PACKAGES" ]; then
+        { set +x; } 2>/dev/null
+        find "$SITE_PACKAGES" -maxdepth 1 -name "*.dist-info" -type d | while read -r d; do
+            if [ ! -f "$d/METADATA" ]; then
+                echo "Removing broken dist-info: $d"
+                rm -rf "$d"
+            fi
+        done
+        set -x
+    fi
 
-# Install protoc
-bash "${SCRIPT_DIR}/../utils/install_protoc.sh"
+    # Install protoc
+    bash "${SCRIPT_DIR}/../utils/install_protoc.sh"
+fi
 
 mark_step_done "Python package site hygiene & install protoc"
 
@@ -163,7 +190,9 @@ if [ "$USE_UV" = "0" ]; then
     PIP_UNINSTALL_CMD="pip uninstall -y"
     PIP_UNINSTALL_SUFFIX="--break-system-packages"
 else
-    pip install uv
+    if [ "$USING_CI_IMAGE" != "1" ]; then
+        pip install uv
+    fi
     export UV_SYSTEM_PYTHON=true
 
     PIP_CMD="uv pip"
@@ -172,7 +201,7 @@ else
     PIP_UNINSTALL_SUFFIX=""
 fi
 
-# Clean up existing installations
+# Clean up existing sglang installations (always — we reinstall from source below)
 $PIP_UNINSTALL_CMD sgl-kernel sglang-kernel sglang sgl-fa4 flash-attn-4 $PIP_UNINSTALL_SUFFIX || true
 
 mark_step_done "Pip / uv toolchain & stale package cleanup"
@@ -209,7 +238,13 @@ fi
 FLASHINFER_UNINSTALL="flashinfer-python"
 [ "$UNINSTALL_CUBIN" = true ] && FLASHINFER_UNINSTALL="$FLASHINFER_UNINSTALL flashinfer-cubin"
 [ "$UNINSTALL_JIT_CACHE" = true ] && FLASHINFER_UNINSTALL="$FLASHINFER_UNINSTALL flashinfer-jit-cache"
-$PIP_UNINSTALL_CMD $FLASHINFER_UNINSTALL $PIP_UNINSTALL_SUFFIX || true
+# On CI image, only uninstall if versions actually mismatch (don't uninstall flashinfer-python
+# unconditionally — the image already has the correct version)
+if [ "$USING_CI_IMAGE" = "1" ] && [ "$UNINSTALL_CUBIN" = false ] && [ "$UNINSTALL_JIT_CACHE" = false ]; then
+    echo "Skipping flashinfer uninstall (all versions match in CI image)"
+else
+    $PIP_UNINSTALL_CMD $FLASHINFER_UNINSTALL $PIP_UNINSTALL_SUFFIX || true
+fi
 $PIP_UNINSTALL_CMD opencv-python opencv-python-headless $PIP_UNINSTALL_SUFFIX || true
 
 mark_step_done "Uninstall Flashinfer"
@@ -217,13 +252,15 @@ mark_step_done "Uninstall Flashinfer"
 # ------------------------------------------------------------------------------
 # Install main package
 # ------------------------------------------------------------------------------
-# Install the main package
+# Install the main package (editable install — always needed, even on CI image)
 EXTRAS="dev,runai,tracing"
 if [ -n "$OPTIONAL_DEPS" ]; then
     EXTRAS="dev,runai,tracing,${OPTIONAL_DEPS}"
 fi
 echo "Installing python extras: [${EXTRAS}]"
-source "$(dirname "$0")/cache_nvidia_wheels.sh"
+if [ "$USING_CI_IMAGE" != "1" ]; then
+    source "$(dirname "$0")/cache_nvidia_wheels.sh"
+fi
 $PIP_CMD install -e "python[${EXTRAS}]" --extra-index-url https://download.pytorch.org/whl/${CU_VERSION} $PIP_INSTALL_SUFFIX
 
 mark_step_done "Install main package"
@@ -283,34 +320,42 @@ mark_step_done "Install sglang-router"
 # ------------------------------------------------------------------------------
 # Download flashinfer artifacts
 # ------------------------------------------------------------------------------
-# Download flashinfer jit cache
-UNINSTALL_JIT_CACHE="$UNINSTALL_JIT_CACHE" \
-    FLASHINFER_PYTHON_REQUIRED="$FLASHINFER_PYTHON_REQUIRED" \
-    CU_VERSION="$CU_VERSION" \
-    PIP_CMD="$PIP_CMD" \
-    PIP_INSTALL_SUFFIX="$PIP_INSTALL_SUFFIX" \
-    bash "${SCRIPT_DIR}/ci_download_flashinfer_jit_cache.sh"
-# Download flashinfer cubins
-bash "${SCRIPT_DIR}/ci_download_flashinfer_cubin.sh"
+if [ "$USING_CI_IMAGE" = "1" ] && [ "$UNINSTALL_JIT_CACHE" = false ] && [ "$UNINSTALL_CUBIN" = false ]; then
+    echo "Skipping flashinfer artifact downloads (pre-installed in CI image)"
+else
+    # Download flashinfer jit cache
+    UNINSTALL_JIT_CACHE="$UNINSTALL_JIT_CACHE" \
+        FLASHINFER_PYTHON_REQUIRED="$FLASHINFER_PYTHON_REQUIRED" \
+        CU_VERSION="$CU_VERSION" \
+        PIP_CMD="$PIP_CMD" \
+        PIP_INSTALL_SUFFIX="$PIP_INSTALL_SUFFIX" \
+        bash "${SCRIPT_DIR}/ci_download_flashinfer_jit_cache.sh"
+    # Download flashinfer cubins
+    bash "${SCRIPT_DIR}/ci_download_flashinfer_cubin.sh"
+fi
 
 mark_step_done "Download flashinfer artifacts"
 
 # ------------------------------------------------------------------------------
 # Install extra dependency
 # ------------------------------------------------------------------------------
-# Install other python dependencies
-if [ "$CU_VERSION" = "cu130" ]; then
-    NVRTC_SPEC="nvidia-cuda-nvrtc"
+if [ "$USING_CI_IMAGE" = "1" ]; then
+    echo "Skipping extra dependency install (pre-installed in CI image)"
 else
-    NVRTC_SPEC="nvidia-cuda-nvrtc-cu12"
-fi
-$PIP_CMD install mooncake-transfer-engine==0.3.10.post1 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
+    # Install other python dependencies
+    if [ "$CU_VERSION" = "cu130" ]; then
+        NVRTC_SPEC="nvidia-cuda-nvrtc"
+    else
+        NVRTC_SPEC="nvidia-cuda-nvrtc-cu12"
+    fi
+    $PIP_CMD install mooncake-transfer-engine==0.3.10.post1 "${NVRTC_SPEC}" py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
 
-# Install other test dependencies
-if [ "$IS_BLACKWELL" != "1" ]; then
-    # For lmms_evals evaluating MMMU
-    git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
-    $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
+    # Install other test dependencies
+    if [ "$IS_BLACKWELL" != "1" ]; then
+        # For lmms_evals evaluating MMMU
+        git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+        $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
+    fi
 fi
 $PIP_CMD uninstall xformers || true
 
@@ -356,18 +401,24 @@ mark_step_done "Fix other dependencies"
 # Force reinstall nvidia-cutlass-dsl to ensure the .pth file exists.
 # The Docker image ships nvidia-cutlass-dsl-libs-base 4.3.5; upgrading to 4.4.2
 # can delete the .pth file without reliably recreating it (pip race condition).
-$PIP_CMD install "nvidia-cutlass-dsl>=4.4.1" "nvidia-cutlass-dsl-libs-base>=4.4.1" --no-deps --force-reinstall $PIP_INSTALL_SUFFIX || true
+if [ "$USING_CI_IMAGE" != "1" ]; then
+    $PIP_CMD install "nvidia-cutlass-dsl>=4.4.1" "nvidia-cutlass-dsl-libs-base>=4.4.1" --no-deps --force-reinstall $PIP_INSTALL_SUFFIX || true
+fi
 
 # Download kernels from kernels community
-kernels download python || true
-kernels lock python || true
-mv python/kernels.lock ${HOME}/.cache/sglang || true
+if [ "$USING_CI_IMAGE" = "1" ]; then
+    echo "Skipping kernels download & human-eval install (pre-installed in CI image)"
+else
+    kernels download python || true
+    kernels lock python || true
+    mv python/kernels.lock ${HOME}/.cache/sglang || true
 
-# Install human-eval
-pip install "setuptools==70.0.0"
-git clone https://github.com/merrymercy/human-eval.git
-cd human-eval
-pip install -e . --no-build-isolation
+    # Install human-eval
+    pip install "setuptools==70.0.0"
+    git clone https://github.com/merrymercy/human-eval.git
+    cd human-eval
+    pip install -e . --no-build-isolation
+fi
 
 # ------------------------------------------------------------------------------
 # Prepare runner
