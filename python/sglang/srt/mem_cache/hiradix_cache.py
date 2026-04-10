@@ -61,7 +61,8 @@ class HiRadixCache(RadixCache):
         self.page_size = params.page_size
         self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
 
-        if isinstance(self.kv_cache, SWAKVPool):
+        self.is_swa = isinstance(self.kv_cache, SWAKVPool)
+        if self.is_swa:
             # For hybrid SWA models (e.g. GPT OSS), only cache full attention
             # layers on the host. SWA layers are bounded by the sliding window.
             full_kv_pool = self.kv_cache.full_kv_pool
@@ -735,6 +736,26 @@ class HiRadixCache(RadixCache):
 
     def evictable_size(self):
         return self.evictable_size_
+
+    def full_evictable_size(self):
+        if self.is_swa:
+            return self.evictable_size_
+        return 0
+
+    def swa_evictable_size(self):
+        if self.is_swa:
+            return self.evictable_size_
+        return 0
+
+    def full_protected_size(self):
+        if self.is_swa:
+            return self.protected_size_
+        return 0
+
+    def swa_protected_size(self):
+        if self.is_swa:
+            return self.protected_size_
+        return 0
 
     def _to_radix_key(self, token_ids: List[int]) -> RadixKey:
         """Convert raw token_ids to a RadixKey for tree walking.

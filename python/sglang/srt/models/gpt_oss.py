@@ -79,6 +79,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     LazyValue,
     add_prefix,
+    get_bool_env_var,
     is_blackwell_supported,
     is_cuda,
     is_flashinfer_available,
@@ -94,6 +95,7 @@ _is_tinygemm_supported = (
     _is_cuda
     and is_flashinfer_available()
     and (is_sm90_supported() or is_blackwell_supported())
+    and not get_bool_env_var("SGLANG_DISABLE_TINYGEMM")
 )
 
 if _is_tinygemm_supported:
