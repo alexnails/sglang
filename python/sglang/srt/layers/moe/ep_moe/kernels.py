@@ -14,14 +14,8 @@ if _is_cuda:
     )
 
 import triton.language as tl
-
-try:
-    from triton.experimental import gluon
-    from triton.experimental.gluon import language as gl
-
-    _has_gluon = True
-except ImportError:
-    _has_gluon = False
+from triton.experimental import gluon
+from triton.experimental.gluon import language as gl
 
 
 def _get_launch_config_1d(device, numel):
@@ -142,49 +136,47 @@ def deepep_post_reorder_triton_kernel(
         tl.store(store_ptr + offset, sum_vec, mask=mask)
 
 
-if _has_gluon:
+@gluon.jit
+def deepep_post_reorder_gluon_kernel(
+    down_output_ptr,
+    output_ptr,
+    src2dst_ptr,
+    topk_weights_ptr,
+    topk,
+    hidden_size,
+    BLOCK_SIZE: gl.constexpr,
+    TOPK: gl.constexpr,
+    layout: gl.constexpr,
+):
+    """Gluon variant with predicated loads and direct fma accumulation.
+    Predicated ld.global zeros data when dst_k < 0, so d_k * w_k == 0
+    without needing gl.where — eliminates selp/mov overhead and lets
+    the compiler fuse mul+add into fma.rn.bf16x2.
+    Benchmarked 1.3-2.4x faster than branchy Triton baseline on H200.
+    """
+    InDtype = down_output_ptr.dtype.element_ty
 
-    @gluon.jit
-    def deepep_post_reorder_gluon_kernel(
-        down_output_ptr,
-        output_ptr,
-        src2dst_ptr,
-        topk_weights_ptr,
-        topk,
-        hidden_size,
-        BLOCK_SIZE: gl.constexpr,
-        TOPK: gl.constexpr,
-        layout: gl.constexpr,
-    ):
-        """Gluon variant with predicated loads and direct fma accumulation.
-        Predicated ld.global zeros data when dst_k < 0, so d_k * w_k == 0
-        without needing gl.where — eliminates selp/mov overhead and lets
-        the compiler fuse mul+add into fma.rn.bf16x2.
-        Benchmarked 1.3-2.4x faster than branchy Triton baseline on H200.
-        """
-        InDtype = down_output_ptr.dtype.element_ty
+    src_idx = gl.program_id(0)
+    s2d = src2dst_ptr + src_idx * topk
+    tw = topk_weights_ptr + src_idx * topk
+    store_ptr = output_ptr + src_idx * hidden_size
 
-        src_idx = gl.program_id(0)
-        s2d = src2dst_ptr + src_idx * topk
-        tw = topk_weights_ptr + src_idx * topk
-        store_ptr = output_ptr + src_idx * hidden_size
+    idx = gl.arange(0, BLOCK_SIZE, layout=layout)
+    for start_offset in range(0, hidden_size, BLOCK_SIZE):
+        offset = start_offset + idx
+        mask = offset < hidden_size
 
-        idx = gl.arange(0, BLOCK_SIZE, layout=layout)
-        for start_offset in range(0, hidden_size, BLOCK_SIZE):
-            offset = start_offset + idx
-            mask = offset < hidden_size
+        acc = gl.zeros([BLOCK_SIZE], dtype=InDtype, layout=layout)
+        for k in range(TOPK):
+            dst_k = gl.load(s2d + k)
+            w_k = gl.load(tw + k).to(InDtype)
+            d_k = gl.load(
+                down_output_ptr + dst_k * hidden_size + offset,
+                mask=mask & (dst_k >= 0),
+            )
+            acc += d_k * w_k
 
-            acc = gl.zeros([BLOCK_SIZE], dtype=InDtype, layout=layout)
-            for k in range(TOPK):
-                dst_k = gl.load(s2d + k)
-                w_k = gl.load(tw + k).to(InDtype)
-                d_k = gl.load(
-                    down_output_ptr + dst_k * hidden_size + offset,
-                    mask=mask & (dst_k >= 0),
-                )
-                acc += d_k * w_k
-
-            gl.store(store_ptr + offset, acc, mask=mask)
+        gl.store(store_ptr + offset, acc, mask=mask)
 
 
 @triton.jit
