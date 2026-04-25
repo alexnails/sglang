@@ -33,6 +33,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install rust dependencies
+        timeout-minutes: 10
         run: |
           bash scripts/ci/cuda/ci_install_gateway_dependencies.sh
 
@@ -120,6 +121,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install dependencies
+        timeout-minutes: 10
         run: |
           bash scripts/ci/cuda/ci_install_gateway_dependencies.sh
 
