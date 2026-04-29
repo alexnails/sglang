@@ -734,7 +734,7 @@ jobs:
         with:
           workspaces: rust/sglang-grpc
           shared-key: "sglang-grpc-cpu"
-          cache-on-failure: true
+          save-if: ${{ matrix.partition == 0 }}
 
       # uv pip targets a venv by default; setup-python has no venv — install into that interpreter (see UV_SYSTEM_PYTHON in https://docs.astral.sh/uv/guides/integration/github/)
       - name: Install dependencies
