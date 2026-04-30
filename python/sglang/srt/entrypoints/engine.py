@@ -117,6 +117,9 @@ class SchedulerInitResult:
 
     scheduler_infos: List[Dict[str, Any]]
     all_child_pids: List[int] = dataclasses.field(default_factory=list)
+    # pid -> human-readable role label (e.g., "scheduler_0", "dp_controller",
+    # "detokenizer"). Used by HostMetricsTracker to annotate snapshots.
+    child_pid_labels: Dict[int, str] = dataclasses.field(default_factory=dict)
     wait_for_ready: Callable[[], None] = lambda: None
     wait_for_completion: Callable[[], None] = lambda: None
     engine_info_bootstrap_server: Optional[Any] = None
@@ -613,6 +616,15 @@ class Engine(EngineScoreMixin, EngineBase):
             scheduler_procs.append(proc)
 
         all_child_pids = [proc.pid for proc in scheduler_procs]
+        if server_args.dp_size > 1:
+            # Single dp_controller proc; per-rank schedulers labeled in wait_for_ready.
+            child_pid_labels: Dict[int, str] = {
+                proc.pid: "dp_controller" for proc in scheduler_procs
+            }
+        else:
+            child_pid_labels = {
+                proc.pid: f"scheduler_{i}" for i, proc in enumerate(scheduler_procs)
+            }
         scheduler_infos = []
 
         def wait_for_ready():
@@ -620,9 +632,11 @@ class Engine(EngineScoreMixin, EngineBase):
             scheduler_infos.extend(infos)
             # For dp_size > 1, collect child scheduler PIDs from the DP controller
             if server_args.dp_size > 1:
-                for info in infos:
+                for dp_idx, info in enumerate(infos):
                     if SCHEDULER_PIDS_ARG in info:
-                        all_child_pids.extend(info[SCHEDULER_PIDS_ARG])
+                        for tp_idx, pid in enumerate(info[SCHEDULER_PIDS_ARG]):
+                            all_child_pids.append(pid)
+                            child_pid_labels[pid] = f"scheduler_dp{dp_idx}_{tp_idx}"
 
         def wait_for_completion():
             for proc in scheduler_procs:
@@ -636,6 +650,7 @@ class Engine(EngineScoreMixin, EngineBase):
             SchedulerInitResult(
                 scheduler_infos=scheduler_infos,
                 all_child_pids=all_child_pids,
+                child_pid_labels=child_pid_labels,
                 wait_for_ready=wait_for_ready,
                 wait_for_completion=wait_for_completion,
             ),
@@ -747,6 +762,7 @@ class Engine(EngineScoreMixin, EngineBase):
         )
         detoken_proc.start()
         scheduler_init_result.all_child_pids.append(detoken_proc.pid)
+        scheduler_init_result.child_pid_labels[detoken_proc.pid] = "detokenizer"
 
         # Init tokenizer manager first, as the bootstrap server is initialized here
         if server_args.tokenizer_worker_num == 1:

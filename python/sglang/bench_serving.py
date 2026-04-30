@@ -951,6 +951,138 @@ async def get_request(
             await asyncio.sleep(interval)
 
 
+async def _sample_host_metrics(
+    base_url: str,
+    interval_ms: int,
+    samples_out: List[Dict[str, Any]],
+    stop_event: asyncio.Event,
+    benchmark_start_time: float,
+) -> None:
+    """Background poller that hits /host_metrics on the server.
+
+    Each sample is annotated with `t` (seconds since `benchmark_start_time`)
+    so the post-hoc classifier can align it to per-request prefill/decode
+    windows. Errors are tolerated silently — we don't want a stale endpoint
+    to fail the whole benchmark.
+    """
+    interval_s = interval_ms / 1000.0
+    headers = get_auth_headers()
+    timeout = aiohttp.ClientTimeout(total=2.0)
+    url = base_url + "/host_metrics"
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        # Discard the first sample: psutil's first cpu_percent call returns 0%
+        # because there is no prior reference point.
+        try:
+            async with session.get(url, headers=headers) as resp:
+                await resp.read()
+        except Exception:
+            pass
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval_s)
+                break
+            except asyncio.TimeoutError:
+                pass
+            try:
+                async with session.get(url, headers=headers) as resp:
+                    if resp.status != 200:
+                        continue
+                    payload = await resp.json()
+            except Exception:
+                continue
+            payload["t"] = time.perf_counter() - benchmark_start_time
+            samples_out.append(payload)
+
+
+def _summarize_host_metrics(
+    samples: List[Dict[str, Any]],
+    outputs: List["RequestFuncOutput"],
+) -> Optional[Dict[str, Any]]:
+    """Classify samples into idle/prefill/decode and produce summary stats.
+
+    Phase logic per sample at relative time t:
+      * idle:    no successful request has start_time <= t < start_time+latency
+      * prefill: some in-flight request is still in its prefill window
+                 (start_time <= t < start_time + ttft)
+      * decode:  in-flight requests exist but all are past TTFT
+
+    Also bins samples by concurrency level (count of in-flight requests at t)
+    to answer "how does CPU scale with users".
+    """
+    if not samples:
+        return None
+
+    # Build (start, ttft_end, end) windows from successful outputs.
+    windows: List[Tuple[float, float, float]] = []
+    if outputs:
+        # All start_times are wall-clock from time.perf_counter() so subtracting
+        # the earliest one anchors them in the same frame as samples' "t".
+        anchor = min(o.start_time for o in outputs if o.success)
+        for o in outputs:
+            if not o.success:
+                continue
+            s = o.start_time - anchor
+            windows.append((s, s + o.ttft, s + o.latency))
+
+    def classify(t: float) -> Tuple[str, int]:
+        in_flight = 0
+        any_prefill = False
+        for s, ttft_end, end in windows:
+            if s <= t < end:
+                in_flight += 1
+                if t < ttft_end:
+                    any_prefill = True
+        if in_flight == 0:
+            return ("idle", 0)
+        if any_prefill:
+            return ("prefill", in_flight)
+        return ("decode", in_flight)
+
+    buckets: Dict[str, List[float]] = {"idle": [], "prefill": [], "decode": []}
+    role_buckets: Dict[str, Dict[str, List[float]]] = {}
+    by_concurrency: Dict[int, List[float]] = {}
+
+    for sample in samples:
+        t = sample.get("t", 0.0)
+        phase, concurrency = classify(t)
+        agg = sample.get("aggregate", {}).get("sglang_cpu_percent")
+        if agg is None:
+            continue
+        buckets[phase].append(agg)
+        by_concurrency.setdefault(concurrency, []).append(agg)
+        for proc in sample.get("processes", []):
+            role = proc.get("role", "?")
+            cpu = proc.get("cpu_percent", 0.0)
+            role_buckets.setdefault(role, {"idle": [], "prefill": [], "decode": []})[
+                phase
+            ].append(cpu)
+
+    def pct(xs: List[float], q: float) -> float:
+        return float(np.percentile(xs, q)) if xs else 0.0
+
+    summary: Dict[str, Any] = {
+        "num_samples": len(samples),
+        "num_idle": len(buckets["idle"]),
+        "num_prefill": len(buckets["prefill"]),
+        "num_decode": len(buckets["decode"]),
+    }
+    for phase in ("idle", "prefill", "decode"):
+        summary[f"sglang_cpu_pct_{phase}_p50"] = pct(buckets[phase], 50)
+        summary[f"sglang_cpu_pct_{phase}_p99"] = pct(buckets[phase], 99)
+    summary["sglang_cpu_pct_by_concurrency_p50"] = {
+        str(k): pct(v, 50) for k, v in sorted(by_concurrency.items())
+    }
+    summary["per_role_cpu_pct_p50"] = {
+        role: {phase: pct(vals, 50) for phase, vals in phases.items()}
+        for role, phases in role_buckets.items()
+    }
+    # System-wide totals (last sample is fine for capacity context).
+    last_sys = samples[-1].get("system", {})
+    summary["system_cores"] = last_sys.get("num_cores")
+    summary["system_mem_total_gb"] = last_sys.get("mem_total_gb")
+    return summary
+
+
 def calculate_metrics(
     input_requests: Optional[List[DatasetRow]],
     outputs: List[RequestFuncOutput],
@@ -1185,6 +1317,7 @@ async def benchmark(
     mooncake_num_rounds=1,
     profile_prefill_url: Optional[List[str]] = None,
     profile_decode_url: Optional[List[str]] = None,
+    host_metrics_interval_ms: int = 0,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -1313,6 +1446,20 @@ async def benchmark(
 
     # Run all requests
     benchmark_start_time = time.perf_counter()
+    host_samples: List[Dict[str, Any]] = []
+    host_sampler_stop: Optional[asyncio.Event] = None
+    host_sampler_task: Optional[asyncio.Task] = None
+    if host_metrics_interval_ms > 0:
+        host_sampler_stop = asyncio.Event()
+        host_sampler_task = asyncio.create_task(
+            _sample_host_metrics(
+                base_url,
+                host_metrics_interval_ms,
+                host_samples,
+                host_sampler_stop,
+                benchmark_start_time,
+            )
+        )
     tasks: List[asyncio.Task] = []
     pbar_total = len(input_requests)
     if (
@@ -1379,6 +1526,13 @@ async def benchmark(
             )
         )
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+    if host_sampler_task is not None:
+        assert host_sampler_stop is not None
+        host_sampler_stop.set()
+        try:
+            await asyncio.wait_for(host_sampler_task, timeout=2.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            host_sampler_task.cancel()
     if is_multi_turn:
         outputs = [x for output in outputs for x in output]
 
@@ -1434,6 +1588,7 @@ async def benchmark(
         accept_length=accept_length,
         plot_throughput=args.plot_throughput,
     )
+    host_metrics_summary = _summarize_host_metrics(host_samples, outputs)
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Backend:", backend))
@@ -1537,6 +1692,32 @@ async def benchmark(
         print("{:<40} {:<10.2f}".format("P95 ITL (ms):", metrics.p95_itl_ms))
         print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
         print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
+    if host_metrics_summary is not None:
+        print("{s:{c}^{n}}".format(s="Host CPU Utilization", n=50, c="-"))
+        print(
+            "{:<40} {:<10}".format(
+                "Samples (idle/prefill/decode):",
+                f"{host_metrics_summary['num_idle']}/"
+                f"{host_metrics_summary['num_prefill']}/"
+                f"{host_metrics_summary['num_decode']}",
+            )
+        )
+        for phase in ("idle", "prefill", "decode"):
+            print(
+                "{:<40} p50={:<7.1f} p99={:<7.1f}".format(
+                    f"SGLang CPU% ({phase}):",
+                    host_metrics_summary[f"sglang_cpu_pct_{phase}_p50"],
+                    host_metrics_summary[f"sglang_cpu_pct_{phase}_p99"],
+                )
+            )
+        cores = host_metrics_summary.get("system_cores")
+        if cores:
+            print("{:<40} {:<10}".format("Host cores:", cores))
+        by_conc = host_metrics_summary.get("sglang_cpu_pct_by_concurrency_p50") or {}
+        if by_conc:
+            print("CPU% by in-flight concurrency (p50):")
+            for level, cpu in by_conc.items():
+                print("  {:>4} reqs -> {:.1f}%".format(level, cpu))
     print("=" * 50)
 
     resp = requests.get(base_url + "/server_info", headers=get_auth_headers())
@@ -1595,6 +1776,8 @@ async def benchmark(
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
         }
+        if host_metrics_summary is not None:
+            result["host_cpu"] = host_metrics_summary
     else:
         print(f"Error running benchmark for request rate: {request_rate}")
         print("-" * 30)
@@ -1625,6 +1808,8 @@ async def benchmark(
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
     }
+    if host_samples:
+        result_details["host_samples"] = host_samples
 
     # Append results to a JSONL file
     with open(output_file_name, "a") as file:
@@ -1892,6 +2077,7 @@ def run_benchmark(args_: argparse.Namespace):
             mooncake_num_rounds=args.mooncake_num_rounds,
             profile_prefill_url=getattr(args, "profile_prefill_url", None),
             profile_decode_url=getattr(args, "profile_decode_url", None),
+            host_metrics_interval_ms=getattr(args, "host_metrics_interval_ms", 0),
         )
     )
 
@@ -2245,6 +2431,18 @@ if __name__ == "__main__":
         "--flush-cache",
         action="store_true",
         help="Flush the cache before running the benchmark",
+    )
+    parser.add_argument(
+        "--host-metrics-interval-ms",
+        type=int,
+        default=0,
+        help=(
+            "Poll the server's /host_metrics endpoint at this interval (ms) "
+            "during the run to capture per-process and system CPU/memory. "
+            "Adds an idle/prefill/decode CPU% breakdown plus a CPU-vs-"
+            "concurrency table to the final summary. 0 disables. "
+            "Recommended: 100."
+        ),
     )
     parser.add_argument(
         "--warmup-requests",

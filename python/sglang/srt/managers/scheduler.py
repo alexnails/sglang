@@ -3868,6 +3868,14 @@ def run_scheduler_process(
     )
     parent_process = psutil.Process().parent()
 
+    # Track scheduler CPU time in the existing Prometheus counter so the
+    # `sglang:process_cpu_seconds_total{component=scheduler_*}` series covers
+    # the heaviest CPU-side process — without this, scheduler load is invisible
+    # to the existing observability stack.
+    from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
+
+    start_cpu_monitor_thread(f"scheduler_tp{tp_rank}_pp{pp_rank}_dp{dp_rank}")
+
     # Set up tracing
     if server_args.enable_trace:
         process_tracing_init(server_args.otlp_traces_endpoint, "sglang")

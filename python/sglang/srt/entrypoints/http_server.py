@@ -192,6 +192,7 @@ class _GlobalState:
     tokenizer_manager: Union[TokenizerManager, MultiTokenizerRouter, TokenizerWorker]
     template_manager: TemplateManager
     scheduler_info: Dict
+    host_metrics_tracker: Optional[Any] = None
 
 
 _global_state: Optional[_GlobalState] = None
@@ -626,6 +627,22 @@ async def get_server_info():
         "Please use '/server_info' instead."
     )
     return await server_info()
+
+
+@app.get("/host_metrics")
+async def host_metrics():
+    """Per-process and system-wide CPU/memory snapshot for the SGLang host.
+
+    Returns CPU% (delta-since-last-call), RSS, thread count for each tracked
+    SGLang process plus system-wide totals. The first call after server start
+    returns 0% for processes (psutil cold start) — clients should discard it.
+    """
+    tracker = _global_state.host_metrics_tracker
+    if tracker is None:
+        return ORJSONResponse(
+            {"error": "host_metrics tracker not initialized"}, status_code=503
+        )
+    return tracker.snapshot()
 
 
 @app.get("/server_info")
@@ -2117,17 +2134,28 @@ def _setup_and_run_http_server(
     subprocess_watchdog: Optional[SubprocessWatchdog],
     execute_warmup_func: Callable = _execute_server_warmup,
     launch_callback: Optional[Callable[[], None]] = None,
+    child_pid_labels: Optional[Dict[int, str]] = None,
 ):
     """Set up global state, configure middleware, and run uvicorn.
 
     Called by launch_server after subprocesses have been launched.
     """
+    # Build the host metrics tracker now that all child PIDs are known.
+    try:
+        from sglang.srt.observability.host_metrics import HostMetricsTracker
+
+        host_metrics_tracker = HostMetricsTracker(child_pid_labels or {})
+    except Exception as e:  # pragma: no cover - never fail server start over telemetry
+        logger.warning("Failed to initialize HostMetricsTracker: %s", e)
+        host_metrics_tracker = None
+
     # Set global states
     set_global_state(
         _GlobalState(
             tokenizer_manager=tokenizer_manager,
             template_manager=template_manager,
             scheduler_info=scheduler_infos[0],
+            host_metrics_tracker=host_metrics_tracker,
         )
     )
 
@@ -2356,4 +2384,5 @@ def launch_server(
         subprocess_watchdog,
         execute_warmup_func=execute_warmup_func,
         launch_callback=launch_callback,
+        child_pid_labels=scheduler_init_result.child_pid_labels,
     )
