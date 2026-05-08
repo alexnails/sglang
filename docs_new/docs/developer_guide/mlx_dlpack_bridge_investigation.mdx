@@ -1,0 +1,147 @@
+---
+title: "MLX ↔ Torch Bridge: DLPack Investigation"
+sidebarTitle: "MLX/Torch DLPack"
+metatags:
+    description: "Why the MLX↔torch tensor bridge pays a Metal↔CPU↔Metal copy on Apple Silicon, microbenches DLPack alternatives, and what blocks true zero-copy interop."
+---
+
+**Date:** 2026-05-07
+**Versions tested:** torch 2.11.0 (pinned in `python/pyproject.toml:67`), mlx 0.31.2, mlx-metal 0.31.2, macOS arm64
+**Scope:** What does the current bridge cost? Can DLPack make it zero-copy on Apple Silicon? What blocks "real" Metal DLPack today?
+
+---
+
+## 1. The bridge today
+
+`python/sglang/srt/utils/tensor_bridge.py` provides two functions, both routed through a CPU intermediate:
+
+- `torch_to_mlx(tensor)` — if torch tensor is on MPS, calls `tensor.cpu()` (copies into a host buffer), then `mx.array(tensor.numpy())` (MLX memcpys the bytes into a fresh shared `MTLBuffer`).
+- `mlx_to_torch(array, device)` — calls `mx.contiguous(array)` + `mx.eval(array)`, takes a `memoryview`, wraps it as a CPU torch tensor with `torch.frombuffer`, then `.to(device)` to MPS (which allocates a fresh private `MTLBuffer` and memcpys into it).
+
+The bridge is **doing two memcpys per round trip** even though Apple Silicon's memory is physically unified. The MPS↔CPU↔MPS hop is in the bridge code itself.
+
+### Call sites (audit)
+
+All non-test callers are in `python/sglang/jit_kernel/diffusion/triton/mps_fallback.py` (RMSNorm / LayerNorm fallbacks for diffusion):
+
+| line | direction | uses MPS-device output? |
+|------|-----------|-------------------------|
+| `mps_fallback.py:57` | `torch_to_mlx(x)` | (input side) |
+| `mps_fallback.py:67` | `mlx_to_torch(result_mx, device).to(orig_dtype)` | **yes** |
+| `mps_fallback.py:79-82` | both directions | **yes** |
+| `mps_fallback.py:115-118` | both directions | **yes** |
+
+Every output path returns a torch MPS tensor that's immediately consumed by torch ops further down the diffusion pipeline. **There are currently no call sites that could accept a CPU-resident result.**
+
+This matters: it means the biggest available DLPack win (skip `.to('mps')`, alias unified memory) does not apply to today's call sites. The bridge cost — measured below — is what these paths pay.
+
+---
+
+## 2. Microbench (M-series, torch 2.11.0 + mlx 0.31.2)
+
+Timings are median µs per call, averaged over 50 iters with explicit `torch.mps.synchronize()` and `mx.synchronize()` around each measurement.
+
+### `mlx_to_torch` (MLX → torch)
+
+| shape           | current → mps | dlpack → mps | dlpack stay-on-cpu |
+|-----------------|--------------:|-------------:|-------------------:|
+| 16K  f32        |          183  |         167  |           **24**   |
+| 1M   f32        |          203  |         178  |           **19**   |
+| 16M  f32 (64MB) |         2264  |        2168  |           **59**   |
+| 1M  bf16        |          215  |         195  |           **25**   |
+| 16M bf16 (32MB) |         1238  |        1357  |           **73**   |
+
+### `torch_to_mlx` (torch → MLX)
+
+| shape          | current (`.cpu().numpy()`) | dlpack (`mx.array(t)`) |
+|----------------|---------------------------:|-----------------------:|
+| 16K  f32 mps   |                       162  |                  133   |
+| 1M   f32 mps   |                       241  |                  238   |
+| 16M  f32 mps   |                      3158  |                 3072   |
+
+### Read
+
+1. **DLPack is not a silver bullet for the bridge as it stands.** When the target is `mps`, DLPack saves ~30µs of Python overhead per call but the dominant cost is `.to('mps')` (about 95% of the time at 16M).
+2. **The big lever is dropping `.to('mps')`.** Going from 2264µs → 59µs at 16M f32 is ~38× faster. That only works if the consumer accepts a CPU-device torch tensor backed by unified memory.
+3. **`torch_to_mlx` doesn't benefit from DLPack.** MLX's importer always memcpys into a fresh shared `MTLBuffer` regardless of how the bytes arrive; the wins are noise.
+4. **bfloat16 needs special handling either way.** MLX 0.31.2's `__dlpack__()` exporter routes through NumPy and explicitly raises on bf16 (`bfloat16 arrays cannot be converted to NumPy`). Current bridge already side-steps this with the `memoryview` path.
+
+---
+
+## 3. Where MLX/torch actually are on DLPack
+
+| capability                                | torch 2.11.0 | mlx 0.31.2 |
+|-------------------------------------------|:------------:|:----------:|
+| `__dlpack_device__()` returns `(kDLMetal, 0)` | ✓        | ✓          |
+| `__dlpack__()` produces a real Metal capsule  | ✓        | ✗ (numpy → kDLCPU capsule with unified-mem CPU vaddr) |
+| Imports a `kDLMetal` capsule from peer        | ✓ (round-trip works) | ✗ (`std::bad_cast`, only consumes kDLCPU) |
+| DLPack v1.0+ kwargs (max_version, dl_device)  | ✓        | ✗ (v0.x protocol only) |
+| Aliases unified memory through CPU capsule    | n/a      | ✓ (verified: torch-side mutation visible in MLX) |
+
+So the *protocol* claims Metal on both sides, but only torch follows through. MLX advertises `kDLMetal` in `__dlpack_device__` while exporting a NumPy-backed CPU capsule whose data pointer is `MTLBuffer::contents()` (the unified-memory CPU vaddr). It works zero-copy because Apple Silicon shares physical bytes between CPU and GPU — but the consumer always gets a CPU-device tensor.
+
+### Relevant MLX source
+
+- `python/src/array.cpp:499-513` — `__dlpack__` returns `nb::ndarray<>` with `array.data<T>()` as data pointer (i.e. `MTL::Buffer::contents()` on Metal).
+- `python/src/convert.cpp:166` — exporter implements DLPack v0.x; ignores `max_version`/`dl_device`/`copy`/`stream` kwargs.
+- `python/src/convert.cpp:48,498` — `nd_array_to_mlx_contiguous` forces `nb::device::cpu` + `nb::c_contig`, then **always copies** through `mx::array(static_cast<const T*>(data), shape, dtype)`. Foreign GPU/MPS capsules are rejected.
+- `mlx/backend/metal/allocator.cpp:23-28` — every Metal `Buffer` is owned by `MetalAllocator` (no external-buffer variant).
+
+---
+
+## 4. What we can do today (no upstream changes)
+
+These changes affect only `tensor_bridge.py` and are safe to land now.
+
+### Win-grade changes
+
+1. **Replace `tensor.cpu().numpy()` with `mx.array(tensor)` in `torch_to_mlx`.** Same cost, smaller code, kills the bf16 special-case branch.
+2. **Replace `memoryview` + `frombuffer` with `torch.from_dlpack` in `mlx_to_torch` for non-bf16 dtypes.** ~25µs / call cheaper, cleaner code. Keep the memoryview path for bf16 (MLX exporter still chokes there).
+3. **Add a `unified=True` (or `device='cpu'`) fast-path to `mlx_to_torch`.** When the consumer can take a CPU-resident tensor, this returns in ~60µs for 64MB instead of ~2.2ms. Today's call sites can't use it, but it gives future call sites the option without forcing a re-architecture.
+
+### Non-wins to skip
+
+- Trying to wrap an MLX `MTLBuffer` directly as a torch MPS tensor without `.to('mps')`. There's no public torch API to wrap a foreign `id<MTLBuffer>` as MPS storage; even private APIs would be brittle across torch versions.
+- "Tunnelling" through a numpy view to avoid the device hop. Numpy is what we already do effectively; the hop comes from torch's `.to('mps')` not from numpy.
+
+---
+
+## 5. The "real Metal DLPack" path — and what blocks it
+
+To get **true zero-copy `mlx_arr ↔ torch_mps_tensor`** (a single `MTLBuffer` shared by both, no memcpy), three independent pieces need to land. As of today only one of them is actually in our court.
+
+### Required changes
+
+| # | Where | Change | Status |
+|---|-------|--------|--------|
+| 1 | MLX `convert.cpp` (export) | `__dlpack__()` returns a real `kDLMetal` capsule with `id<MTLBuffer>` as data pointer (per DLPack v1.3 spec), not a numpy-routed CPU capsule | **Not started.** Needs DLPack v1.0+ protocol upgrade in MLX. |
+| 2 | MLX `convert.cpp` + `MetalAllocator` (import) | Accept a foreign `kDLMetal` capsule; introduce an external-buffer `Buffer` variant that doesn't go through `MetalAllocator`; wrap (don't copy) in `nd_array_to_mlx` | **Not started.** Architectural change to MLX's allocator. |
+| 3 | DLPack stream slot wiring on both sides | Cross-queue sync via `MTLSharedEvent` plumbed through DLPack's `stream` field (torch MPS and MLX use separate `MTLCommandQueue`s) | MLX has shared-event infra (commit `8a0677d5`); torch side likely needs work. |
+
+### Practical wrinkles even after #1–#3 land
+
+- **Storage mode mismatch.** Torch MPS uses `MTLResourceStorageModePrivate`; MLX uses `MTLResourceStorageModeShared`. After #2 each side could *consume* the other's buffer for GPU kernels, but a torch MPS-private buffer can't be CPU-read by MLX without first copying to a shared buffer. So even with the protocol working, mixed CPU+GPU pipelines still pay a copy when crossing.
+- **Queue ownership / fence semantics.** Without proper stream-slot use, you get races when one side's command buffer hasn't completed before the other reads.
+
+### Tracking issues
+
+- [pytorch/pytorch#153789](https://github.com/pytorch/pytorch/issues/153789) — "Add dlpack support for MPS device", opened May 2025. **Partially landed by torch 2.11.0**: MPS tensors now produce/consume `kDLMetal` capsules in torch↔torch round-trips (verified above). Whether torch will accept *foreign* Metal capsules from non-torch producers (i.e. MLX once it ships #1) is the open question.
+- [pytorch/pytorch#55090](https://github.com/pytorch/pytorch/issues/55090) — "Implement improved DLPack support" (umbrella for v1.0+ protocol).
+- No active MLX issues on items #1 or #2 that I could find. Filing one (or a PR) is the unblock.
+
+---
+
+## 6. Recommended sequence
+
+1. **Land the bridge cleanup PR now.** Items 1–3 from §4. Net effect: ~25µs/call cheaper, fewer special cases, sets up the `unified=True` API for future use.
+2. **File MLX upstream issue.** Two requests: (a) DLPack v1.0+ protocol with real Metal exporter, (b) external-buffer `Buffer` variant with foreign `kDLMetal` import. Reference the source locations in §3. This is the unblock for true zero-copy.
+3. **Audit downstream torch ops in `mps_fallback.py`** to see whether the diffusion fallback genuinely needs MPS-device output, or whether parts of the pipeline could run on a unified-memory CPU torch tensor. If yes, switch those paths to the new `unified=True` API for an ~38× per-call win.
+4. **Park the "true Metal DLPack" plan.** Until MLX lands #1 and #2, no amount of work on the sglang side can eliminate the `.to('mps')` cost. Track upstream and revisit when those changes ship.
+
+---
+
+## Appendix: methodology
+
+- Microbench: 50 iterations per cell after 5 warmups, with `torch.mps.synchronize()` + `mx.synchronize()` calls bracketing each measurement; fresh inputs per iteration to avoid MLX's lazy-eval cache hiding work.
+- Probes: invoked `__dlpack_device__()` and `__dlpack__()` directly on torch CPU/MPS tensors and MLX arrays; round-tripped each direction; tested storage aliasing by mutating one side and reading the other.
+- Verified the MLX→torch CPU path is true zero-copy on unified memory (mutation via the torch handle is visible through the MLX handle), despite the torch tensor reporting `device=cpu`.
