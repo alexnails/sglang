@@ -2250,14 +2250,32 @@ def enc_hook(obj: Any) -> Any:
         return pickle.dumps(obj)
 
 
+def _maybe_load_pickled_value(obj: Any) -> Any:
+    if isinstance(obj, memoryview):
+        obj = obj.tobytes()
+    elif isinstance(obj, bytearray):
+        obj = bytes(obj)
+
+    if (
+        isinstance(obj, bytes)
+        and len(obj) >= 2
+        and obj[0] == 0x80
+        and obj[1] <= pickle.HIGHEST_PROTOCOL
+    ):
+        return pickle.loads(obj)
+    return obj
+
+
 def dec_hook(tp: Type, obj: Any) -> Any:
     if tp is torch.Tensor:
         shape, dtype, data = obj
         tensor_dtype = getattr(torch, dtype)
-        return torch.frombuffer(data, dtype=tensor_dtype).reshape(shape)
+        if len(data) == 0:
+            return torch.empty(shape, dtype=tensor_dtype)
+        return torch.frombuffer(bytearray(data), dtype=tensor_dtype).reshape(shape)
     elif tp is np.ndarray:
         shape, dtype, data = obj
-        return np.frombuffer(data, dtype=np.dtype(dtype)).reshape(shape)
+        return np.frombuffer(data, dtype=np.dtype(dtype)).copy().reshape(shape)
     elif tp is array:
         typecode, raw_data = obj
         res = array(typecode)
@@ -2267,28 +2285,21 @@ def dec_hook(tp: Type, obj: Any) -> Any:
         # The TraceContext is represented as a dict after encoding,
         # we need to decode it back to TraceContext
         if isinstance(obj, dict):
-            obj = {k: pickle.loads(v) if v is not None else v for k, v in obj.items()}
+            obj = {k: _maybe_load_pickled_value(v) for k, v in obj.items()}
         return TraceContext(obj)
     elif tp is TraceSpanContext:
         # The TraceSpanContext is represented as a tuple after encoding,
         # we need to decode it back to TraceSpanContext
         trace_id, span_id, is_remote, trace_flags, trace_state, _ = obj
-        if trace_flags is not None:
-            trace_flags = pickle.loads(trace_flags)
-        if trace_state is not None:
-            trace_state = pickle.loads(trace_state)
+        trace_flags = _maybe_load_pickled_value(trace_flags)
+        trace_state = _maybe_load_pickled_value(trace_state)
         return TraceSpanContext(trace_id, span_id, is_remote, trace_flags, trace_state)
     else:
         if envs.SGLANG_LOG_PICKLE_IPC_OBJECTS.get():
             logger.info(
                 f"Object of type {type(obj)} and {str(tp)} is decoding with pickle."
             )
-        try:
-            return pickle.loads(obj)
-        except Exception as e:
-            raise ValueError(
-                f"Failed to decode object of type {type(obj)} with pickle: {e}."
-            )
+        return pickle.loads(obj)
 
 
 _struct_types = tuple(
