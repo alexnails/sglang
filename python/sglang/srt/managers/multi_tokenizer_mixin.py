@@ -58,7 +58,10 @@ from sglang.srt.managers.load_snapshot import (
     create_load_snapshot_reader,
     zmq_reader_owner,
 )
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.managers.tokenizer_manager import (
+    TokenizerManager,
+    _attach_multi_http_worker_info,
+)
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
     configure_logger,
@@ -102,18 +105,6 @@ class SocketMapping:
         if ipc_name not in self._mapping:
             self._register_ipc_mapping(ipc_name, is_tokenizer=is_tokenizer)
         sock_send(self._mapping[ipc_name], output)
-
-
-def _attach_multi_http_worker_info(req: Any, tokenizer_ipc_name: str):
-    if hasattr(req, "http_worker_ipc"):
-        req.http_worker_ipc = tokenizer_ipc_name
-    elif hasattr(req, "http_worker_ipcs"):
-        rids = getattr(req, "rids", None)
-        req_len = len(rids) if rids is not None else len(req)
-        req.http_worker_ipcs = [tokenizer_ipc_name] * req_len
-    else:
-        raise ValueError(f"Unknown req type: {type(req)}")
-
 
 def _extract_field_by_index(
     output: Any, field_name: str, index: int, check_length: bool = True
@@ -744,21 +735,3 @@ def write_data_for_multi_tokenizer(
     args_shm.close()
 
     return args_shm
-
-
-class SenderWrapper:
-    def __init__(
-        self,
-        port_args: PortArgs,
-        send_to_scheduler: zmq.Socket,
-    ):
-        self.port_args = port_args
-        self.send_to_scheduler = send_to_scheduler
-
-    def send_obj(self, obj):
-        _attach_multi_http_worker_info(obj, self.port_args.tokenizer_ipc_name)
-        sock_send(self.send_to_scheduler, obj)
-
-    async def async_send_obj(self, obj):
-        _attach_multi_http_worker_info(obj, self.port_args.tokenizer_ipc_name)
-        await async_sock_send(self.send_to_scheduler, obj)

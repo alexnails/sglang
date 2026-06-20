@@ -75,6 +75,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
     async_sock_recv,
+    async_sock_send,
+    sock_send,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.mm_utils import TensorTransportMode, wrap_shm_features
@@ -374,8 +376,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.async_dynamic_batch_tokenizer = None
 
     def init_ipc_channels(self, port_args: PortArgs):
-        from sglang.srt.managers.multi_tokenizer_mixin import SenderWrapper
-
         context = zmq.asyncio.Context(2)
         self.recv_from_detokenizer = get_zmq_socket(
             context, zmq.PULL, port_args.tokenizer_ipc_name, True
@@ -596,7 +596,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
 
         if self.server_args.tokenizer_worker_num > 1:
-            self._attach_multi_http_worker_info(obj)
+            _attach_multi_http_worker_info(obj, self.tokenizer_ipc_name)
         self._init_req_state(obj, request)
         if self.server_args.language_only:
             self._handle_epd_disaggregation_encode_request(obj)
@@ -3084,3 +3084,32 @@ class SignalHandler:
 # | http       | no           | waiting queue   | type 1          | type 1 exception      | del in _handle_abort_req    |
 # | http       | no           | running         | type 3          | type 3 exception      | del in _handle_batch_output |
 #
+
+
+def _attach_multi_http_worker_info(req: Any, tokenizer_ipc_name: str):
+    if hasattr(req, "http_worker_ipc"):
+        req.http_worker_ipc = tokenizer_ipc_name
+    elif hasattr(req, "http_worker_ipcs"):
+        rids = getattr(req, "rids", None)
+        req_len = len(rids) if rids is not None else len(req)
+        req.http_worker_ipcs = [tokenizer_ipc_name] * req_len
+    else:
+        raise ValueError(f"Unknown req type: {type(req)}")
+
+
+class SenderWrapper:
+    def __init__(
+        self,
+        port_args: PortArgs,
+        send_to_scheduler: zmq.Socket,
+    ):
+        self.port_args = port_args
+        self.send_to_scheduler = send_to_scheduler
+
+    def send_obj(self, obj):
+        _attach_multi_http_worker_info(obj, self.port_args.tokenizer_ipc_name)
+        sock_send(self.send_to_scheduler, obj)
+
+    async def async_send_obj(self, obj):
+        _attach_multi_http_worker_info(obj, self.port_args.tokenizer_ipc_name)
+        await async_sock_send(self.send_to_scheduler, obj)
