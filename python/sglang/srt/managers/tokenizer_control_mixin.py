@@ -1,16 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-import binascii
 import hashlib
 import logging
-import pickle
 import time
 import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
-import pybase64
 
 from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
@@ -77,7 +74,10 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.server_args import LoRARef, ServerArgs
-from sglang.srt.utils import get_bool_env_var
+from sglang.srt.utils import (
+    get_bool_env_var,
+    normalize_serialized_named_tensor_payloads,
+)
 from sglang.utils import TypeBasedDispatcher
 
 if TYPE_CHECKING:
@@ -459,7 +459,7 @@ class TokenizerControlMixin:
         if obj.abort_all_requests:
             self.abort_request(abort_all=True)
 
-        obj.serialized_named_tensors = _decode_serialized_named_tensor_payloads(
+        obj.serialized_named_tensors = normalize_serialized_named_tensor_payloads(
             obj.serialized_named_tensors
         )
 
@@ -866,40 +866,3 @@ class TokenizerControlMixin:
         """Update weight version if provided."""
         if weight_version is not None:
             self.server_args.weight_version = weight_version
-
-
-def _looks_like_pickle_payload(data: bytes) -> bool:
-    return len(data) >= 2 and data[0] == 0x80 and data[1] <= pickle.HIGHEST_PROTOCOL
-
-
-def _decode_serialized_named_tensor_payload(data: Any) -> Any:
-    """Normalize a single serialized tensor payload to raw pickle bytes.
-
-    Three entry paths produce different representations:
-      1. In-process Engine (engine.py) — raw pickle bytes. Detected by the
-         pickle magic header (0x80 + protocol), returned as-is.
-      2. HTTP JSON (FastAPI Body) — msgspec auto-base64-decodes the JSON
-         string into raw pickle bytes before we see it, so same as (1).
-      3. Pydantic / HttpServerEngine — Pydantic coerces a base64 str to
-         bytes via UTF-8 encode (does NOT base64-decode), so the bytes are
-         still base64-encoded. Caught by the b64decode fallback below.
-    """
-    if isinstance(data, str):
-        return pybase64.b64decode(data, validate=True)
-
-    if isinstance(data, (bytes, bytearray, memoryview)):
-        data = bytes(data)
-        # Paths (1) and (2): already raw pickle bytes.
-        if _looks_like_pickle_payload(data):
-            return data
-        # Path (3): base64 content as bytes — decode to raw pickle.
-        try:
-            return pybase64.b64decode(data, validate=True)
-        except (binascii.Error, ValueError):
-            return data
-
-    return data
-
-
-def _decode_serialized_named_tensor_payloads(payloads: List[Any]) -> List[Any]:
-    return [_decode_serialized_named_tensor_payload(data) for data in payloads]

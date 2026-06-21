@@ -14,6 +14,10 @@
 """
 The definition of objects transferred between different
 processes (TokenizerManager, DetokenizerManager, Scheduler).
+
+Keep this file focused on IPC struct definitions so it stays concise. Put
+normalizers, helper utilities, and future non-struct logic in the owning module
+instead, such as sglang.srt.utils.common.
 """
 
 from __future__ import annotations
@@ -1585,7 +1589,8 @@ class UpdateWeightsFromTensorReqInput(BaseReq, kw_only=True):
     - Data is structured in JSON for easy transmission over HTTP
     """
 
-    # List[Union[str, bytes]]
+    # Raw MultiprocessingSerializer bytes. HTTP/base64 strings are accepted at
+    # ingress and normalized before this request is sent over scheduler IPC.
     serialized_named_tensors: List[bytes]
     # Optional format specification for loading
     load_format: Optional[str] = None
