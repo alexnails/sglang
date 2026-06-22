@@ -6,8 +6,14 @@
 //! Scheduler reads via pyzmq), so the bytes — already byte-identical to the
 //! Python codec (see `msgpack::encode_tokenized_generate`) — interoperate.
 //!
-//! Request direction only for now; routing generated outputs back to the gRPC
-//! server (the `http_worker_ipc` return path) is the remaining Phase-5 work.
+//! `ZmqGenerateClient` ties both directions together: it pushes requests and
+//! demuxes streamed `BatchStrOutput`s back to per-request channels by rid, so
+//! the gRPC `generate` handler can serve over ZMQ without the PyO3 bridge.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use tokio::sync::mpsc;
 
 use crate::msgpack;
 use crate::proto::SamplingParams;
@@ -186,6 +192,101 @@ impl SchedulerReceiver {
     pub fn recv_outputs(&self) -> Result<Vec<GenerateOutput>, String> {
         let bytes = self.socket.recv_bytes(0).map_err(|e| e.to_string())?;
         decode_batch_str_output(&bytes)
+    }
+}
+
+type PendingMap = Mutex<HashMap<String, mpsc::UnboundedSender<GenerateOutput>>>;
+
+/// Ties the request and response directions together for the gRPC `generate`
+/// handler: pushes a `TokenizedGenerateReqInput` to the Scheduler and routes the
+/// streamed outputs back to the originating request by rid.
+///
+/// A background thread owns the PULL socket (libzmq sockets aren't `Sync`) and
+/// forwards each decoded `GenerateOutput` into the per-rid channel registered by
+/// `submit`. The PUSH socket is shared behind a `Mutex` since gRPC handlers run
+/// on multiple Tokio worker threads.
+pub struct ZmqGenerateClient {
+    sender: Mutex<SchedulerSender>,
+    return_endpoint: String,
+    pending: Arc<PendingMap>,
+}
+
+impl ZmqGenerateClient {
+    /// Connect the PUSH socket to the Scheduler input endpoint, bind the PULL
+    /// return endpoint, and spawn the output-demux thread.
+    ///
+    /// NOTE: bind-vs-connect on the Scheduler input depends on the live launch
+    /// topology (the TokenizerManager normally binds `scheduler_input_ipc_name`).
+    /// This connects; confirm against the Scheduler wiring when running on a GPU box.
+    pub fn start(scheduler_endpoint: &str, return_endpoint: &str) -> Result<Arc<Self>, String> {
+        let sender = SchedulerSender::connect(scheduler_endpoint).map_err(|e| e.to_string())?;
+        let receiver = SchedulerReceiver::bind(return_endpoint).map_err(|e| e.to_string())?;
+        let pending: Arc<PendingMap> = Arc::new(Mutex::new(HashMap::new()));
+
+        let pending_recv = pending.clone();
+        std::thread::Builder::new()
+            .name("grpc-zmq-recv".to_string())
+            .spawn(move || Self::recv_loop(receiver, pending_recv))
+            .map_err(|e| e.to_string())?;
+
+        Ok(Arc::new(Self {
+            sender: Mutex::new(sender),
+            return_endpoint: return_endpoint.to_string(),
+            pending,
+        }))
+    }
+
+    fn recv_loop(receiver: SchedulerReceiver, pending: Arc<PendingMap>) {
+        loop {
+            match receiver.recv_outputs() {
+                Ok(outputs) => {
+                    let map = pending.lock().unwrap();
+                    for out in outputs {
+                        if let Some(rid) = out.rid.clone() {
+                            if let Some(tx) = map.get(&rid) {
+                                let _ = tx.send(out); // receiver gone => request dropped
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("gRPC ZMQ recv loop error: {e}");
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        }
+    }
+
+    /// Register `rid`, push the request, and return a stream of its outputs.
+    pub fn submit(
+        &self,
+        rid: &str,
+        req: &crate::proto::GenerateRequest,
+    ) -> Result<mpsc::UnboundedReceiver<GenerateOutput>, SendError> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.pending.lock().unwrap().insert(rid.to_string(), tx);
+
+        let ipc_req = build_tokenized_generate(
+            Some(rid.to_string()),
+            Some(self.return_endpoint.clone()), // route outputs back to recv_loop
+            None,                               // tokenized path: no input_text
+            &req.input_ids,
+            req.sampling_params.clone(),
+            req.return_logprob.unwrap_or(false),
+            req.logprob_start_len.unwrap_or(0),
+            req.top_logprobs_num.unwrap_or(0),
+            req.stream.unwrap_or(true),
+        );
+        if let Err(e) = self.sender.lock().unwrap().send_tokenized_generate(&ipc_req) {
+            self.remove(rid);
+            return Err(e);
+        }
+        Ok(rx)
+    }
+
+    /// Drop a request's routing entry (call when its stream ends or is aborted).
+    pub fn remove(&self, rid: &str) {
+        self.pending.lock().unwrap().remove(rid);
     }
 }
 

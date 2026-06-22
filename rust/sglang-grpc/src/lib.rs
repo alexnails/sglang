@@ -156,7 +156,7 @@ fn extract_tokenizer_info(runtime_handle: &PyObject) -> PyResult<TokenizerInfo> 
 /// Returns:
 ///     GrpcServerHandle that can be used to shut down the server.
 #[pyfunction]
-#[pyo3(signature = (host, port, runtime_handle, worker_threads=4, response_channel_capacity=64, response_timeout_secs=300))]
+#[pyo3(signature = (host, port, runtime_handle, worker_threads=4, response_channel_capacity=64, response_timeout_secs=300, scheduler_input_ipc_name=None, grpc_output_ipc_name=None))]
 fn start_server(
     host: String,
     port: u16,
@@ -164,6 +164,12 @@ fn start_server(
     worker_threads: usize,
     response_channel_capacity: usize,
     response_timeout_secs: u64,
+    // When both are provided, the tokenized `Generate` RPC goes ZMQ-native to the
+    // Scheduler (Phase 4/5): `scheduler_input_ipc_name` is the Scheduler input
+    // endpoint to push to; `grpc_output_ipc_name` is the endpoint this server binds
+    // for returned outputs (set as each request's `http_worker_ipc`).
+    scheduler_input_ipc_name: Option<String>,
+    grpc_output_ipc_name: Option<String>,
 ) -> PyResult<GrpcServerHandle> {
     // Best-effort: embedding processes may initialize tracing themselves.
     let _ = tracing_subscriber::fmt()
@@ -242,6 +248,28 @@ fn start_server(
     let shutdown_clone = shutdown.clone();
     let bridge_clone = bridge.clone();
 
+    let zmq_generate = match (scheduler_input_ipc_name, grpc_output_ipc_name) {
+        (Some(scheduler_ep), Some(return_ep)) => {
+            match zmq_transport::ZmqGenerateClient::start(&scheduler_ep, &return_ep) {
+                Ok(client) => {
+                    tracing::info!(
+                        scheduler = %scheduler_ep,
+                        return_endpoint = %return_ep,
+                        "ZMQ-native generate path enabled"
+                    );
+                    Some(client)
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to start ZMQ generate client ({e}); falling back to the PyO3 bridge"
+                    );
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
     let join_handle = std::thread::Builder::new()
         .name("sglang-grpc".to_string())
         .spawn(move || {
@@ -250,6 +278,7 @@ fn start_server(
                 bridge_clone,
                 shutdown_clone,
                 response_timeout,
+                zmq_generate,
             )) {
                 tracing::error!("gRPC server exited with error: {}", e);
             }

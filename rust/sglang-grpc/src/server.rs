@@ -17,10 +17,15 @@ use crate::utils::{
     build_classify_dict, build_embed_dict, build_generate_dict, build_text_embed_dict,
     build_text_generate_dict, extract_model_path,
 };
+use crate::zmq_transport::ZmqGenerateClient;
 
 pub struct SglangServiceImpl {
     pub bridge: Arc<PyBridge>,
     pub response_timeout: Duration,
+    /// When set (a Scheduler ZMQ endpoint was configured), the tokenized
+    /// `Generate` RPC bypasses the PyO3 bridge and talks to the Scheduler over
+    /// ZMQ + msgpack (RFC #22558 Phase 4/5). `None` => bridge fallback.
+    pub zmq_generate: Option<Arc<ZmqGenerateClient>>,
 }
 
 type StreamResult<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -297,6 +302,43 @@ impl proto::sglang_service_server::SglangService for SglangServiceImpl {
             .rid
             .clone()
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+        // ZMQ-native path (RFC #22558 Phase 4/5): encode + push the tokenized
+        // request straight to the Scheduler and stream the demuxed outputs,
+        // bypassing the PyO3 bridge. Falls through to the bridge when unset.
+        if let Some(zmq) = &self.zmq_generate {
+            let mut rx = zmq
+                .submit(&rid, &req)
+                .map_err(|e| Status::internal(format!("ZMQ generate submit failed: {e}")))?;
+            let zmq = zmq.clone();
+            let rid_clone = rid.clone();
+            let stream = async_stream::stream! {
+                loop {
+                    match rx.recv().await {
+                        Some(out) => {
+                            let finished = out.finished;
+                            yield Ok(proto::GenerateResponse {
+                                output_ids: out.output_ids,
+                                meta_info: HashMap::new(),
+                                finished,
+                            });
+                            if finished {
+                                break;
+                            }
+                        }
+                        None => {
+                            yield Err(Status::internal(
+                                "ZMQ output channel closed before a finished response",
+                            ));
+                            break;
+                        }
+                    }
+                }
+                zmq.remove(&rid_clone);
+            };
+            return Ok(Response::new(Box::pin(stream)));
+        }
+
         let req_dict = build_generate_dict(&rid, &req);
 
         let mut receiver = self
@@ -980,12 +1022,14 @@ pub async fn run_grpc_server(
     bridge: Arc<PyBridge>,
     shutdown: Arc<Notify>,
     response_timeout: Duration,
+    zmq_generate: Option<Arc<ZmqGenerateClient>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = listener.local_addr()?;
     let listener = tokio::net::TcpListener::from_std(listener)?;
     let service = SglangServiceImpl {
         bridge,
         response_timeout,
+        zmq_generate,
     };
 
     let max_message_size = resolve_max_message_size();
