@@ -138,7 +138,7 @@ class TestTypeBasedDispatcher(unittest.TestCase):
             TokenizedEmbeddingReqInput(
                 input_text="",
                 input_ids=[1, 2],
-                image_inputs=dict(),
+                mm_inputs=dict(),
                 token_type_ids=[1, 2],
                 sampling_params=SamplingParams(),
             )
@@ -167,7 +167,7 @@ class TestTypeBasedDispatcher(unittest.TestCase):
                     TokenizedEmbeddingReqInput(
                         input_text="",
                         input_ids=[1, 2],
-                        image_inputs=dict(),
+                        mm_inputs=dict(),
                         token_type_ids=[1, 2],
                         sampling_params=SamplingParams(),
                     )

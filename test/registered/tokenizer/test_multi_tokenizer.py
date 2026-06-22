@@ -39,6 +39,9 @@ class TestMultiTokenizer(CustomTestCase, MMLUMixin):
                 8,
                 "--mem-fraction-static",
                 0.7,
+                "--enable-metrics",
+                "--enable-request-time-stats-logging",
+                "--enable-trace",
             ],
         )
 

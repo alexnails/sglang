@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+from sglang.srt.managers.io_struct import msgpack_decode, msgpack_encode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scripted_runtime.http_server import ScriptedHttpServer
 from sglang.test.scripted_runtime.io_struct import (
@@ -29,14 +30,14 @@ class _FakePairSocket:
         self._reply = reply
         self.sent: list = []
 
-    def send_pyobj(self, obj: object) -> None:
-        self.sent.append(obj)
+    def send(self, data: bytes, flags: int = 0) -> None:
+        self.sent.append(msgpack_decode(data))
 
     def poll(self, timeout_ms: int) -> bool:
         return self._poll_result
 
-    def recv_pyobj(self) -> object:
-        return self._reply
+    def recv(self, flags: int = 0) -> bytes:
+        return msgpack_encode(self._reply)
 
 
 class _FakeProcess:
