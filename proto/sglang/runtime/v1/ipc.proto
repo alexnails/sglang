@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+// Scheduler-facing IPC wire types, mirroring sglang.srt.managers.io_struct
+// (PR #28688, the msgpack IPC source of truth). Distinct from the client-facing
+// RPC messages in sglang.proto: these are what the native gRPC server encodes
+// and pushes to the Scheduler over ZMQ.
+//
+// Encoding (must match io_struct): each message here is a msgpack **tagged
+// positional array** (msgspec `array_like=True, tag=True`, tag = the message
+// name), EXCEPT helper value-structs (TokenArray) which are array_like but
+// untagged. Field declaration order IS the wire order — keep it in lockstep
+// with the io_struct field order. Only the faithful prefix (through the last
+// required field) is declared; the Scheduler fills the remaining defaulted
+// fields, since msgspec accepts a short array_like prefix.
+package sglang.runtime.v1.ipc;
+
+import "sglang/runtime/v1/sglang.proto";
+
+// Mirrors a Python array.array("i", ids): on the wire a 2-element msgpack array
+// [typecode, raw_bytes], which io_struct's dec_hook turns back into array.array.
+// array_like + untagged: it is a field value, decoded positionally by type.
+message TokenArray {
+  string typecode = 1; // array.array typecode, e.g. "i" (int32, 4 bytes/id)
+  bytes data = 2;      // little-endian packed token ids
+}
+
+// Faithful prefix of io_struct.TokenizedGenerateReqInput, through the last
+// required field (`stream`). Field order is load-bearing.
+message TokenizedGenerateReqInput {
+  optional string rid = 1;
+  optional string http_worker_ipc = 2;
+  optional string input_text = 3;
+  optional TokenArray input_ids = 4;
+  // None on the text/token generate path (multimodal/embeds not yet wired):
+  optional bytes input_embeds = 5;
+  optional bytes mm_inputs = 6;
+  optional bytes token_type_ids = 7;
+  optional sglang.runtime.v1.SamplingParams sampling_params = 8;
+  bool return_logprob = 9;
+  int32 logprob_start_len = 10;
+  int32 top_logprobs_num = 11;
+  repeated int32 token_ids_logprob = 12;
+  bool stream = 13;
+}

@@ -254,6 +254,29 @@ class UpdateWeightsResponse(msgspec.Struct, omit_defaults=True):
     message: str = ""
 
 
+class TokenArray(msgspec.Struct, array_like=True):
+    typecode: str = ""
+    data: bytes = b""
+
+
+class TokenizedGenerateReqInput(
+    msgspec.Struct, tag=True, array_like=True, kw_only=True
+):
+    rid: str | None = None
+    http_worker_ipc: str | None = None
+    input_text: str | None = None
+    input_ids: TokenArray | None = None
+    input_embeds: bytes | None = None
+    mm_inputs: bytes | None = None
+    token_type_ids: bytes | None = None
+    sampling_params: SamplingParams | None = None
+    return_logprob: bool = False
+    logprob_start_len: int = 0
+    top_logprobs_num: int = 0
+    token_ids_logprob: list[int] = msgspec.field(default_factory=list)
+    stream: bool = False
+
+
 _ENCODER = msgspec.msgpack.Encoder()
 _DECODERS: dict = {}
 

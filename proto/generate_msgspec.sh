@@ -12,7 +12,8 @@ set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$here/.." && pwd)"
-proto="sglang/runtime/v1/sglang.proto"
+# Client-facing RPC types + the Scheduler IPC wire types (#28688 mirror).
+protos=("sglang/runtime/v1/sglang.proto" "sglang/runtime/v1/ipc.proto")
 out="$repo_root/python/sglang/srt/grpc/messages.py"
 python_bin="${PYTHON:-python3}"
 
@@ -24,7 +25,7 @@ protoc \
   --include_imports \
   --experimental_allow_proto3_optional \
   --descriptor_set_out="$tmp/sglang.desc" \
-  "$proto"
+  "${protos[@]}"
 
 "$python_bin" "$here/gen_msgspec.py" "$tmp/sglang.desc" > "$out"
 

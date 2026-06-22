@@ -27,6 +27,14 @@ GV_TOKENIZE_RESPONSE = bytes.fromhex(
     "84a6746f6b656e7393010203a5636f756e7403ad6d61785f6d6f64656c5f6c656e"
     "cc80aa696e7075745f74657874a26869"
 )
+# IPC wire (ipc.proto): a msgpack tagged positional array mirroring io_struct's
+# #28688 TokenizedGenerateReqInput. Float-free, so byte-identical cross-language.
+GV_TOK_GENERATE = bytes.fromhex(
+    "9eb9546f6b656e697a656447656e6572617465526571496e707574a3616263"
+    "c0a2686992a169c40c010000000200000003000000c0c0c083ae6d61785f6e"
+    "65775f746f6b656e7310ae73746f705f746f6b656e5f6964739102a16e01c2"
+    "000090c3"
+)
 
 
 class TestMsgpackCodec(CustomTestCase):
@@ -96,6 +104,54 @@ class TestMsgpackCodec(CustomTestCase):
 
         blob = msgspec.msgpack.encode({"rid": "x", "field_from_the_future": 7})
         self.assertEqual(M.decode(blob, M.GenerateRequest).rid, "x")
+
+
+class TestIpcWireCodec(CustomTestCase):
+    """ipc.proto types must encode to #28688's msgpack tagged-array wire and be
+    decodable by the real Scheduler codec (io_struct)."""
+
+    def _sample_req(self):
+        from array import array
+
+        return M.TokenizedGenerateReqInput(
+            rid="abc",
+            input_text="hi",
+            input_ids=M.TokenArray(typecode="i", data=array("i", [1, 2, 3]).tobytes()),
+            sampling_params=M.SamplingParams(
+                max_new_tokens=16, n=1, stop_token_ids=[2]
+            ),
+            return_logprob=False,
+            logprob_start_len=0,
+            top_logprobs_num=0,
+            stream=True,
+        )
+
+    def test_tokenized_generate_golden_vector(self):
+        """Float-free; byte-identical to the Rust codec (cross-language drift lock)."""
+        self.assertEqual(M.encode(self._sample_req()), GV_TOK_GENERATE)
+
+    def test_array_like_tagged_shape(self):
+        """0x9e = fixarray(14): tag + 13-field faithful prefix, not a field map."""
+        blob = M.encode(self._sample_req())
+        self.assertEqual(blob[0], 0x9E)
+        back = M.decode(GV_TOK_GENERATE, M.TokenizedGenerateReqInput)
+        self.assertEqual(back.rid, "abc")
+        self.assertEqual(back.input_ids.typecode, "i")
+
+    def test_scheduler_decodes_generated_wire(self):
+        """The real Scheduler codec must accept our bytes and rebuild a correct
+        TokenizedGenerateReqInput, filling the omitted trailing fields."""
+        import sglang.srt.managers.io_struct as io_struct
+
+        d = io_struct.msgpack_decode(M.encode(self._sample_req()))
+        self.assertEqual(type(d).__name__, "TokenizedGenerateReqInput")
+        self.assertEqual(d.rid, "abc")
+        self.assertEqual(list(d.input_ids), [1, 2, 3])
+        self.assertEqual(d.input_ids.typecode, "i")
+        self.assertEqual(d.sampling_params.max_new_tokens, 16)
+        self.assertEqual(d.sampling_params.stop_token_ids, {2})
+        self.assertIs(d.stream, True)
+        self.assertIs(d.return_hidden_states, False)  # trailing default filled
 
 
 if __name__ == "__main__":

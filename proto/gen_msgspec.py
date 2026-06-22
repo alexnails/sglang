@@ -40,6 +40,19 @@ SCALAR = {
     FD.TYPE_SINT64: ("int", "0"),
 }
 
+# Encoding policy for the Scheduler IPC wire (PR #28688 / io_struct):
+# messages in the `*.ipc` package encode as msgpack tagged positional arrays
+# (msgspec array_like + tag = class name), so the Scheduler's tagged-union
+# decoder dispatches on them. Helpers in IPC_HELPERS are array_like but
+# UNTAGGED (decoded positionally as a field value, e.g. TokenArray -> the
+# [typecode, bytes] pair io_struct's dec_hook expects). Every other message
+# stays a field-name map with omit_defaults, as before.
+IPC_HELPERS = {"TokenArray"}
+
+
+def is_ipc(pkg):
+    return pkg == "sglang.runtime.v1.ipc" or pkg.endswith(".ipc")
+
 
 def short(type_name):
     return type_name.rsplit(".", 1)[-1]
@@ -63,11 +76,13 @@ def main(desc_path):
 
     map_entries = {}
     messages = {}  # name -> DescriptorProto
+    pkg_of = {}  # name -> proto package (selects the encoding policy)
     for fp in fds.file:
         for msg in fp.message_type:
             collect_maps(msg, f".{fp.package}.{msg.name}", map_entries)
             if not msg.options.map_entry:
                 messages[msg.name] = msg
+                pkg_of[msg.name] = fp.package
 
     def value_anno(f):
         if f.type == FD.TYPE_MESSAGE:
@@ -123,7 +138,23 @@ def main(desc_path):
 
     for name in ordered:
         msg = messages[name]
-        out.append(f"class {name}(msgspec.Struct, omit_defaults=True):")
+        if is_ipc(pkg_of[name]):
+            # array_like positional wire; tag (= class name) unless it's a
+            # helper value-struct decoded positionally by its field type.
+            cfg = (
+                "msgspec.Struct, array_like=True"
+                if name in IPC_HELPERS
+                else "msgspec.Struct, tag=True, array_like=True, kw_only=True"
+            )
+            header = f"class {name}({cfg}):"
+            if len(header) <= 88:  # keep black happy without a separate format pass
+                out.append(header)
+            else:
+                out.append(f"class {name}(")
+                out.append(f"    {cfg}")
+                out.append("):")
+        else:
+            out.append(f"class {name}(msgspec.Struct, omit_defaults=True):")
         if not msg.field:
             out.append("    pass")
             out.append("")
