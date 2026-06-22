@@ -3,6 +3,7 @@ pub mod msgpack;
 pub mod server;
 pub mod tokenizers;
 pub(crate) mod utils;
+pub mod zmq_transport;
 
 pub mod proto {
     tonic::include_proto!("sglang.runtime.v1");
