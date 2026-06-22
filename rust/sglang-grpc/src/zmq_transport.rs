@@ -44,6 +44,7 @@ impl From<zmq::Error> for SendError {
 /// `input_ids` is packed as native-endian int32, mirroring `array("i", ids)`.
 pub fn build_tokenized_generate(
     rid: Option<String>,
+    http_worker_ipc: Option<String>,
     input_text: Option<String>,
     input_ids: &[i32],
     sampling_params: Option<SamplingParams>,
@@ -55,6 +56,9 @@ pub fn build_tokenized_generate(
     let data: Vec<u8> = input_ids.iter().flat_map(|v| v.to_le_bytes()).collect();
     TokenizedGenerateReqInput {
         rid,
+        // The Scheduler/Detokenizer routes this request's outputs back to the
+        // endpoint a SchedulerReceiver is bound to (the Phase-5 return path).
+        http_worker_ipc,
         input_text,
         input_ids: Some(TokenArray {
             typecode: "i".to_string(),
@@ -101,6 +105,90 @@ impl SchedulerSender {
     }
 }
 
+/// One request's slice of a `BatchStrOutput` (the gRPC server streams these).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GenerateOutput {
+    pub rid: Option<String>,
+    pub output_text: String,
+    pub output_ids: Vec<i32>,
+    pub finished: bool,
+}
+
+fn token_array_to_ids(v: &rmpv::Value) -> Vec<i32> {
+    // io_struct sends array.array as [typecode, raw_bytes]; we only need the ids.
+    if let Some(pair) = v.as_array() {
+        if pair.len() == 2 {
+            if let rmpv::Value::Binary(data) = &pair[1] {
+                return data
+                    .chunks_exact(4)
+                    .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Decode the leading positional fields of a `BatchStrOutput` (array_like+tag).
+/// We read only what the gRPC server streams: rid, output text/ids, finished.
+/// Field order (after the tag): rids, http_worker_ipcs, finished_reasons,
+/// output_strs, output_ids, ...
+pub fn decode_batch_str_output(bytes: &[u8]) -> Result<Vec<GenerateOutput>, String> {
+    let value = rmpv::decode::read_value(&mut &bytes[..]).map_err(|e| e.to_string())?;
+    let arr = value.as_array().ok_or("BatchStrOutput: expected an array")?;
+    if arr.len() < 6 {
+        return Err(format!("BatchStrOutput: short array (len {})", arr.len()));
+    }
+    let rids = arr[1].as_array();
+    let finished = arr[3].as_array().ok_or("finished_reasons: expected array")?;
+    let strs = arr[4].as_array().ok_or("output_strs: expected array")?;
+    let ids = arr[5].as_array();
+
+    let mut out = Vec::with_capacity(strs.len());
+    for (i, s) in strs.iter().enumerate() {
+        out.push(GenerateOutput {
+            rid: rids
+                .and_then(|r| r.get(i))
+                .and_then(|x| x.as_str())
+                .map(str::to_string),
+            output_text: s.as_str().unwrap_or_default().to_string(),
+            output_ids: ids
+                .and_then(|l| l.get(i))
+                .map(token_array_to_ids)
+                .unwrap_or_default(),
+            // A non-nil finish reason means this request is done.
+            finished: finished.get(i).map(|fr| !fr.is_nil()).unwrap_or(false),
+        });
+    }
+    Ok(out)
+}
+
+/// A PULL socket the gRPC server binds for generated outputs; the request's
+/// `http_worker_ipc` points the Scheduler/Detokenizer here (Phase-5 return path).
+pub struct SchedulerReceiver {
+    _ctx: zmq::Context,
+    socket: zmq::Socket,
+}
+
+impl SchedulerReceiver {
+    pub fn bind(endpoint: &str) -> zmq::Result<Self> {
+        let ctx = zmq::Context::new();
+        let socket = ctx.socket(zmq::PULL)?;
+        socket.bind(endpoint)?;
+        Ok(Self { _ctx: ctx, socket })
+    }
+
+    pub fn set_recv_timeout_ms(&self, ms: i32) -> zmq::Result<()> {
+        self.socket.set_rcvtimeo(ms)
+    }
+
+    /// Receive one output frame and decode its per-request slices.
+    pub fn recv_outputs(&self) -> Result<Vec<GenerateOutput>, String> {
+        let bytes = self.socket.recv_bytes(0).map_err(|e| e.to_string())?;
+        decode_batch_str_output(&bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,10 +202,14 @@ mod tests {
 
     // Same float-free vector as msgpack::tests + test_msgpack_codec.py.
     const GV_TOK_GENERATE: &str = "9eb9546f6b656e697a656447656e6572617465526571496e707574a3616263c0a2686992a169c40c010000000200000003000000c0c0c083ae6d61785f6e65775f746f6b656e7310ae73746f705f746f6b656e5f6964739102a16e01c2000090c3";
+    // A faithful 1-item BatchStrOutput minted from io_struct (scratchpad/mock_scheduler.py mint):
+    // output_strs=["hello world"], output_ids=[array("i",[10,11,12])], finish=stop.
+    const GV_BATCH_STR_OUTPUT: &str = "dc0028ae42617463685374724f757470757491a361626391ac6970633a2f2f2f746d702f789182a474797065a473746f70a76d617463686564c091ab68656c6c6f20776f726c649192a169c40c0a0000000b0000000c000000910391039100910090909090909090909090909090909090909090c0c0c0c0c0c0c0c0909090";
 
     fn golden_req() -> TokenizedGenerateReqInput {
         build_tokenized_generate(
             Some("abc".into()),
+            None, // http_worker_ipc
             Some("hi".into()),
             &[1, 2, 3],
             Some(SamplingParams {
@@ -173,5 +265,47 @@ mod tests {
         let received = pull.recv_bytes(0).unwrap();
         assert_eq!(received, from_hex(GV_TOK_GENERATE));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn decode_batch_str_output_reads_leading_fields() {
+        let outs = decode_batch_str_output(&from_hex(GV_BATCH_STR_OUTPUT)).unwrap();
+        assert_eq!(outs.len(), 1);
+        assert_eq!(outs[0].rid.as_deref(), Some("abc"));
+        assert_eq!(outs[0].output_text, "hello world");
+        assert_eq!(outs[0].output_ids, vec![10, 11, 12]);
+        assert!(outs[0].finished);
+    }
+
+    #[test]
+    #[ignore = "manual E2E vs scratchpad/mock_scheduler.py; set SGL_REQ_ENDPOINT + SGL_OUT_ENDPOINT"]
+    fn e2e_roundtrip_with_mock_scheduler() {
+        let req_ep = std::env::var("SGL_REQ_ENDPOINT").expect("set SGL_REQ_ENDPOINT");
+        let out_ep = std::env::var("SGL_OUT_ENDPOINT").expect("set SGL_OUT_ENDPOINT");
+        // Bind our output receiver BEFORE pushing, so the reply isn't missed.
+        let receiver = SchedulerReceiver::bind(&out_ep).unwrap();
+        receiver.set_recv_timeout_ms(15000).unwrap();
+        let sender = SchedulerSender::connect(&req_ep).unwrap();
+        let req = build_tokenized_generate(
+            Some("abc".into()),
+            Some(out_ep.clone()), // route outputs back to our receiver
+            Some("hi".into()),
+            &[1, 2, 3],
+            Some(SamplingParams {
+                max_new_tokens: Some(16),
+                ..Default::default()
+            }),
+            false,
+            0,
+            0,
+            true,
+        );
+        sender.send_tokenized_generate(&req).unwrap();
+        let outs = receiver.recv_outputs().unwrap();
+        eprintln!("E2E received: {outs:?}");
+        assert_eq!(outs.len(), 1);
+        assert_eq!(outs[0].output_text, "hello world");
+        assert_eq!(outs[0].output_ids, vec![10, 11, 12]);
+        assert!(outs[0].finished);
     }
 }
