@@ -8,6 +8,9 @@ use std::process::Command;
 /// the Python `msgspec` codec generated from the same proto.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto_path = "../../proto/sglang/runtime/v1/sglang.proto";
+    // Scheduler IPC wire types (#28688 mirror); encoded by src/msgpack.rs's
+    // hand-rolled array_like+tag encoder, not the derived map Serialize.
+    let ipc_proto_path = "../../proto/sglang/runtime/v1/ipc.proto";
     let proto_root = "../../proto";
     let out_dir = std::env::var("OUT_DIR")?;
     let protoc = std::env::var("PROTOC").unwrap_or_else(|_| "protoc".to_string());
@@ -22,6 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &format!("--descriptor_set_out={descriptor}"),
             "--include_imports",
             proto_path,
+            ipc_proto_path,
         ])
         .status()?;
     if !status.success() {
@@ -102,8 +106,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    builder.compile_protos(&[proto_path], &[proto_root])?;
+    builder.compile_protos(&[proto_path, ipc_proto_path], &[proto_root])?;
 
     println!("cargo:rerun-if-changed={}", proto_path);
+    println!("cargo:rerun-if-changed={}", ipc_proto_path);
     Ok(())
 }

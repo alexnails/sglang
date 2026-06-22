@@ -63,6 +63,94 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, rmp_serde::decode:
     rmp_serde::from_slice(bytes)
 }
 
+// ---------------------------------------------------------------------------
+// IPC array_like+tag encoder (matches sglang.srt.managers.io_struct, #28688).
+//
+// The Scheduler's tagged-union decoder expects each request as a msgpack
+// *positional array* whose first element is the type tag (the struct name),
+// not a field-name map. rmp-serde's struct-as-map is a single global serializer
+// setting, so we can't emit "outer array + inner SamplingParams map" in one
+// serde pass; instead we hand-write the outer array with low-level `rmp` and
+// reuse `encode` (with_struct_map) for the nested SamplingParams map. Only the
+// faithful prefix (through the last required field `stream`) is emitted; msgspec
+// fills the remaining defaulted fields. Byte-identical to the Python codec's
+// `messages.encode` (shared golden vector below / in test_msgpack_codec.py).
+// ---------------------------------------------------------------------------
+
+fn put_nil(buf: &mut Vec<u8>) {
+    rmp::encode::write_nil(buf).expect("vec write is infallible");
+}
+
+fn put_str(buf: &mut Vec<u8>, s: &str) {
+    rmp::encode::write_str(buf, s).expect("vec write is infallible");
+}
+
+fn put_opt_str(buf: &mut Vec<u8>, s: Option<&str>) {
+    match s {
+        Some(v) => put_str(buf, v),
+        None => put_nil(buf),
+    }
+}
+
+fn put_opt_bin(buf: &mut Vec<u8>, b: Option<&[u8]>) {
+    match b {
+        Some(v) => {
+            rmp::encode::write_bin(buf, v).expect("vec write is infallible");
+        }
+        None => put_nil(buf),
+    }
+}
+
+/// Minimal msgpack int, matching msgspec: non-negative as unsigned, else signed.
+fn put_int(buf: &mut Vec<u8>, v: i64) {
+    if v >= 0 {
+        rmp::encode::write_uint(buf, v as u64).expect("vec write is infallible");
+    } else {
+        rmp::encode::write_sint(buf, v).expect("vec write is infallible");
+    }
+}
+
+/// Encode an `ipc::TokenizedGenerateReqInput` to the Scheduler IPC wire.
+pub fn encode_tokenized_generate(
+    req: &crate::proto::ipc::TokenizedGenerateReqInput,
+) -> Result<Vec<u8>, rmp_serde::encode::Error> {
+    let mut buf = Vec::new();
+    // tag + 13 prefix fields = a 14-element array.
+    rmp::encode::write_array_len(&mut buf, 14).expect("vec write is infallible");
+    put_str(&mut buf, "TokenizedGenerateReqInput");
+    put_opt_str(&mut buf, req.rid.as_deref());
+    put_opt_str(&mut buf, req.http_worker_ipc.as_deref());
+    put_opt_str(&mut buf, req.input_text.as_deref());
+    // input_ids: [typecode, raw_bytes] (io_struct dec_hook -> array.array), or nil.
+    match &req.input_ids {
+        Some(ta) => {
+            rmp::encode::write_array_len(&mut buf, 2).expect("vec write is infallible");
+            put_str(&mut buf, &ta.typecode);
+            rmp::encode::write_bin(&mut buf, &ta.data).expect("vec write is infallible");
+        }
+        None => put_nil(&mut buf),
+    }
+    // None on the text/token generate path (multimodal/embeds not yet wired).
+    put_opt_bin(&mut buf, req.input_embeds.as_deref());
+    put_opt_bin(&mut buf, req.mm_inputs.as_deref());
+    put_opt_bin(&mut buf, req.token_type_ids.as_deref());
+    // sampling_params stays a field-name map (io_struct keeps it non-array_like).
+    match &req.sampling_params {
+        Some(sp) => buf.extend_from_slice(&encode(sp)?),
+        None => put_nil(&mut buf),
+    }
+    rmp::encode::write_bool(&mut buf, req.return_logprob).expect("vec write is infallible");
+    put_int(&mut buf, req.logprob_start_len as i64);
+    put_int(&mut buf, req.top_logprobs_num as i64);
+    rmp::encode::write_array_len(&mut buf, req.token_ids_logprob.len() as u32)
+        .expect("vec write is infallible");
+    for v in &req.token_ids_logprob {
+        put_int(&mut buf, *v as i64);
+    }
+    rmp::encode::write_bool(&mut buf, req.stream).expect("vec write is infallible");
+    Ok(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,6 +225,9 @@ mod tests {
     const GV_OPENAI: &str =
         "82a96a736f6e5f626f6479c4077b2261223a317dad74726163655f6865616465727381a178a179";
     const GV_TOKENIZE_RESPONSE: &str = "84a6746f6b656e7393010203a5636f756e7403ad6d61785f6d6f64656c5f6c656ecc80aa696e7075745f74657874a26869";
+    // IPC array_like+tag wire; identical to GV_TOK_GENERATE in
+    // test/registered/unit/grpc/test_msgpack_codec.py (float-free => byte-stable).
+    const GV_TOK_GENERATE: &str = "9eb9546f6b656e697a656447656e6572617465526571496e707574a3616263c0a2686992a169c40c010000000200000003000000c0c0c083ae6d61785f6e65775f746f6b656e7310ae73746f705f746f6b656e5f6964739102a16e01c2000090c3";
 
     #[test]
     fn golden_vector_generate_request() {
@@ -193,5 +284,30 @@ mod tests {
         };
         assert_eq!(encode(&resp).unwrap(), expect);
         assert_eq!(decode::<TokenizeResponse>(&expect).unwrap(), resp);
+    }
+
+    #[test]
+    fn golden_vector_tokenized_generate_ipc() {
+        // The IPC tagged-array wire must be byte-identical to the Python codec
+        // (messages.encode) so the Scheduler's io_struct decoder accepts it.
+        let expect = from_hex(GV_TOK_GENERATE);
+        let req = crate::proto::ipc::TokenizedGenerateReqInput {
+            rid: Some("abc".into()),
+            input_text: Some("hi".into()),
+            input_ids: Some(crate::proto::ipc::TokenArray {
+                typecode: "i".into(),
+                // array("i", [1, 2, 3]).tobytes() — int32 little-endian.
+                data: vec![1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0],
+            }),
+            sampling_params: Some(SamplingParams {
+                max_new_tokens: Some(16),
+                n: Some(1),
+                stop_token_ids: vec![2],
+                ..Default::default()
+            }),
+            stream: true,
+            ..Default::default()
+        };
+        assert_eq!(encode_tokenized_generate(&req).unwrap(), expect);
     }
 }

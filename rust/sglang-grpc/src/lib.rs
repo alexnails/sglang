@@ -6,6 +6,12 @@ pub(crate) mod utils;
 
 pub mod proto {
     tonic::include_proto!("sglang.runtime.v1");
+
+    // Scheduler IPC wire types (sglang/runtime/v1/ipc.proto). Mounted as a child
+    // module so prost's `super::SamplingParams` cross-package path resolves here.
+    pub mod ipc {
+        tonic::include_proto!("sglang.runtime.v1.ipc");
+    }
 }
 
 use pyo3::prelude::*;
