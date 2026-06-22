@@ -13,32 +13,24 @@ from sglang.srt.utils import (  # noqa: E402
     normalize_serialized_named_tensor_payloads,
 )
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class TestUpdateWeightsFromTensorPayloadDecoding(CustomTestCase):
-    def test_base64_bytes_from_json_are_decoded(self):
+    def test_base64_and_raw_payloads_normalize_to_pickle_bytes(self):
         payload = [("weight", [1, 2, 3])]
+        raw = MultiprocessingSerializer.serialize(payload)
         encoded = MultiprocessingSerializer.serialize(payload, output_str=True)
         req = TypeAdapter(UpdateWeightsFromTensorReqInput).validate_python(
-            {"serialized_named_tensors": [encoded]}
+            {"serialized_named_tensors": [encoded, raw]}
         )
 
-        self.assertIsInstance(req.serialized_named_tensors[0], bytes)
-        decoded = normalize_serialized_named_tensor_payloads(
+        normalized = normalize_serialized_named_tensor_payloads(
             req.serialized_named_tensors
         )
 
-        self.assertEqual(MultiprocessingSerializer.deserialize(decoded[0]), payload)
-
-    def test_raw_pickle_bytes_are_preserved(self):
-        payload = [("weight", [1, 2, 3])]
-        raw = MultiprocessingSerializer.serialize(payload)
-
-        decoded = normalize_serialized_named_tensor_payloads([raw])
-
-        self.assertEqual(decoded, [raw])
-        self.assertEqual(MultiprocessingSerializer.deserialize(decoded[0]), payload)
+        self.assertEqual(normalized, [raw, raw])
+        self.assertEqual(MultiprocessingSerializer.deserialize(normalized[0]), payload)
 
 
 if __name__ == "__main__":
