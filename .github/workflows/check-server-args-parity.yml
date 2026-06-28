@@ -1,0 +1,52 @@
+name: Server Args CLI Parity
+
+# Enforces that the generated Rust `ServerArgs` clap struct stays in sync with
+# the Python `ServerArgs` dataclass (the single source of truth). The Lint
+# workflow's pre-commit run cannot do this — it only installs pre-commit, so the
+# `ServerArgs` import (which needs the sglang/torch runtime) is unavailable there
+# and the pre-commit hook skips. This job installs the runtime and is therefore
+# the authoritative, merge-blocking gate. Add it to the branch's required checks.
+
+on:
+  pull_request:
+    paths:
+      - "python/sglang/srt/server_args.py"
+      - "python/sglang/srt/arg_groups/**"
+      - "rust/sglang-grpc/src/server_args_generated.rs"
+      - "scripts/ci/check_rust_cli_drift.py"
+      - ".github/workflows/check-server-args-parity.yml"
+  push:
+    branches: [main]
+    paths:
+      - "python/sglang/srt/server_args.py"
+      - "python/sglang/srt/arg_groups/**"
+      - "rust/sglang-grpc/src/server_args_generated.rs"
+      - "scripts/ci/check_rust_cli_drift.py"
+      - ".github/workflows/check-server-args-parity.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: server-args-parity-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install minimal deps to import ServerArgs
+        run: |
+          python -m pip install --upgrade pip
+          # CPU-only torch is enough to import ServerArgs (no GPU at import time).
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e ./python
+
+      - name: Check Rust ServerArgs is in sync with Python
+        run: |
+          python -m sglang.srt.arg_groups.gen_rust_cli --check

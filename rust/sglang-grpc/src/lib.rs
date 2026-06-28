@@ -1,5 +1,9 @@
 pub mod bridge;
 pub mod server;
+/// CLI argument definitions, auto-generated from the Python `ServerArgs`
+/// dataclass so both frontends accept the same flags. See
+/// `python/sglang/srt/arg_groups/gen_rust_cli.py`; do not edit by hand.
+pub mod server_args_generated;
 pub mod tokenizers;
 pub(crate) mod utils;
 

@@ -112,6 +112,12 @@ repos:
         pass_filenames: false
         always_run: true
         stages: [pre-commit]
+      - id: check-rust-cli-drift
+        name: rust ServerArgs CLI parity (generated from Python)
+        entry: python3 scripts/ci/check_rust_cli_drift.py
+        language: system
+        files: ^(python/sglang/srt/server_args\.py|python/sglang/srt/arg_groups/.*\.py|rust/sglang-grpc/src/server_args_generated\.rs)$
+        pass_filenames: false
       - id: rustfmt-sgl-model-gateway
         name: rustfmt sgl-model-gateway (nightly)
         entry: bash -c 'rustup component add --toolchain nightly rustfmt >/dev/null && cd sgl-model-gateway && cargo +nightly fmt -- --check'
