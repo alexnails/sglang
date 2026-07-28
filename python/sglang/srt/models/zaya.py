@@ -316,17 +316,23 @@ def cca_decode(
     prev_hs_state: torch.Tensor,
     mamba_indices: torch.Tensor,
     total_padding: Optional[int] = None,
+    decode_conv_weight: Optional[torch.Tensor] = None,
+    decode_conv_bias: Optional[torch.Tensor] = None,
+    decode_conv_groups: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Single-token decode conv-state step (v1, pure torch).
 
     Gathers each request's cached ``conv_state`` / ``prev_hs_state`` via
-    ``index_select``, runs ``conv_qk`` on the ``[T, C, total_padding + 1]``
+    ``index_select``, applies the conv over the ``[T, C, total_padding + 1]``
     window, and scatters the updated state back with ``index_copy_``. All ops are
     on-device (``mamba_indices`` is a device ``long`` tensor), so this stays
     CUDA-graph capturable. Returns ``(qk_out, prev_hs)`` where ``prev_hs`` is the
     previous hidden state feeding ``val_proj2``.
 
-    The Triton swap is :func:`cca_conv1d_update`.
+    When ``decode_conv_weight`` / ``_bias`` / ``_groups`` are supplied (see
+    :meth:`CCA.fold_decode_conv`) the two conv stages are evaluated as a single
+    grouped matmul; otherwise ``conv_qk`` is run as-is. The Triton swap is
+    :func:`cca_conv1d_update`.
     """
     dtype = hidden_states.dtype
     if total_padding is None:
@@ -335,8 +341,18 @@ def cca_decode(
     left_pad = conv_state.index_select(0, mamba_indices).to(dtype)
     cur = qk.unsqueeze(-1)  # [T, C, 1]
     padded = torch.cat([left_pad, cur], dim=-1)  # [T, C, total_padding + 1]
-    out = conv_qk(padded)  # [T, C, 1]
-    qk_out = out.squeeze(-1)  # [T, C]
+    if decode_conv_weight is not None:
+        # Folded path: [T, C, taps] -> [T, G, Cg*taps] (the trailing (Cg, taps)
+        # dims flatten in place, matching how fold_decode_conv laid out the
+        # weight) -> one grouped matmul -> [T, C].
+        num_tokens = padded.shape[0]
+        grouped = padded.reshape(num_tokens, decode_conv_groups, -1)
+        qk_out = (
+            torch.einsum("tgk,gok->tgo", grouped, decode_conv_weight) + decode_conv_bias
+        ).reshape(num_tokens, -1)
+    else:
+        out = conv_qk(padded)  # [T, C, 1]
+        qk_out = out.squeeze(-1)  # [T, C]
 
     new_state = padded[..., -total_padding:]
     conv_state.index_copy_(0, mamba_indices, new_state.to(conv_state.dtype))
@@ -574,6 +590,36 @@ class CCA(nn.Module):
             ),
         )
 
+        # Decode-time fold of the two conv stages into one grouped matmul.
+        # Filled by ``fold_decode_conv`` after weight load; see that method and
+        # ``cca_decode`` for the derivation. Non-persistent (derived from the
+        # conv_qk parameters, and those are already TP-sliced per rank, so the
+        # fold is automatically per-rank correct).
+        self.decode_conv_groups = self.num_q_heads + self.num_k_heads
+        self.decode_conv_taps = self.total_padding + 1
+        ch_per_group = self.in_out_ch // self.decode_conv_groups
+        self.register_buffer(
+            "decode_conv_weight",
+            torch.zeros(
+                self.decode_conv_groups,
+                ch_per_group,
+                ch_per_group * self.decode_conv_taps,
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "decode_conv_bias",
+            torch.zeros(self.decode_conv_groups, ch_per_group),
+            persistent=False,
+        )
+        # The folded buffers are only valid once ``fold_decode_conv`` has run
+        # against loaded weights. Until then ``forward`` must keep using the real
+        # ``conv_qk`` -- consuming the zero-initialized buffers would silently
+        # emit bias-only output. Folding is done eagerly at load time rather than
+        # lazily in ``forward``, because a lazy fold would execute inside CUDA
+        # graph capture and bake stale constants into the replayed graph.
+        self._decode_conv_folded = False
+
         # Per-K-head learnable temperature scalar (per-rank slice).
         self.temp = nn.Parameter(torch.zeros(self.num_k_heads))
 
@@ -696,6 +742,55 @@ class CCA(nn.Module):
             key_conv.to(torch.float32) + 0.5 * query_pre_mean + 0.5 * key_base_fp32
         )
         return query_out, key_out
+
+    @torch.no_grad()
+    def fold_decode_conv(self) -> None:
+        """Collapse ``conv_qk`` into one grouped matmul for the decode step.
+
+        Decode feeds a ``[T, C, total_padding + 1]`` window and needs a single
+        output timestep, so the depthwise stage (``kernel_size = cca_time0``)
+        followed by the grouped stage (``kernel_size = cca_time1``) is one affine
+        map from ``t0 + t1 - 1 == total_padding + 1`` input taps::
+
+            out[co] = sum_{ci in g} sum_{j<t1} w1[co,ci,j]
+                                  * ( sum_{k<t0} w0[ci,k] * x[ci,j+k] ) + bias
+                    = sum_{ci in g} sum_m A[co,ci,m] * x[ci,m] + bias
+            A[co,ci,m] = sum_{j+k=m} w1[co,ci,j] * w0[ci,k]
+
+        The depthwise bias passes through every tap of the grouped stage, hence
+        ``b = b1 + sum_ci (sum_j w1[co,ci,j]) * b0[ci]``. Folding turns two
+        MIOpen grouped convs into one einsum: measured 1.9x (T=1) to 4.6x (T=32)
+        on MI350X under graph replay. Extend still uses the real two-stage conv,
+        which produces many timesteps and cannot be folded this way.
+        """
+        t0, t1 = self.cca_time0, self.cca_time1
+        groups = self.decode_conv_groups
+        cg = self.in_out_ch // groups
+        taps = self.decode_conv_taps
+
+        w0 = self.conv_qk[0].weight.float().view(groups, cg, t0)  # depthwise
+        b0 = self.conv_qk[0].bias.float().view(groups, cg)
+        w1 = self.conv_qk[1].weight.float().view(groups, cg, cg, t1)  # grouped
+        b1 = self.conv_qk[1].bias.float().view(groups, cg)
+
+        folded = torch.zeros(
+            groups, cg, cg, taps, device=w0.device, dtype=torch.float32
+        )
+        for j in range(t1):
+            for k in range(t0):
+                # w1[..., j] weights the depthwise output at offset j, which
+                # itself reads input tap j + k.
+                folded[..., j + k] += w1[..., j] * w0[:, None, :, k]
+
+        self.decode_conv_weight.copy_(
+            folded.reshape(groups, cg, cg * taps).to(self.decode_conv_weight.dtype)
+        )
+        self.decode_conv_bias.copy_(
+            (b1 + (w1.sum(dim=3) * b0[:, None, :]).sum(dim=2)).to(
+                self.decode_conv_bias.dtype
+            )
+        )
+        self._decode_conv_folded = True
 
     def _conv_qk_run(self, padded: torch.Tensor) -> torch.Tensor:
         """Run ``conv_qk`` on ``[N, C, S + total_padding]`` → ``[N, C, S]``."""
@@ -827,6 +922,11 @@ class CCA(nn.Module):
                 prev_hs_state,
                 meta.cache_indices,
                 self.total_padding,
+                decode_conv_weight=(
+                    self.decode_conv_weight if self._decode_conv_folded else None
+                ),
+                decode_conv_bias=self.decode_conv_bias,
+                decode_conv_groups=self.decode_conv_groups,
             )
         else:
             qk_out, v2_input = cca_extend(
@@ -1843,6 +1943,8 @@ class ZayaForCausalLM(nn.Module):
         for module in self.modules():
             if isinstance(module, ResidualScaling):
                 module.fold_scales()
+            elif isinstance(module, CCA):
+                module.fold_decode_conv()
 
 
 EntryClass = ZayaForCausalLM

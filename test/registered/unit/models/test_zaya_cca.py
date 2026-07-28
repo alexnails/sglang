@@ -571,6 +571,78 @@ class TestZayaCCA(CustomTestCase):
             self.assertNotIn(id(fb_decode), backend._step_slot_ids)
 
 
+class TestCCADecodeConvFold(CustomTestCase):
+    """``CCA.fold_decode_conv`` must reproduce the two-stage conv exactly.
+
+    Derived property. At decode the window is ``[T, C, total_padding + 1]`` and
+    only one output timestep is needed, so conv_qk[0] (depthwise, k=cca_time0)
+    composed with conv_qk[1] (grouped, k=cca_time1) collapses to a single grouped
+    matmul whose weight is precomputable. The tap-index bookkeeping
+    (``A[..., j+k] += w1[..., j] * w0[..., k]``) and the depthwise bias
+    pass-through are easy to get subtly wrong -- off-by-one in the tap offset
+    still produces plausible-looking output -- so pin the identity directly.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _ensure_dist_initialized()
+
+    def _check(self, cca, T: int):
+        taps = cca.total_padding + 1
+        torch.manual_seed(7)
+        window = torch.randn(T, cca.in_out_ch, taps, dtype=torch.float32) * 0.3
+        with torch.no_grad():
+            # Reference: the real two-stage conv, which yields exactly one step.
+            ref = cca.conv_qk(window)
+            self.assertEqual(ref.shape, (T, cca.in_out_ch, 1))
+            ref = ref.squeeze(-1)
+
+            cca.fold_decode_conv()
+            grouped = window.reshape(T, cca.decode_conv_groups, -1)
+            got = (
+                torch.einsum("tgk,gok->tgo", grouped, cca.decode_conv_weight)
+                + cca.decode_conv_bias
+            ).reshape(T, -1)
+        torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-4)
+
+    def test_fold_matches_two_stage_conv(self):
+        cca, _ = _make_tiny_cca(seed=3)
+        for T in (1, 4):
+            self._check(cca, T)
+
+    def test_fold_matches_under_tensor_parallel_slicing(self):
+        # conv_qk is TP-sliced per rank, so the fold must be built from the live
+        # per-rank weights -- a rank that folded the full-width weight would
+        # silently mix in another rank's heads.
+        for rank in (0, 1):
+            cca, _ = _make_tiny_cca(seed=4, tp_rank=rank, tp_size=2)
+            self._check(cca, T=2)
+
+    def test_unfolded_cca_does_not_use_the_zero_buffers(self):
+        # Regression guard. The folded buffers are zero-initialized and only
+        # valid after fold_decode_conv() runs against loaded weights. A forward
+        # that consumed them unconditionally emitted bias-only garbage with no
+        # error -- silent wrongness for any path that populates weights without
+        # going through ZayaForCausalLM.load_weights.
+        cca, _ = _make_tiny_cca(seed=6)
+        self.assertFalse(cca._decode_conv_folded)
+        cca.fold_decode_conv()
+        self.assertTrue(cca._decode_conv_folded)
+
+    def test_fold_is_refreshed_not_stale(self):
+        # The buffers are non-persistent and derived, so a weight change must be
+        # picked up by re-folding; a cached-once implementation would go stale on
+        # weight reload (the RL / update_weights path).
+        cca, _ = _make_tiny_cca(seed=5)
+        cca.fold_decode_conv()
+        before = cca.decode_conv_weight.clone()
+        with torch.no_grad():
+            cca.conv_qk[0].weight.mul_(2.0)
+        cca.fold_decode_conv()
+        self.assertFalse(torch.allclose(before, cca.decode_conv_weight))
+        self._check(cca, T=1)
+
+
 class TestShortConvPaddingSlotClamp(CustomTestCase):
     """``ShortConvAttnBackend`` must clamp the -1 batch-padding sentinel.
 
