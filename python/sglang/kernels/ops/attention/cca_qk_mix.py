@@ -153,19 +153,21 @@ def cca_qk_mix(
     head_dim: int,
     q_scale: float,
     eps: float = _RMS_EPS,
+    out_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return ``(q, k)`` as fp32 ``[T, heads, head_dim]``. Caller must have
-    checked :func:`covered`."""
+    """Return ``(q, k)`` as ``[T, heads, head_dim]`` in ``out_dtype``.
+
+    Accumulation is always fp32 inside the kernel; ``out_dtype`` only picks the
+    store precision. Writing the model dtype directly saves the caller a cast --
+    and the cast is all it was, since the fp32 result was rounded to the model
+    dtype immediately afterwards. Caller must have checked :func:`covered`.
+    """
     num_tokens = conv_qk.shape[0]
     q_out = torch.empty(
-        (num_tokens, num_q_heads, head_dim),
-        dtype=torch.float32,
-        device=conv_qk.device,
+        (num_tokens, num_q_heads, head_dim), dtype=out_dtype, device=conv_qk.device
     )
     k_out = torch.empty(
-        (num_tokens, num_k_heads, head_dim),
-        dtype=torch.float32,
-        device=conv_qk.device,
+        (num_tokens, num_k_heads, head_dim), dtype=out_dtype, device=conv_qk.device
     )
     if num_tokens == 0:
         return q_out, k_out

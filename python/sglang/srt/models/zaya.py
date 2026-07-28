@@ -847,6 +847,7 @@ class CCA(nn.Module):
         key_conv: torch.Tensor,
         query_pre: torch.Tensor,
         key_base: torch.Tensor,
+        out_dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Blend post-conv q/k with the grouped pre-conv means, then RMS-normalize.
 
@@ -875,12 +876,14 @@ class CCA(nn.Module):
                 num_k_heads=self.num_k_heads,
                 head_dim=self.head_dim,
                 q_scale=float(self.sqrt_head_dim),
+                out_dtype=out_dtype,
             )
 
         query, key = self._add_grouped_qk_means(
             query_conv, key_conv, query_pre, key_base
         )
-        return self._normalize_qk(query, key)
+        query, key = self._normalize_qk(query, key)
+        return query.to(out_dtype), key.to(out_dtype)
 
     @torch.no_grad()
     def fold_decode_conv(self) -> None:
@@ -988,6 +991,7 @@ class CCA(nn.Module):
             query_conv, key_conv, query_pre, key_base
         )
         query, key = self._normalize_qk(query, key)
+        query, key = query.to(hs.dtype), key.to(hs.dtype)
 
         # val_proj1 / val_proj2 are replicated; compute the full V tensor and
         # then take this rank's K-head slice.
@@ -1020,10 +1024,10 @@ class CCA(nn.Module):
         shifted / previous hidden state), updating the ``conv_state`` /
         ``prev_hs`` pool slots in place.
 
-        ``q`` / ``k`` are returned in fp32 (the normalize step keeps fp32 for
-        stability); ``v`` is returned in the input dtype since the caller
-        casts everything back to ``hidden_states.dtype`` before rotary +
-        attention anyway.
+        ``q`` / ``k`` / ``v`` are all returned in ``hidden_states``' dtype. The
+        blend and normalize still accumulate in fp32 internally, but the result is
+        stored at model precision: the caller rounded it there immediately anyway,
+        so materializing an fp32 copy first only cost a per-layer ``copy_``.
 
         Shapes::
 
@@ -1034,8 +1038,8 @@ class CCA(nn.Module):
         if hidden_states.shape[0] == 0:
             zero = hidden_states.new_zeros((0,))
             return (
-                zero.view(0, self.num_q_heads, self.head_dim).to(torch.float32),
-                zero.view(0, self.num_k_heads, self.head_dim).to(torch.float32),
+                zero.view(0, self.num_q_heads, self.head_dim),
+                zero.view(0, self.num_k_heads, self.head_dim),
                 zero.view(0, self.num_k_heads, self.head_dim),
             )
 
@@ -1091,8 +1095,18 @@ class CCA(nn.Module):
             T, self.num_k_heads, self.head_dim
         )
 
+        # Emit the model dtype straight away: the caller rounded the fp32 result
+        # to it immediately, so this is the same single rounding minus two
+        # per-layer copies (aten::copy_ was the largest single op in the profile).
         query, key = self._mix_and_normalize_qk(
-            qk_out, q_raw, k_raw, query_conv, key_conv, query_pre, key_base
+            qk_out,
+            q_raw,
+            k_raw,
+            query_conv,
+            key_conv,
+            query_pre,
+            key_base,
+            out_dtype=hidden_states.dtype,
         )
 
         v1, _ = self.val_proj1(hidden_states)
@@ -1412,7 +1426,14 @@ class ZayaRouter(nn.Module):
             expert_prob = torch.softmax(logits, dim=-1)
 
         biased = expert_prob.detach().to(torch.float32) + self.balancing_biases
-        _, expert_choice = torch.topk(biased, self.topk, dim=-1)
+        if self.topk == 1:
+            # ZAYA1 ships moe_router_topk=1. argmax is the same selection without
+            # the sort/heap machinery a general top-k pays for, and it keeps the
+            # trailing dim that ``torch.gather`` below expects. Measured 1.9% of
+            # decode GPU time in aten::topk before this.
+            expert_choice = biased.argmax(dim=-1, keepdim=True)
+        else:
+            _, expert_choice = torch.topk(biased, self.topk, dim=-1)
 
         if self.topk > 1 and self.use_mod:
             skip_idx = self.num_experts - 1
