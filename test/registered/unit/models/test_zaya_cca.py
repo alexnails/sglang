@@ -571,6 +571,70 @@ class TestZayaCCA(CustomTestCase):
             self.assertNotIn(id(fb_decode), backend._step_slot_ids)
 
 
+class TestShortConvPaddingSlotClamp(CustomTestCase):
+    """``ShortConvAttnBackend`` must clamp the -1 batch-padding sentinel.
+
+    Regression guard. Batch padding poisons unused rows' mamba slot ids to -1
+    (``MambaAttnBackendBase._forward_metadata``); DP attention hits this on every
+    step where a replica's batch is padded. CCA feeds the shared index view
+    straight into ``index_select`` / ``index_copy_``, and a negative index there
+    is an out-of-bounds device gather -- on ROCm it aborts the queue with
+    HSA_STATUS_ERROR_EXCEPTION 0x1016 instead of raising, which crashed ZAYA1 at
+    attn_tp > 1 under DP attention. Clamping to 0 is safe because
+    ``MambaSlotAllocator`` reserves slot 0 (it hands out 1..size), so padded rows
+    land on a scratch slot they cannot corrupt.
+    """
+
+    @staticmethod
+    def _bare_backend(buf: Optional[torch.Tensor], idx: Optional[torch.Tensor]):
+        # _refresh_cache_indices touches only these three attributes, so a bare
+        # instance exercises the clamping contract without a live ModelRunner.
+        from sglang.srt.layers.attention.linear.short_conv_backend import (
+            ShortConvAttnBackend,
+        )
+
+        backend = object.__new__(ShortConvAttnBackend)
+        backend._cache_indices_buf = buf
+        backend._cache_indices = None
+        backend.forward_metadata = (
+            None if idx is None else SimpleNamespace(mamba_cache_indices=idx)
+        )
+        return backend
+
+    def test_graph_buffer_path_clamps_padding(self):
+        # Buffered path (cuda/cpu graph): the persistent buffer is refilled in
+        # place, so the clamp must land in the buffer the captured graph reads.
+        buf = torch.empty(8, dtype=torch.int64)
+        idx = torch.tensor([3, 5, -1, -1], dtype=torch.int64)
+        backend = self._bare_backend(buf, idx)
+        backend._refresh_cache_indices()
+
+        out = backend._cache_indices
+        self.assertEqual(out.tolist(), [3, 5, 0, 0])
+        self.assertGreaterEqual(int(out.min()), 0)
+        # Must be a view of the persistent buffer, not a fresh allocation.
+        self.assertIs(out.untyped_storage(), buf.untyped_storage())
+
+    def test_fallback_path_clamps_without_mutating_source(self):
+        # No buffer (eager, or bs beyond the buffer): the clamp must be
+        # out-of-place. ``to(torch.long)`` aliases an already-int64 tensor, so an
+        # in-place clamp would corrupt the backend's own mamba_cache_indices --
+        # destroying the -1 sentinel other consumers rely on to skip padded rows.
+        idx = torch.tensor([2, -1], dtype=torch.int64)
+        backend = self._bare_backend(None, idx)
+        backend._refresh_cache_indices()
+
+        self.assertEqual(backend._cache_indices.tolist(), [2, 0])
+        self.assertEqual(idx.tolist(), [2, -1])
+
+    def test_no_metadata_yields_no_indices(self):
+        # Before the first step forward_metadata is None; the view must stay None
+        # rather than clamping a nonexistent tensor.
+        backend = self._bare_backend(torch.empty(4, dtype=torch.int64), None)
+        backend._refresh_cache_indices()
+        self.assertIsNone(backend._cache_indices)
+
+
 def _make_swa_config(
     *,
     num_hidden_layers: int,
