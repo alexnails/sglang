@@ -954,6 +954,18 @@ class ZayaAttention(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
+        # Idle forward: under DP attention a replica with no requests this step
+        # still runs a forward (to join the MoE layers' gather/scatter) with T=0.
+        # Every op below is a no-op on an empty batch, but the ROCm rotary kernel
+        # derives its launch grid from the token count and raises SIGFPE on zero,
+        # so return the correctly-shaped empty output before touching any kernel.
+        # This is safe for collectives: an idle replica is idle on *all* of its
+        # attention-TP ranks, so they skip the o_proj all-reduce together, and the
+        # cross-replica gather/scatter that idle replicas must participate in
+        # lives in ``ZayaDecoderMLPLayer`` and still runs.
+        if hidden_states.shape[0] == 0:
+            return hidden_states.new_zeros((0, self.hidden_size))
+
         # CCA returns fp32 q/k and input-dtype v as ``[T, heads, head_dim]``
         # tensors; flatten the head dim and cast all to the model dtype before
         # rotary + RadixAttention.
