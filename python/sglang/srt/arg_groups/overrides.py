@@ -781,6 +781,52 @@ def _lfm2_overrides(server_args: Any, hf_config: Any) -> dict:
     return {}
 
 
+@_register_for("ZayaForCausalLM")
+def _zaya_overrides(server_args: Any, hf_config: Any) -> dict:
+    """ZAYA1 (CCA attention + MoE) memory-pool and DP-attention defaults.
+
+    ``mamba_full_memory_ratio``: the global 0.9 default assumes the linear-attn
+    state dominates the cache, which holds for models with only a few
+    full-attention layers (Qwen3-Next et al). ZAYA1 is half full-attention, so
+    its KV is the dominant consumer and the ratio badly over-allocates: 0.9
+    spends ~47% of the post-weights budget on conv states. One CCA slot costs
+    ``num_attn_layers * ((q+kv)*head_dim*2 + hidden) * 2`` bytes -- 360 KB on
+    ZAYA1-base, 1.0 MB on 74B -- i.e. 9 (base) to 17 (74B) tokens of KV each,
+    and only a few thousand slots are ever reachable (``max_running_requests *
+    mamba ratio`` live, plus the radix tree's tracked states). Measured on
+    ZAYA1-base / MI350X: 0.9 allocated 214,758 slots = 73.7 GB of conv state for
+    a server capped at 8 concurrent requests; dropping the ratio leaves the slot
+    count comfortable and grows the KV cache ~1.8-1.9x. Yields to an explicit
+    --mamba-full-memory-ratio.
+
+    ``enable_dp_lm_head``: ZAYA1 checkpoints tie the LM head to the input
+    embedding. Under DP attention ``embed_tokens`` must shard its vocab over the
+    attention-TP sub-group (each replica embeds only its own tokens), so the tied
+    head inherits that shard group -- ``vocab/attn_tp`` rows. ``LogitsProcessor``
+    all-gathers logits over the attention-TP group iff ``enable_dp_lm_head``, and
+    over the *global* TP group otherwise, so leaving it off would gather a
+    ``vocab/attn_tp``-wide logit slice across ``tp_size`` ranks and produce
+    garbage. Turning it on is also the faster path (no cross-DP gather before a
+    262k-row head), so pin it whenever DP attention is active on a tied
+    checkpoint.
+    """
+    from sglang.srt.server_args import ServerArgs
+
+    overrides: Dict[str, Any] = {}
+
+    if server_args.mamba_full_memory_ratio == ServerArgs.mamba_full_memory_ratio:
+        overrides["mamba_full_memory_ratio"] = 0.05
+
+    if (
+        server_args.enable_dp_attention
+        and server_args.dp_size > 1
+        and hf_config.tie_word_embeddings
+    ):
+        overrides["enable_dp_lm_head"] = True
+
+    return overrides
+
+
 @_register_for("DeepseekV4ForCausalLM")
 def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
     """DeepSeek V4 attention/page/window/MoE-runner defaults (from

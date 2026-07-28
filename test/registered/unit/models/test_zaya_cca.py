@@ -571,6 +571,168 @@ class TestZayaCCA(CustomTestCase):
             self.assertNotIn(id(fb_decode), backend._step_slot_ids)
 
 
+def _make_swa_config(
+    *,
+    num_hidden_layers: int,
+    swa_layers,
+    swa_rotary_base=10000,
+    rope_theta: float = 10_000_000.0,
+):
+    """ZAYA1-74B-style config: a per-layer ``swa_layers`` window list (aligned
+    with the global layer index, 0 == full attention) plus a dedicated RoPE
+    base for the sliding-window layers."""
+    from sglang.srt.configs.zaya import ZayaConfig
+
+    return ZayaConfig(
+        hidden_size=16,
+        ffn_hidden_size=32,
+        num_hidden_layers=num_hidden_layers,
+        num_experts=2,
+        num_attention_heads=4,
+        num_query_groups=2,
+        num_key_value_heads=2,
+        head_dim=8,
+        cca_time0=2,
+        cca_time1=2,
+        max_position_embeddings=64,
+        moe_router_topk=1,
+        zaya_mlp_expansion=8,
+        attention_bias=False,
+        rope_theta=rope_theta,
+        swa_layers=swa_layers,
+        swa_rotary_base=swa_rotary_base,
+    )
+
+
+class TestZayaSlidingWindowAttention(CustomTestCase):
+    """ZAYA1-74B interleaves sliding-window attention with full attention and
+    gives the sliding layers their own RoPE base (``swa_rotary_base``). These
+    tests verify that ``ZayaConfig`` resolves the per-layer window from
+    ``swa_layers`` and that ``ZayaAttention`` wires the matching
+    ``RadixAttention.sliding_window_size`` and rotary base into each layer.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _ensure_dist_initialized()
+        # Building a RoPE cache reads ``get_global_server_args().rl_on_policy_target``,
+        # which is unset in this CPU unit-test process. Install a minimal
+        # ServerArgs for the duration of the test class and restore afterward.
+        from sglang.srt.server_args import (
+            ServerArgs,
+            get_global_server_args,
+            set_global_server_args_for_scheduler,
+        )
+
+        try:
+            cls._prev_server_args = get_global_server_args()
+        except ValueError:
+            cls._prev_server_args = None
+        if cls._prev_server_args is None:
+            cls._installed_server_args = True
+            set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+        else:
+            cls._installed_server_args = False
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        if getattr(cls, "_installed_server_args", False):
+            from sglang.srt.server_args import set_global_server_args_for_scheduler
+
+            set_global_server_args_for_scheduler(cls._prev_server_args)
+
+    def _build_attention(self, config, layer_id: int):
+        from sglang.srt.models.zaya import ZayaAttention
+
+        return ZayaAttention(config=config, layer_id=layer_id)
+
+    def test_config_reports_per_layer_window(self):
+        # 8 layers: attention layers live at the even ids 0/2/4/6 (zaya_layers
+        # is None), and ``swa_layers`` marks 0 and 4 as sliding (window 4096).
+        config = _make_swa_config(
+            num_hidden_layers=8,
+            swa_layers=[4096, 0, 0, 0, 4096, 0, 0, 0],
+        )
+        self.assertEqual(config.sliding_window_for_layer(0), 4096)
+        self.assertEqual(config.sliding_window_for_layer(4), 4096)
+        self.assertEqual(config.sliding_window_for_layer(2), 0)
+        self.assertEqual(config.sliding_window_for_layer(6), 0)
+        self.assertEqual(config.swa_window_size, 4096)
+        # window - 1: the exclusive convention shared with the attention
+        # backends (matches the Gemma reference models).
+        self.assertEqual(config.get_attention_sliding_window_size(), 4095)
+
+    def test_non_uniform_window_is_rejected(self):
+        # The runtime tracks a single global window, so mixed window sizes
+        # across SWA layers are unsupported and must fail loudly.
+        config = _make_swa_config(
+            num_hidden_layers=8,
+            swa_layers=[4096, 0, 0, 0, 2048, 0, 0, 0],
+        )
+        with self.assertRaises(AssertionError):
+            _ = config.swa_window_size
+
+    def test_attention_selects_window_and_rope_base_per_layer(self):
+        config = _make_swa_config(
+            num_hidden_layers=8,
+            swa_layers=[4096, 0, 0, 0, 4096, 0, 0, 0],
+            swa_rotary_base=10000,
+            rope_theta=10_000_000.0,
+        )
+        sliding = self._build_attention(config, layer_id=0)
+        full = self._build_attention(config, layer_id=2)
+
+        # Sliding layer: window-1 handed to RadixAttention, SWA rope base.
+        self.assertTrue(sliding.is_sliding)
+        self.assertEqual(sliding.attn.sliding_window_size, 4095)
+        self.assertEqual(sliding.rotary_emb.base, 10000)
+
+        # Full layer: no window (-1) and the global rope base.
+        self.assertFalse(full.is_sliding)
+        self.assertEqual(full.attn.sliding_window_size, -1)
+        self.assertEqual(full.rotary_emb.base, 10_000_000)
+
+        # Distinct rope bases must not collapse onto a shared rotary cache entry.
+        self.assertIsNot(sliding.rotary_emb, full.rotary_emb)
+
+    def test_base_checkpoint_has_no_sliding_window(self):
+        # No ``swa_layers`` -> every attention layer is full attention and the
+        # model reports no global window, preserving base-model behavior.
+        config = _make_swa_config(num_hidden_layers=4, swa_layers=None)
+        self.assertEqual(config.sliding_window_for_layer(0), 0)
+        self.assertIsNone(config.swa_window_size)
+        self.assertIsNone(config.get_attention_sliding_window_size())
+
+        attn = self._build_attention(config, layer_id=0)
+        self.assertFalse(attn.is_sliding)
+        self.assertEqual(attn.attn.sliding_window_size, -1)
+        self.assertEqual(attn.rotary_emb.base, int(config.rope_theta))
+
+    def test_hybrid_layer_pattern_marks_only_sliding_attention_layers(self):
+        # ``ModelConfig.get_hybrid_layer_ids`` consumes ``hybrid_layer_pattern``
+        # (1 = SWA, 0 = full) to split the KV pool. The pattern must be indexed
+        # by *global* layer id and cover every layer, so that the derived
+        # swa/full id lists stay disjoint and never claim a MoE layer -- which
+        # holds no KV cache -- as a full-attention layer's sibling.
+        config = _make_swa_config(
+            num_hidden_layers=8,
+            swa_layers=[4096, 0, 0, 0, 4096, 0, 0, 0],
+        )
+        self.assertEqual(config.hybrid_layer_pattern, [1, 0, 0, 0, 1, 0, 0, 0])
+        self.assertEqual(config.swa_attention_layer_ids, [0, 4])
+        # Attention layers are the even ids; the sliding ones are exactly those
+        # flagged in swa_layers, and the rest stay full attention.
+        self.assertEqual(config.full_attention_layer_ids, [0, 2, 4, 6])
+
+    def test_base_checkpoint_reports_no_hybrid_pattern(self):
+        # Without swa_layers the model must not opt in to the hybrid-SWA KV
+        # pool: a non-None pattern here would make get_hybrid_layer_ids split a
+        # uniformly full-attention model into empty/complete halves.
+        config = _make_swa_config(num_hidden_layers=4, swa_layers=None)
+        self.assertIsNone(config.hybrid_layer_pattern)
+        self.assertEqual(config.swa_attention_layer_ids, [])
+
+
 class TestZayaCCATensorParallel(CustomTestCase):
     """Head-parallel TP equivalence:
 

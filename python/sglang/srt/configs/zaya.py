@@ -242,6 +242,77 @@ class ZayaConfig(PretrainedConfig):
     def mamba_chunk_size(self) -> int:
         return 1
 
+    # -- Sliding-window attention (ZAYA1-74B) -------------------------------
+
+    def sliding_window_for_layer(self, layer_id: int) -> int:
+        """Sliding-window size for ``layer_id`` (0 == full attention).
+
+        ZAYA1-74B-style checkpoints carry a per-layer ``swa_layers`` list that
+        is aligned with the global layer index: each entry is the window size
+        (e.g. 4096) for a sliding-window attention layer and 0 for a
+        full-attention layer (non-attention/MoE layers are 0 as well). Base
+        checkpoints omit ``swa_layers`` entirely, so every attention layer is
+        treated as full attention here.
+        """
+        if not self.swa_layers:
+            return 0
+        return int(self.swa_layers[layer_id])
+
+    @property
+    def swa_window_size(self) -> Optional[int]:
+        """The single sliding-window size shared by every SWA layer, or None.
+
+        The runtime tracks one global sliding-window size for the attention
+        backend, so all SWA layers must share the same window. ZAYA1-74B uses
+        4096 on every sliding layer; checkpoints without ``swa_layers`` (or
+        with all-zero entries) report None.
+        """
+        if not self.swa_layers:
+            return None
+        windows = {int(w) for w in self.swa_layers if int(w) > 0}
+        if not windows:
+            return None
+        assert len(windows) == 1, (
+            "ZAYA1 expects a single sliding-window size across all SWA layers, "
+            f"got {sorted(windows)}"
+        )
+        return next(iter(windows))
+
+    def get_attention_sliding_window_size(self) -> Optional[int]:
+        """Global window size handed to the attention backend, or None.
+
+        Returns ``window - 1`` so the backend applies an inclusive ``[i-w+1, i]``
+        window -- the exclusive convention shared across SGLang's attention
+        backends and the Gemma reference models. ``ZayaForCausalLM`` exposes the
+        same value so :class:`ModelRunner` can size the SWA metadata buffers.
+        """
+        window = self.swa_window_size
+        return (window - 1) if window is not None else None
+
+    @property
+    def swa_attention_layer_ids(self) -> List[int]:
+        """Attention layers that use the sliding window (empty when no SWA)."""
+        if self.swa_window_size is None:
+            return []
+        return [i for i in self.full_attention_layer_ids if self.swa_layers[i]]
+
+    @property
+    def hybrid_layer_pattern(self) -> Optional[List[int]]:
+        """Per-layer SWA mask (1 = sliding, 0 = full) for the hybrid-SWA KV pool.
+
+        ``ModelConfig.get_hybrid_layer_ids`` consumes this generic opt-in (paired
+        with ``is_hybrid_swa``) so ZAYA1 does not need an entry in the hybrid-SWA
+        architecture allowlist. Non-attention (MoE) layers report 0; they hold no
+        KV cache at all, and the full/SWA split only ever indexes attention
+        layers.
+        """
+        if self.swa_window_size is None:
+            return None
+        return [
+            1 if self.sliding_window_for_layer(i) else 0
+            for i in range(self.num_hidden_layers)
+        ]
+
     @property
     def mamba2_cache_params(self) -> Optional[Mamba2CacheParams]:
         from sglang.srt.configs.mamba_utils import (
@@ -259,15 +330,14 @@ class ZayaConfig(PretrainedConfig):
         # and feeds the replicated val_proj1 / val_proj2, so it stays at full
         # ``hidden_size`` on every rank.
         #
-        # Use the *global* TP world size -- the same accessor that
+        # Use the *attention* TP world size -- the same accessor that
         # ``ZayaAttention`` / ``CCA`` use to split heads and over which
-        # ``o_proj`` all-reduces -- so the cache shape and the per-rank
-        # ``in_out_ch`` stay in lockstep. ZAYA1 asserts the attention-TP group
-        # equals the global TP group (DP attention is unsupported), so the two
-        # are always identical in practice.
+        # ``o_proj`` all-reduces. This equals the global TP group with plain
+        # tensor parallelism, and the smaller per-DP-replica sub-group when DP
+        # attention is enabled, so the cache shape and the per-rank
+        # ``in_out_ch`` stay in lockstep in either mode.
         try:
-
-            tp_size = get_parallel().tp_size
+            tp_size = get_parallel().attn_tp_size
         except (AssertionError, RuntimeError):
             tp_size = 1
 
@@ -275,9 +345,10 @@ class ZayaConfig(PretrainedConfig):
             self.num_attention_heads + self.num_key_value_heads
         ) * self.head_dim
         assert in_out_ch_full % tp_size == 0, (
-            f"CCA channels ({in_out_ch_full}) must be divisible by TP size "
-            f"({tp_size}); both num_attention_heads and num_query_groups must "
-            "be divisible by tp_size for ZAYA1 head-parallel attention."
+            f"CCA channels ({in_out_ch_full}) must be divisible by attention "
+            f"TP size ({tp_size}); both num_attention_heads and num_query_groups "
+            "must be divisible by attention tp_size for ZAYA1 head-parallel "
+            "attention."
         )
         in_out_ch_per_rank = in_out_ch_full // tp_size
         total_padding = (self.cca_time0 - 1) + (self.cca_time1 - 1)
