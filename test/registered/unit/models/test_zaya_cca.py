@@ -571,6 +571,121 @@ class TestZayaCCA(CustomTestCase):
             self.assertNotIn(id(fb_decode), backend._step_slot_ids)
 
 
+class TestCCAQKMixKernel(CustomTestCase):
+    """The fused q/k head-mix kernel must match the torch chain it replaces.
+
+    Derived property. ``cca_qk_mix`` collapses ``_add_grouped_qk_means`` +
+    ``_normalize_qk`` into one kernel, re-deriving the GQA group indexing
+    (q head == g * gqa_groups + j), the 0.5 blend weights, the per-k-head
+    temperature and the two RMS normalizations from scratch. Any of those can be
+    subtly wrong -- a transposed group index or a temperature applied to q
+    instead of k still produces plausible tensors -- so pin the equivalence.
+
+    Requires a GPU (Triton); the CPU suite exercises the torch fallback instead,
+    which ``covered()`` selects when the folded scale vector is absent.
+    """
+
+    def _run(self, num_q_heads: int, num_k_heads: int, num_tokens: int):
+        import torch as _torch
+
+        from sglang.kernels.ops.attention import cca_qk_mix as kernel
+
+        head_dim = 32
+        dev = "cuda"
+        _torch.manual_seed(11)
+        cca = _make_tiny_cca(seed=2)[0]
+        # Drive the reference through the real module helpers so the test tracks
+        # them rather than a re-derivation of the same formula.
+        cca.num_q_heads = num_q_heads
+        cca.num_k_heads = num_k_heads
+        cca.gqa_groups = num_q_heads // num_k_heads
+        cca.head_dim = head_dim
+        cca.sqrt_head_dim = head_dim**0.5
+        cca.clamp_temp = False
+        cca.temp = torch.nn.Parameter(_torch.rand(num_k_heads) + 0.5)
+
+        conv_qk = (
+            _torch.randn(
+                num_tokens,
+                (num_q_heads + num_k_heads) * head_dim,
+                dtype=_torch.bfloat16,
+            )
+            * 0.3
+        )
+        pre_q = (
+            _torch.randn(num_tokens, num_q_heads * head_dim, dtype=_torch.bfloat16)
+            * 0.3
+        )
+        base_k = (
+            _torch.randn(num_tokens, num_k_heads * head_dim, dtype=_torch.bfloat16)
+            * 0.3
+        )
+
+        with _torch.no_grad():
+            q_ref, k_ref = cca._add_grouped_qk_means(
+                conv_qk[:, : num_q_heads * head_dim].view(
+                    num_tokens, num_q_heads, head_dim
+                ),
+                conv_qk[:, num_q_heads * head_dim :].view(
+                    num_tokens, num_k_heads, head_dim
+                ),
+                pre_q.view(num_tokens, num_q_heads, head_dim),
+                base_k.view(num_tokens, num_k_heads, head_dim),
+            )
+            q_ref, k_ref = cca._normalize_qk(q_ref, k_ref)
+
+            k_scale = (cca.temp.detach().float() * cca.sqrt_head_dim).to(dev)
+            args = (conv_qk.to(dev), pre_q.to(dev), base_k.to(dev), k_scale)
+            self.assertTrue(
+                kernel.covered(*args, num_q_heads, num_k_heads, head_dim),
+                "kernel should cover these shapes",
+            )
+            q_got, k_got = kernel.cca_qk_mix(
+                *args,
+                num_q_heads=num_q_heads,
+                num_k_heads=num_k_heads,
+                head_dim=head_dim,
+                q_scale=cca.sqrt_head_dim,
+            )
+
+        torch.testing.assert_close(
+            q_got.cpu(), q_ref, rtol=2e-3, atol=2e-3, check_dtype=False
+        )
+        torch.testing.assert_close(
+            k_got.cpu(), k_ref, rtol=2e-3, atol=2e-3, check_dtype=False
+        )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused kernel requires a GPU")
+    def test_matches_torch_chain_across_gqa_shapes(self):
+        _ensure_dist_initialized()
+        # 8:1 is ZAYA1-74B at attn_tp=2; 4:1 is 8B at tp=1; 1:1 exercises the
+        # degenerate group where the k blend reduces to a single q head.
+        for num_q_heads, num_k_heads in ((8, 1), (8, 2), (2, 2)):
+            for num_tokens in (1, 5):
+                with self.subTest(q=num_q_heads, k=num_k_heads, t=num_tokens):
+                    self._run(num_q_heads, num_k_heads, num_tokens)
+
+    def test_uncovered_inputs_fall_back(self):
+        # covered() is the only thing standing between an unsupported shape and a
+        # wrong-answer kernel launch, so its negative branches must hold. Most
+        # importantly a missing scale vector (weights not folded yet) must report
+        # False so the torch path runs.
+        from sglang.kernels.ops.attention import cca_qk_mix as kernel
+
+        conv_qk = torch.randn(4, 9 * 32)
+        pre_q = torch.randn(4, 8 * 32)
+        base_k = torch.randn(4, 1 * 32)
+        scale = torch.ones(1)
+        # No folded scales yet.
+        self.assertFalse(kernel.covered(conv_qk, pre_q, base_k, None, 8, 1, 32))
+        # CPU tensors are not served by the Triton path.
+        self.assertFalse(kernel.covered(conv_qk, pre_q, base_k, scale, 8, 1, 32))
+        # Head dim beyond one block.
+        self.assertFalse(kernel.covered(conv_qk, pre_q, base_k, scale, 8, 1, 4096))
+        # q heads not divisible by k heads.
+        self.assertFalse(kernel.covered(conv_qk, pre_q, base_k, scale, 8, 3, 32))
+
+
 class TestCCADecodeConvFold(CustomTestCase):
     """``CCA.fold_decode_conv`` must reproduce the two-stage conv exactly.
 

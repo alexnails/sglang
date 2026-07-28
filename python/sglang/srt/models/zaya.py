@@ -623,6 +623,16 @@ class CCA(nn.Module):
         # Per-K-head learnable temperature scalar (per-rank slice).
         self.temp = nn.Parameter(torch.zeros(self.num_k_heads))
 
+        # ``sqrt(head_dim) * temperature`` per k head, folded once after weight
+        # load for the fused q/k head-mix kernel (see fold_qk_scales). fp32 to
+        # match the accumulation precision of the torch path it replaces.
+        self.register_buffer(
+            "qk_k_scale",
+            torch.zeros(self.num_k_heads, dtype=torch.float32),
+            persistent=False,
+        )
+        self._qk_scales_folded = False
+
         # Attach TP-aware weight loaders to conv_qk weights/biases and ``temp``
         # so the existing ``load_weights`` dispatch (``getattr(param,
         # "weight_loader", default_weight_loader)``) automatically slices the
@@ -742,6 +752,65 @@ class CCA(nn.Module):
             key_conv.to(torch.float32) + 0.5 * query_pre_mean + 0.5 * key_base_fp32
         )
         return query_out, key_out
+
+    @torch.no_grad()
+    def fold_qk_scales(self) -> None:
+        """Fold ``sqrt(head_dim) * temperature`` into one fp32 vector.
+
+        ``_normalize_qk`` applies both factors to k (and the ``clamp_temp``
+        exponential) on every forward; they depend only on loaded weights, so the
+        fused kernel takes the product precomputed. Refreshed by
+        ``ZayaForCausalLM.fold_decode_constants`` after every weight load.
+        """
+        temp = self.temp.detach().to(torch.float32)
+        if self.clamp_temp:
+            temp = torch.exp(torch.clamp(temp, 1e-12, 2.0))
+        self.qk_k_scale.copy_(temp * float(self.sqrt_head_dim))
+        self._qk_scales_folded = True
+
+    def _mix_and_normalize_qk(
+        self,
+        qk_out: torch.Tensor,
+        query_pre_flat: torch.Tensor,
+        key_base_flat: torch.Tensor,
+        query_conv: torch.Tensor,
+        key_conv: torch.Tensor,
+        query_pre: torch.Tensor,
+        key_base: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Blend post-conv q/k with the grouped pre-conv means, then RMS-normalize.
+
+        Prefers the fused Triton kernel and falls back to the two torch helpers
+        when it cannot serve the shapes (see ``cca_qk_mix.covered``) -- notably
+        before ``fold_qk_scales`` has run, so CPU unit tests keep the torch path.
+        """
+        from sglang.kernels.ops.attention import cca_qk_mix as _cca_qk_mix
+
+        scale = self.qk_k_scale if self._qk_scales_folded else None
+        if _cca_qk_mix.covered(
+            qk_out,
+            query_pre_flat,
+            key_base_flat,
+            scale,
+            num_q_heads=self.num_q_heads,
+            num_k_heads=self.num_k_heads,
+            head_dim=self.head_dim,
+        ):
+            return _cca_qk_mix.cca_qk_mix(
+                qk_out,
+                query_pre_flat,
+                key_base_flat,
+                scale,
+                num_q_heads=self.num_q_heads,
+                num_k_heads=self.num_k_heads,
+                head_dim=self.head_dim,
+                q_scale=float(self.sqrt_head_dim),
+            )
+
+        query, key = self._add_grouped_qk_means(
+            query_conv, key_conv, query_pre, key_base
+        )
+        return self._normalize_qk(query, key)
 
     @torch.no_grad()
     def fold_decode_conv(self) -> None:
@@ -948,10 +1017,9 @@ class CCA(nn.Module):
             T, self.num_k_heads, self.head_dim
         )
 
-        query, key = self._add_grouped_qk_means(
-            query_conv, key_conv, query_pre, key_base
+        query, key = self._mix_and_normalize_qk(
+            qk_out, q_raw, k_raw, query_conv, key_conv, query_pre, key_base
         )
-        query, key = self._normalize_qk(query, key)
 
         v1, _ = self.val_proj1(hidden_states)
         v2, _ = self.val_proj2(v2_input)
@@ -1945,6 +2013,7 @@ class ZayaForCausalLM(nn.Module):
                 module.fold_scales()
             elif isinstance(module, CCA):
                 module.fold_decode_conv()
+                module.fold_qk_scales()
 
 
 EntryClass = ZayaForCausalLM
