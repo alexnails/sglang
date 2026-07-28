@@ -68,7 +68,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
-    ColumnParallelLinear,
+    MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
 )
@@ -545,42 +545,38 @@ class CCA(nn.Module):
         # (1.6-2.25x slower than ReplicatedLinear in bench_one_batch), so the
         # single-GPU case uses ReplicatedLinear. ``tp_size > 1`` keeps
         # ColumnParallelLinear for the per-rank head shard.
+        # q and k read the same ``hidden_states`` and their outputs are
+        # immediately concatenated, so they are one projection: a single wider
+        # GEMM replaces two skinny ones and the ``cat`` disappears. Decode is
+        # launch-bound on exactly these -- a profile of ZAYA1-base put the skinny
+        # GEMV kernel at 280 launches per step (7 per attention layer) and the
+        # concatenates at 80 -- and the k half is tiny (num_query_groups *
+        # head_dim), so on its own it is nearly all overhead.
         if self.tp_size > 1:
-            self.linear_q = ColumnParallelLinear(
+            self.linear_qk = MergedColumnParallelLinear(
                 self.hidden_size,
-                self.latent_q_dim_full,
+                [self.latent_q_dim_full, self.latent_k_dim_full],
                 bias=bias,
                 gather_output=False,
                 quant_config=quant_config,
-                prefix=add_prefix("linear_q", prefix),
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
-            )
-            self.linear_k = ColumnParallelLinear(
-                self.hidden_size,
-                self.latent_k_dim_full,
-                bias=bias,
-                gather_output=False,
-                quant_config=quant_config,
-                prefix=add_prefix("linear_k", prefix),
+                prefix=add_prefix("linear_qk", prefix),
                 tp_rank=self.tp_rank,
                 tp_size=self.tp_size,
             )
         else:
-            self.linear_q = ReplicatedLinear(
+            # ColumnParallelLinear measured 1.6-2.25x slower than
+            # ReplicatedLinear at tp=1 (bench_one_batch), so the single-GPU case
+            # keeps a plain replicated projection; ``_merged_qk_row_loader``
+            # gives it the same shard-id loading contract as the merged
+            # column-parallel one.
+            self.linear_qk = ReplicatedLinear(
                 self.hidden_size,
-                self.latent_q_dim_full,
+                self.latent_q_dim_full + self.latent_k_dim_full,
                 bias=bias,
                 quant_config=quant_config,
-                prefix=add_prefix("linear_q", prefix),
+                prefix=add_prefix("linear_qk", prefix),
             )
-            self.linear_k = ReplicatedLinear(
-                self.hidden_size,
-                self.latent_k_dim_full,
-                bias=bias,
-                quant_config=quant_config,
-                prefix=add_prefix("linear_k", prefix),
-            )
+            self._install_merged_qk_loader(bias=bias)
         # The HF V-projection layout maps val_proj1 to the FIRST half of K
         # heads and val_proj2 to the SECOND half (after ``cat([v1, v2]).view(
         # T, num_k_heads_full, head_dim)``). That doesn't align with a simple
@@ -732,6 +728,38 @@ class CCA(nn.Module):
         set_weight_attrs(self.conv_qk[1].weight, {"weight_loader": conv_row_loader})
         set_weight_attrs(self.conv_qk[1].bias, {"weight_loader": conv_row_loader})
         set_weight_attrs(self.temp, {"weight_loader": temp_loader})
+
+    def _install_merged_qk_loader(self, *, bias: bool) -> None:
+        """Give the tp=1 replicated q/k projection a shard-id weight loader.
+
+        ``MergedColumnParallelLinear`` already accepts ``(param, weight,
+        loaded_shard_id)``; ``ReplicatedLinear`` does not, so attach an
+        equivalent that writes shard 0 (q) then shard 1 (k) into the merged rows.
+        Keeps ``load_weights`` free of a tp==1 special case.
+        """
+        q_rows = self.latent_q_dim_full
+
+        def merged_row_loader(
+            param: torch.Tensor,
+            loaded_weight: torch.Tensor,
+            loaded_shard_id: int = 0,
+        ) -> None:
+            start = 0 if loaded_shard_id == 0 else q_rows
+            end = q_rows if loaded_shard_id == 0 else param.data.shape[0]
+            assert loaded_weight.shape[0] == end - start, (
+                f"merged qk shard {loaded_shard_id} expects "
+                f"{end - start} rows, got {loaded_weight.shape[0]}"
+            )
+            param.data[start:end].copy_(loaded_weight)
+
+        # Assigned directly rather than through ``set_weight_attrs``:
+        # ReplicatedLinear already installs its own single-shard weight_loader,
+        # and set_weight_attrs asserts against overwriting an existing attribute.
+        # Replacing it is the point here -- the merged parameter needs the
+        # shard-aware loader.
+        self.linear_qk.weight.weight_loader = merged_row_loader
+        if bias:
+            self.linear_qk.bias.weight_loader = merged_row_loader
 
     # ----- helpers ---------------------------------------------------------
 
@@ -935,12 +963,14 @@ class CCA(nn.Module):
         S = hs.shape[0]
         hs_3d = hs.unsqueeze(1)  # [S, 1, H]
 
-        q_raw, _ = self.linear_q(hs_3d)  # [S, 1, latent_q_dim_per_rank]
-        k_raw, _ = self.linear_k(hs_3d)  # [S, 1, latent_k_dim_per_rank]
-        qk = torch.cat([q_raw, k_raw], dim=-1)  # [S, 1, in_out_ch_per_rank]
+        qk, _ = self.linear_qk(hs_3d)  # [S, 1, in_out_ch_per_rank]
 
-        query_pre = q_raw.view(S, self.num_q_heads, self.head_dim)
-        key_base = k_raw.view(S, self.num_k_heads, self.head_dim)
+        query_pre = qk[..., : self.latent_q_dim].reshape(
+            S, self.num_q_heads, self.head_dim
+        )
+        key_base = qk[..., self.latent_q_dim :].reshape(
+            S, self.num_k_heads, self.head_dim
+        )
 
         # [1, C, S+pad] -> [1, C, S]
         qk_perm = qk.permute(1, 2, 0)
@@ -1010,9 +1040,11 @@ class CCA(nn.Module):
             )
 
         T = hidden_states.shape[0]
-        q_raw, _ = self.linear_q(hidden_states)  # [T, latent_q]
-        k_raw, _ = self.linear_k(hidden_states)
-        qk = torch.cat([q_raw, k_raw], dim=-1)  # [T, in_out_ch]
+        # One merged projection: ``qk`` is already the layout the conv wants, and
+        # the q / k views are free slices of it (unit innermost stride preserved).
+        qk, _ = self.linear_qk(hidden_states)  # [T, in_out_ch]
+        q_raw = qk[:, : self.latent_q_dim]
+        k_raw = qk[:, self.latent_q_dim :]
 
         query_pre = q_raw.view(T, self.num_q_heads, self.head_dim)
         key_base = k_raw.view(T, self.num_k_heads, self.head_dim)
@@ -1930,6 +1962,11 @@ class ZayaForCausalLM(nn.Module):
         r"^(.*\.zaya_block\.experts)\.local_experts\.(\d+)\.(linear_fc1|linear_fc2)\.weight$"
     )
 
+    # The checkpoint keeps q and k as separate projections; the runtime merges
+    # them into one ``linear_qk`` (see CCA.__init__), so each maps onto a shard of
+    # the merged parameter -- q is shard 0, k is shard 1.
+    _MERGED_QK_RE = re.compile(r"^(.*\.qkv)\.linear_(q|k)\.(weight|bias)$")
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load an HF ZAYA1 safetensors checkpoint into the SGLang module tree.
 
@@ -1964,6 +2001,20 @@ class ZayaForCausalLM(nn.Module):
             if ckpt_name.startswith("lm_head") and self.config.tie_word_embeddings:
                 continue
             if "rotary_emb" in ckpt_name:
+                continue
+
+            qk_match = self._MERGED_QK_RE.match(ckpt_name)
+            if qk_match is not None:
+                cca_prefix, which, kind = qk_match.groups()
+                param_name = f"{cca_prefix}.linear_qk.{kind}"
+                param = params_dict.get(param_name)
+                if param is None:
+                    logger.warning("No param %s for %s", param_name, ckpt_name)
+                    continue
+                # Both the merged column-parallel loader and the replicated
+                # stand-in installed for tp=1 take (param, weight, shard_id).
+                param.weight_loader(param, loaded_weight, 0 if which == "q" else 1)
+                loaded_params.add(param_name)
                 continue
 
             match = self._EXPERT_RE.match(ckpt_name)
