@@ -817,6 +817,19 @@ def _zaya_overrides(server_args: Any, hf_config: Any) -> dict:
     if server_args.mamba_full_memory_ratio == ServerArgs.mamba_full_memory_ratio:
         overrides["mamba_full_memory_ratio"] = 0.05
 
+    # ``swa_full_tokens_ratio`` sizes the sliding-window sub-pool as a fraction of
+    # the full sub-pool. The 0.8 global default assumes the two pools serve
+    # comparable residency, which is badly wrong for ZAYA1-74B: its window is 4096
+    # against a 262144 context, so a request needs 64x fewer slots in the SWA
+    # layers than in the full ones. Measured on 8x MI350X at tp=8/dp=4, 0.8 gave
+    # the SWA pool 6.37M tokens (91 GiB) to hold what ~4096/request needs, capping
+    # the full pool at 7.96M; dropping the ratio moves that memory to the full
+    # pool, which is what actually bounds long-context concurrency. Matches the
+    # value Inkling pins for the same reason. Yields to an explicit
+    # --swa-full-tokens-ratio.
+    if server_args.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
+        overrides["swa_full_tokens_ratio"] = 0.1
+
     if (
         server_args.enable_dp_attention
         and server_args.dp_size > 1

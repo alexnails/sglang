@@ -218,6 +218,27 @@ class ZayaConfig(PretrainedConfig):
         self.swa_rotary_base = swa_rotary_base
         self._attn_implementation = _attn_implementation
 
+        # ``sliding_window_size`` is the *inclusive* window (4096), matching the
+        # HF ``sliding_window`` convention that ``ModelConfig`` reads; the
+        # attention backends instead take the exclusive ``window - 1`` via
+        # ``ZayaForCausalLM.get_attention_sliding_window_size``, which
+        # ``resolve_sliding_window_size`` prefers over this field.
+        window = self.swa_window_size
+        self.sliding_window_size = window
+
+        # Opt in to the hybrid-SWA KV pool when the checkpoint actually interleaves
+        # sliding-window layers. ``ModelConfig.is_hybrid_swa_model`` honours this
+        # flag (paired with ``hybrid_layer_pattern``) as a generic escape from its
+        # architecture allowlist, so ZAYA1 needs no entry there, and base
+        # checkpoints -- which omit ``swa_layers`` entirely -- keep the flag False
+        # and stay on the single-pool full-attention path.
+        #
+        # SWA-KV and per-request linear state compose without any new pool type:
+        # the KV side takes SWAKVPool + SWATokenToKVPoolAllocator while the CCA
+        # conv state rides on HybridReqToTokenPool.mamba_pool (per-request slots,
+        # not token-indexed), the same way Inkling does it.
+        self.is_hybrid_swa = window is not None
+
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -298,18 +319,30 @@ class ZayaConfig(PretrainedConfig):
 
     @property
     def hybrid_layer_pattern(self) -> Optional[List[int]]:
-        """Per-layer SWA mask (1 = sliding, 0 = full) for the hybrid-SWA KV pool.
+        """Per-layer KV class: 1 = sliding attention, 0 = full attention, -1 = none.
 
         ``ModelConfig.get_hybrid_layer_ids`` consumes this generic opt-in (paired
-        with ``is_hybrid_swa``) so ZAYA1 does not need an entry in the hybrid-SWA
-        architecture allowlist. Non-attention (MoE) layers report 0; they hold no
-        KV cache at all, and the full/SWA split only ever indexes attention
-        layers.
+        with ``is_hybrid_swa``) so ZAYA1 needs no entry in the hybrid-SWA
+        architecture allowlist. It derives ``swa_attention_layer_ids`` from the
+        ``== 1`` entries and ``full_attention_layer_ids`` from the ``== 0`` ones,
+        so any other value -- here -1 -- is excluded from both lists.
+
+        ZAYA1's odd layers are MoE and hold no KV at all, so they MUST be -1 and
+        not 0. Those two lists do not merely index the pools, they *size* them:
+        reporting MoE layers as full-attention made ``SWAKVPool``'s full sub-pool
+        90 layers wide instead of 30 on the 74B (measured 23039 vs the correct
+        7680 bytes/token of K), tripling its per-token cost and turning the whole
+        hybrid-SWA split into a capacity regression.
         """
         if self.swa_window_size is None:
             return None
+        attention_layers = set(self.full_attention_layer_ids)
         return [
-            1 if self.sliding_window_for_layer(i) else 0
+            (
+                (1 if self.sliding_window_for_layer(i) else 0)
+                if i in attention_layers
+                else -1
+            )
             for i in range(self.num_hidden_layers)
         ]
 

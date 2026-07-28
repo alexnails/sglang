@@ -800,13 +800,15 @@ class TestZayaSlidingWindowAttention(CustomTestCase):
 
     def test_non_uniform_window_is_rejected(self):
         # The runtime tracks a single global window, so mixed window sizes
-        # across SWA layers are unsupported and must fail loudly.
-        config = _make_swa_config(
-            num_hidden_layers=8,
-            swa_layers=[4096, 0, 0, 0, 2048, 0, 0, 0],
-        )
+        # across SWA layers are unsupported and must fail loudly -- and must do
+        # so while *constructing* the config (the hybrid-SWA opt-in resolves the
+        # window in __init__), not lazily on first attribute read, so an
+        # unsupported checkpoint is rejected at load rather than mid-serving.
         with self.assertRaises(AssertionError):
-            _ = config.swa_window_size
+            _make_swa_config(
+                num_hidden_layers=8,
+                swa_layers=[4096, 0, 0, 0, 2048, 0, 0, 0],
+            )
 
     def test_attention_selects_window_and_rope_base_per_layer(self):
         config = _make_swa_config(
@@ -844,20 +846,19 @@ class TestZayaSlidingWindowAttention(CustomTestCase):
         self.assertEqual(attn.attn.sliding_window_size, -1)
         self.assertEqual(attn.rotary_emb.base, int(config.rope_theta))
 
-    def test_hybrid_layer_pattern_marks_only_sliding_attention_layers(self):
-        # ``ModelConfig.get_hybrid_layer_ids`` consumes ``hybrid_layer_pattern``
-        # (1 = SWA, 0 = full) to split the KV pool. The pattern must be indexed
-        # by *global* layer id and cover every layer, so that the derived
-        # swa/full id lists stay disjoint and never claim a MoE layer -- which
-        # holds no KV cache -- as a full-attention layer's sibling.
+    def test_hybrid_layer_pattern_is_indexed_by_global_layer_id(self):
+        # The pattern is indexed by *global* layer id and covers every layer so
+        # get_hybrid_layer_ids can index it directly. Note the two same-named
+        # properties mean different things: ZayaConfig.full_attention_layer_ids is
+        # the mamba interface's "every attention layer" (each carries a CCA conv
+        # state), whereas ModelConfig.full_attention_layer_ids after the SWA split
+        # means "non-sliding attention layers" only.
         config = _make_swa_config(
             num_hidden_layers=8,
             swa_layers=[4096, 0, 0, 0, 4096, 0, 0, 0],
         )
-        self.assertEqual(config.hybrid_layer_pattern, [1, 0, 0, 0, 1, 0, 0, 0])
+        self.assertEqual(config.hybrid_layer_pattern, [1, -1, 0, -1, 1, -1, 0, -1])
         self.assertEqual(config.swa_attention_layer_ids, [0, 4])
-        # Attention layers are the even ids; the sliding ones are exactly those
-        # flagged in swa_layers, and the rest stay full attention.
         self.assertEqual(config.full_attention_layer_ids, [0, 2, 4, 6])
 
     def test_base_checkpoint_reports_no_hybrid_pattern(self):
@@ -867,6 +868,64 @@ class TestZayaSlidingWindowAttention(CustomTestCase):
         config = _make_swa_config(num_hidden_layers=4, swa_layers=None)
         self.assertIsNone(config.hybrid_layer_pattern)
         self.assertEqual(config.swa_attention_layer_ids, [])
+
+    def test_window_size_conventions(self):
+        # Two different conventions coexist and must not be conflated:
+        # ``sliding_window_size`` is the inclusive window that ModelConfig reads
+        # from the HF config, while the attention backends take the exclusive
+        # ``window - 1`` via the model's get_attention_sliding_window_size.
+        swa = _make_swa_config(
+            num_hidden_layers=8, swa_layers=[4096, 0, 0, 0, 4096, 0, 0, 0]
+        )
+        self.assertEqual(swa.sliding_window_size, 4096)
+        self.assertEqual(swa.get_attention_sliding_window_size(), 4095)
+
+        base = _make_swa_config(num_hidden_layers=4, swa_layers=None)
+        self.assertIsNone(base.sliding_window_size)
+
+    def test_hybrid_swa_optin_is_per_checkpoint(self):
+        # is_hybrid_swa is the generic escape from ModelConfig's arch allowlist, so
+        # it must key off the checkpoint (swa_layers) rather than the architecture:
+        # base ZAYA1 checkpoints have no sliding-window layers and must stay on the
+        # single-pool path.
+        from sglang.srt.configs.model_config import is_hybrid_swa_model
+
+        swa = _make_swa_config(
+            num_hidden_layers=8, swa_layers=[4096, 0, 0, 0, 4096, 0, 0, 0]
+        )
+        self.assertTrue(swa.is_hybrid_swa)
+        self.assertTrue(is_hybrid_swa_model(["ZayaForCausalLM"], swa))
+
+        base = _make_swa_config(num_hidden_layers=4, swa_layers=None)
+        self.assertFalse(base.is_hybrid_swa)
+        self.assertFalse(is_hybrid_swa_model(["ZayaForCausalLM"], base))
+
+    def test_moe_layers_are_excluded_from_both_kv_layer_lists(self):
+        # Regression guard. ZAYA1 alternates attention (even) and MoE (odd) layers,
+        # and the MoE layers hold no KV at all. get_hybrid_layer_ids derives
+        # swa_attention_layer_ids from `pattern == 1` and full_attention_layer_ids
+        # from `pattern == 0`, and those lists SIZE the SWA sub-pools rather than
+        # merely indexing them -- so reporting MoE layers as 0 made the full
+        # sub-pool 90 layers wide instead of 30 on the 74B, tripling its per-token
+        # cost (23039 vs 7680 bytes/token of K) and turning hybrid-SWA into a
+        # capacity regression. MoE layers must therefore be in NEITHER list.
+        from sglang.srt.configs.model_config import get_hybrid_layer_ids
+
+        config = _make_swa_config(
+            num_hidden_layers=8, swa_layers=[4096, 0, 0, 0, 4096, 0, 0, 0]
+        )
+        self.assertEqual(config.hybrid_layer_pattern, [1, -1, 0, -1, 1, -1, 0, -1])
+
+        swa_ids, full_ids = get_hybrid_layer_ids(["ZayaForCausalLM"], config)
+        self.assertEqual(swa_ids, [0, 4])
+        self.assertEqual(full_ids, [2, 6])
+        self.assertEqual(set(swa_ids) & set(full_ids), set())
+        # Every KV-bearing layer is an attention layer, and no MoE layer appears.
+        moe_layers = {1, 3, 5, 7}
+        self.assertEqual(set(swa_ids + full_ids) & moe_layers, set())
+        self.assertEqual(
+            sorted(swa_ids + full_ids), sorted(config.full_attention_layer_ids)
+        )
 
 
 class TestZayaCCATensorParallel(CustomTestCase):
