@@ -571,6 +571,108 @@ class TestZayaCCA(CustomTestCase):
             self.assertNotIn(id(fb_decode), backend._step_slot_ids)
 
 
+class TestCCAStateStepKernel(CustomTestCase):
+    """The fused decode state step must be bit-identical to the torch chain.
+
+    Derived property. ``cca_state_step`` re-derives the conv history shift
+    (``new[w] = old[w+1]``, last tap = this token) and the read-before-overwrite
+    ordering of the ``prev_hs`` gather/scatter, while mutating the pools in place.
+    An off-by-one in the shift, or writing the slot before reading it, corrupts
+    only the *next* step for that request -- which surfaces as gradual output
+    drift rather than an error, so pin exactness on both the returned tensors and
+    the mutated pools.
+
+    Requires a GPU (Triton); on CPU ``covered()`` selects the torch chain, which
+    the rest of this file already exercises.
+    """
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused kernel requires a GPU")
+    def test_bit_identical_to_torch_chain(self):
+        from sglang.kernels.ops.attention import cca_state_step as kernel
+
+        dev = "cuda"
+        torch.manual_seed(5)
+        # total_padding 3 exercises a shift longer than ZAYA1's 2, where an
+        # off-by-one in the history roll would otherwise be invisible.
+        for num_channels, hidden_size, total_padding in ((64, 32, 2), (48, 16, 3)):
+            for num_tokens in (1, 6):
+                with self.subTest(c=num_channels, h=hidden_size, p=total_padding):
+                    slots = (
+                        torch.randperm(32, device=dev)[:num_tokens].to(torch.long) + 1
+                    )
+                    qk = torch.randn(
+                        num_tokens, num_channels, device=dev, dtype=torch.bfloat16
+                    )
+                    hs = torch.randn(
+                        num_tokens, hidden_size, device=dev, dtype=torch.bfloat16
+                    )
+                    conv0 = torch.randn(
+                        64,
+                        num_channels,
+                        total_padding,
+                        device=dev,
+                        dtype=torch.bfloat16,
+                    )
+                    prev0 = torch.randn(
+                        64, hidden_size, 1, device=dev, dtype=torch.bfloat16
+                    )
+
+                    conv_ref, prev_ref = conv0.clone(), prev0.clone()
+                    conv_got, prev_got = conv0.clone(), prev0.clone()
+
+                    with torch.no_grad():
+                        left = conv_ref.index_select(0, slots).to(hs.dtype)
+                        window_ref = torch.cat([left, qk.unsqueeze(-1)], dim=-1)
+                        conv_ref.index_copy_(
+                            0,
+                            slots,
+                            window_ref[..., -total_padding:].to(conv_ref.dtype),
+                        )
+                        prevhs_ref = (
+                            prev_ref.index_select(0, slots).squeeze(-1).to(hs.dtype)
+                        )
+                        prev_ref.index_copy_(
+                            0, slots, hs.unsqueeze(-1).to(prev_ref.dtype)
+                        )
+
+                        self.assertTrue(
+                            kernel.covered(
+                                qk, hs, conv_got, prev_got, slots, total_padding
+                            )
+                        )
+                        window_got, prevhs_got = kernel.cca_state_step(
+                            qk, hs, conv_got, prev_got, slots, total_padding
+                        )
+
+                    # Bit-exact: the kernel only moves data, no arithmetic.
+                    self.assertTrue(torch.equal(window_got, window_ref))
+                    self.assertTrue(torch.equal(prevhs_got, prevhs_ref))
+                    self.assertTrue(torch.equal(conv_got, conv_ref))
+                    self.assertTrue(torch.equal(prev_got, prev_ref))
+
+    def test_uncovered_inputs_fall_back(self):
+        # covered() gates an in-place pool mutation, so its negative branches
+        # matter more than usual: a mismatched dtype would have the kernel write
+        # raw bits into the pool.
+        from sglang.kernels.ops.attention import cca_state_step as kernel
+
+        qk = torch.randn(4, 8)
+        hs = torch.randn(4, 6)
+        conv = torch.randn(16, 8, 2)
+        prev = torch.randn(16, 6, 1)
+        slots = torch.arange(4)
+        # CPU tensors are not served.
+        self.assertFalse(kernel.covered(qk, hs, conv, prev, slots, 2))
+        # Missing slot indices (before the backend resolves them).
+        self.assertFalse(kernel.covered(qk, hs, conv, prev, None, 2))
+        # A single tap leaves no history to shift.
+        self.assertFalse(kernel.covered(qk, hs, conv, prev, slots, 0))
+        # Pool dtype must match the value written into it.
+        self.assertFalse(
+            kernel.covered(qk.to(torch.bfloat16), hs, conv, prev, slots, 2)
+        )
+
+
 class TestCCAQKMixKernel(CustomTestCase):
     """The fused q/k head-mix kernel must match the torch chain it replaces.
 

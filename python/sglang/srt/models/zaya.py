@@ -338,21 +338,35 @@ def cca_decode(
     if total_padding is None:
         total_padding = conv_state.shape[-1]
 
+    from sglang.kernels.ops.attention import cca_state_step as _state_step
+
+    if _state_step.covered(
+        qk, hidden_states, conv_state, prev_hs_state, mamba_indices, total_padding
+    ):
+        # One kernel for the two gathers, the concat and the two scatters.
+        padded, prev_hs = _state_step.cca_state_step(
+            qk,
+            hidden_states,
+            conv_state,
+            prev_hs_state,
+            mamba_indices,
+            total_padding,
+        )
+        qk_out = _cca_decode_conv(
+            padded,
+            conv_qk,
+            decode_conv_weight,
+            decode_conv_bias,
+            decode_conv_groups,
+        )
+        return qk_out, prev_hs
+
     left_pad = conv_state.index_select(0, mamba_indices).to(dtype)
     cur = qk.unsqueeze(-1)  # [T, C, 1]
     padded = torch.cat([left_pad, cur], dim=-1)  # [T, C, total_padding + 1]
-    if decode_conv_weight is not None:
-        # Folded path: [T, C, taps] -> [T, G, Cg*taps] (the trailing (Cg, taps)
-        # dims flatten in place, matching how fold_decode_conv laid out the
-        # weight) -> one grouped matmul -> [T, C].
-        num_tokens = padded.shape[0]
-        grouped = padded.reshape(num_tokens, decode_conv_groups, -1)
-        qk_out = (
-            torch.einsum("tgk,gok->tgo", grouped, decode_conv_weight) + decode_conv_bias
-        ).reshape(num_tokens, -1)
-    else:
-        out = conv_qk(padded)  # [T, C, 1]
-        qk_out = out.squeeze(-1)  # [T, C]
+    qk_out = _cca_decode_conv(
+        padded, conv_qk, decode_conv_weight, decode_conv_bias, decode_conv_groups
+    )
 
     new_state = padded[..., -total_padding:]
     conv_state.index_copy_(0, mamba_indices, new_state.to(conv_state.dtype))
@@ -385,8 +399,36 @@ def cca_conv1d_fn(*args, **kwargs):
 def cca_conv1d_update(*args, **kwargs):
     raise NotImplementedError(
         "Fused CCA decode conv-with-state kernel not implemented yet; "
-        "the model uses cca_decode (v1 torch) in the meantime."
+        "the model uses cca_decode (v1 torch) in the meantime. The state "
+        "plumbing around the conv is already fused -- see "
+        "sglang.kernels.ops.attention.cca_state_step -- so what remains here is "
+        "folding the grouped matmul itself into that kernel."
     )
+
+
+def _cca_decode_conv(
+    padded: torch.Tensor,
+    conv_qk: nn.Module,
+    decode_conv_weight: Optional[torch.Tensor],
+    decode_conv_bias: Optional[torch.Tensor],
+    decode_conv_groups: Optional[int],
+) -> torch.Tensor:
+    """Apply the decode conv to a ``[T, C, taps]`` window, returning ``[T, C]``.
+
+    Prefers the load-time-folded single grouped matmul (see
+    :meth:`CCA.fold_decode_conv`) and falls back to running the real two-stage
+    ``conv_qk``, which is what an unfolded module (e.g. a CPU unit test) gets.
+    """
+    if decode_conv_weight is not None:
+        # [T, C, taps] -> [T, G, Cg*taps] (the trailing (Cg, taps) dims flatten
+        # in place, matching how fold_decode_conv laid out the weight) -> one
+        # grouped matmul -> [T, C].
+        num_tokens = padded.shape[0]
+        grouped = padded.reshape(num_tokens, decode_conv_groups, -1)
+        return (
+            torch.einsum("tgk,gok->tgo", grouped, decode_conv_weight) + decode_conv_bias
+        ).reshape(num_tokens, -1)
+    return conv_qk(padded).squeeze(-1)
 
 
 # ---------------------------------------------------------------------------
