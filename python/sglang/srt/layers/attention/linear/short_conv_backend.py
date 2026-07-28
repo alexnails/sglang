@@ -123,14 +123,31 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
         md = self.forward_metadata
         idx = md.mamba_cache_indices if md is not None else None
         buf = self._cache_indices_buf
+        # Batch padding poisons unused rows' slot ids to -1 (see
+        # MambaAttnBackendBase._forward_metadata: "padded rows are then poisoned
+        # to -1"). Padding appears under cuda-graph bs rounding and, notably,
+        # whenever DP attention pads a replica's batch. Clamp ONCE per step, here
+        # where the shared int64 view is resolved, so every conv layer's
+        # index_select / index_copy_ is in bounds without a per-layer clamp:
+        # MambaPool reserves slot 0 (MambaSlotAllocator hands out 1..size), so
+        # padded rows land on that scratch slot -- they can neither read out of
+        # bounds nor clobber a live request's state, and the model discards their
+        # outputs anyway. An unclamped -1 is an out-of-bounds device gather; on
+        # ROCm it aborts the queue with HSA_STATUS_ERROR_EXCEPTION 0x1016 rather
+        # than raising, which surfaced as a hard crash on ZAYA1 at attn_tp > 1
+        # under DP attention.
         if idx is None:
             self._cache_indices = None
         elif buf is not None and idx.shape[0] <= buf.shape[0]:
             n = idx.shape[0]
             buf[:n].copy_(idx)
+            buf[:n].clamp_(min=0)
             self._cache_indices = buf[:n]
         else:
-            self._cache_indices = idx.to(torch.long)
+            # ``clamp`` (not ``clamp_``): ``to(torch.long)`` is a no-op alias when
+            # idx is already int64, so an in-place clamp would mutate the
+            # backend's own mamba_cache_indices.
+            self._cache_indices = idx.to(torch.long).clamp(min=0)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         super().init_cuda_graph_state(max_bs, max_num_tokens)
