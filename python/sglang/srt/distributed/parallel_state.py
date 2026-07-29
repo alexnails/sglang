@@ -57,7 +57,6 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import (
     get_current_device_stream_fast,
-    get_hip_version,
     get_int_env_var,
     is_cpu,
     is_cuda,
@@ -237,23 +236,31 @@ def _rocm_cuda_graph_custom_ar_unsafe() -> bool:
     capture). The ROCm 7.2.1 HIP runtime corrects hipEventQuery/Synchronize
     capture handling, so newer runtimes are unaffected.
 
-    ``torch.version.hip``'s third field is a monotonically increasing HIP build
-    number, not a semantic patch: ROCm 7.2.0 reports ``7.2.26015`` (the exact
-    build the bug was reproduced on in pytorch#177309), while 7.2.1+ carry a
-    larger build. Hence ``<= (7, 2, 26015)`` flags 7.2.0 and every earlier
-    minor/major, while 7.2.1+/7.3+/8.x compare greater and are treated as fixed.
+    DEFAULT OFF, opt in via ``SGLANG_ROCM_CUDA_GRAPH_FORCE_PYNCCL=1``, because the
+    evidence for needing it did not hold up:
 
-    The workaround is not free: it pushes every collective in the captured region
-    onto pynccl, and custom/quick all-reduce are substantially faster for the
-    small messages a DP-attention decode step issues.
-    ``SGLANG_ROCM_CUDA_GRAPH_FORCE_PYNCCL`` overrides the version check in both
-    directions so the trade can be measured, and so a HIP build the check flags
-    too broadly is not stuck on the slow path.
+    * The crashes originally attributed to this on ZAYA1 were root-caused
+      elsewhere -- unclamped ``-1`` mamba slot ids fed to ``index_select`` (an
+      out-of-bounds gather that surfaces as HSA 0x1016, exactly like the capture
+      bug) and a SIGFPE from the ROCm rotary kernel on zero-token idle DP
+      forwards. Both are fixed; neither involved custom all-reduce.
+    * Measured on HIP 7.2.26015 (the exact build pytorch#177309 reports), ROCm
+      7.0.2 / gfx950, tp=8/dp=4 on ZAYA1-74B: forcing pynccl costs **5.3% at
+      C=32 and 6.5% at C=128** (TPOT 21.07 -> 20.00 and 25.25 -> 23.73), because
+      it pushes every collective in the captured region -- 120+ per decode step
+      under DP attention -- off custom/quick AR, which is far faster at these
+      message sizes. ~650k tokens generated with correct output and no aborts.
+    * Upstream main carries no such guard, so defaulting it off matches upstream.
+
+    Residual risk: the bug this guards against is *silent* capture corruption that
+    surfaces later, so absence over a few hundred thousand tokens is evidence, not
+    proof. Set ``SGLANG_ROCM_CUDA_GRAPH_FORCE_PYNCCL=1`` to restore the
+    conservative path if a ROCm build does exhibit it.
     """
     override = envs.SGLANG_ROCM_CUDA_GRAPH_FORCE_PYNCCL.get()
     if override is not None:
         return bool(override)
-    return is_hip() and get_hip_version() <= (7, 2, 26015)
+    return False
 
 
 class GroupCoordinator:
