@@ -1722,7 +1722,12 @@ class ZayaDecoderATTLayer(nn.Module):
         if self.res_scale is not None:
             residual, hidden_states = self.res_scale(residual, hidden_states)
         if residual is not None:
-            residual = residual.float() + hidden_states.float()
+            # No explicit .float() on either side: the residual stream is
+            # already fp32 (so residual.float() was a no-op) and a mixed
+            # fp32 + bf16 add type-promotes to fp32 inside the one add kernel,
+            # which is bit-identical to casting first. Saves a per-layer
+            # aten::copy_ -- the largest single op in the decode profile.
+            residual = residual + hidden_states
         else:
             residual = hidden_states.float()
         hidden_states = _apply_norm_with_fp32_residual(
@@ -1774,7 +1779,12 @@ class ZayaDecoderMLPLayer(nn.Module):
         if self.res_scale is not None:
             residual, hidden_states = self.res_scale(residual, hidden_states)
         if residual is not None:
-            residual = residual.float() + hidden_states.float()
+            # No explicit .float() on either side: the residual stream is
+            # already fp32 (so residual.float() was a no-op) and a mixed
+            # fp32 + bf16 add type-promotes to fp32 inside the one add kernel,
+            # which is bit-identical to casting first. Saves a per-layer
+            # aten::copy_ -- the largest single op in the decode profile.
+            residual = residual + hidden_states
         else:
             residual = hidden_states.float()
         hidden_states = _apply_norm_with_fp32_residual(
