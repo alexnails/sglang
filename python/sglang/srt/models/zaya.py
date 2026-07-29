@@ -1482,8 +1482,15 @@ def mod_blend(
     replicated on every rank, so it is folded in here -- after the reduce of
     ``masked_experts`` -- weighted by ``(1 - mod_mask)``. See
     :func:`mod_premask_experts`.
+
+    The weighted add is one ``addcmul`` rather than a separate multiply and add,
+    which is exact (identical operations, just fused) and drops one launch per
+    MoE layer. Note the ``1.0 - mod_mask`` complement is NOT folded away by
+    rewriting this as ``masked + mod_out - mask*mod_out``: that form is not
+    exact, since ``(a + b) - b != a`` in floating point, and it must be for the
+    masked tokens where the skip term is supposed to vanish entirely.
     """
-    return masked_experts_reduced + (1.0 - mod_mask) * mod_out
+    return torch.addcmul(masked_experts_reduced, 1.0 - mod_mask, mod_out)
 
 
 class ZayaBlock(nn.Module):
