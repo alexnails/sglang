@@ -242,7 +242,17 @@ def _rocm_cuda_graph_custom_ar_unsafe() -> bool:
     build the bug was reproduced on in pytorch#177309), while 7.2.1+ carry a
     larger build. Hence ``<= (7, 2, 26015)`` flags 7.2.0 and every earlier
     minor/major, while 7.2.1+/7.3+/8.x compare greater and are treated as fixed.
+
+    The workaround is not free: it pushes every collective in the captured region
+    onto pynccl, and custom/quick all-reduce are substantially faster for the
+    small messages a DP-attention decode step issues.
+    ``SGLANG_ROCM_CUDA_GRAPH_FORCE_PYNCCL`` overrides the version check in both
+    directions so the trade can be measured, and so a HIP build the check flags
+    too broadly is not stuck on the slow path.
     """
+    override = envs.SGLANG_ROCM_CUDA_GRAPH_FORCE_PYNCCL.get()
+    if override is not None:
+        return bool(override)
     return is_hip() and get_hip_version() <= (7, 2, 26015)
 
 

@@ -845,6 +845,16 @@ class Envs:
     # falls back to the per-conv-type Python loop.
     SGLANG_DISABLE_FUSED_MAMBA_SLOT_OPS = EnvBool(False)
 
+    # Override the ROCm <= 7.2.0 guard that forces the capture-safe pynccl path
+    # for custom / quick all-reduce inside CUDA graph capture (see
+    # distributed/parallel_state._rocm_cuda_graph_custom_ar_unsafe). Unset means
+    # "use the HIP-version check". Setting it to 0 re-enables custom AR during
+    # capture, which is much faster for the small messages a DP-attention decode
+    # step issues -- at the risk of the hipEventQuery capture-corruption bug the
+    # guard exists for. Provided so the guard can be A/B'd and so a fixed HIP
+    # build is not stuck on the slow path if the version check is too broad.
+    SGLANG_ROCM_CUDA_GRAPH_FORCE_PYNCCL = EnvBool(None)
+
     # Unified Radix Tree
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
     # Registered TreeCore backend serving the unified radix cache.
