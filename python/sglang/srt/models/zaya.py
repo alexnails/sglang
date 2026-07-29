@@ -134,6 +134,9 @@ class ResidualScaling(nn.Module):
                 torch.ones(self.hidden_size, dtype=torch.float32),
                 persistent=False,
             )
+        # Gate for the fused residual chain: the folded buffers above are only
+        # valid once fold_scales has run against loaded weights.
+        self._scales_folded = False
 
     @torch.no_grad()
     def fold_scales(self) -> None:
@@ -151,6 +154,7 @@ class ResidualScaling(nn.Module):
             self.residual_bias_scaled.copy_(
                 self.residual_bias.float() * self.residual_scale_f32
             )
+        self._scales_folded = True
 
     def forward(
         self,
@@ -1672,6 +1676,53 @@ class ZayaBlock(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def _residual_scale_norm(
+    res_scale: Optional[ResidualScaling],
+    norm: nn.Module,
+    residual: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+    target_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run a layer's opening ``res_scale -> accumulate -> norm`` chain.
+
+    Prefers the fused kernel and falls back to the torch chain when it cannot
+    serve the shapes -- notably before ``fold_scales`` has run, so CPU unit tests
+    keep exercising the reference path. Returns ``(normed_hidden, new_residual)``.
+    """
+    from sglang.kernels.ops.elementwise import zaya_residual_norm as _rn
+
+    folded = res_scale is not None and res_scale._scales_folded
+    norm_weight = norm.weight if isinstance(norm, RMSNorm) else None
+    if folded and _rn.covered(hidden_states, residual, norm_weight, folded):
+        return _rn.residual_scale_accumulate_norm(
+            hidden_states,
+            residual,
+            hs_scale=res_scale.hidden_states_scale_f32,
+            hs_bias_scaled=res_scale.hidden_states_bias_scaled,
+            res_scale=(
+                res_scale.residual_scale_f32
+                if (res_scale.has_residual and residual is not None)
+                else None
+            ),
+            res_bias_scaled=(
+                res_scale.residual_bias_scaled
+                if (res_scale.has_residual and residual is not None)
+                else None
+            ),
+            norm_weight=norm_weight,
+            eps=norm.variance_epsilon,
+            out_dtype=target_dtype,
+        )
+
+    if res_scale is not None:
+        residual, hidden_states = res_scale(residual, hidden_states)
+    if residual is not None:
+        residual = residual + hidden_states
+    else:
+        residual = hidden_states.float()
+    return _apply_norm_with_fp32_residual(norm, residual, target_dtype), residual
+
+
 class ZayaDecoderATTLayer(nn.Module):
     """Attention decoder layer: ``res_scale → input_norm → ZayaAttention``."""
 
@@ -1719,19 +1770,8 @@ class ZayaDecoderATTLayer(nn.Module):
             if isinstance(self.input_norm, RMSNorm)
             else hidden_states.dtype
         )
-        if self.res_scale is not None:
-            residual, hidden_states = self.res_scale(residual, hidden_states)
-        if residual is not None:
-            # No explicit .float() on either side: the residual stream is
-            # already fp32 (so residual.float() was a no-op) and a mixed
-            # fp32 + bf16 add type-promotes to fp32 inside the one add kernel,
-            # which is bit-identical to casting first. Saves a per-layer
-            # aten::copy_ -- the largest single op in the decode profile.
-            residual = residual + hidden_states
-        else:
-            residual = hidden_states.float()
-        hidden_states = _apply_norm_with_fp32_residual(
-            self.input_norm, residual, target_dtype
+        hidden_states, residual = _residual_scale_norm(
+            self.res_scale, self.input_norm, residual, hidden_states, target_dtype
         )
         hidden_states = self.self_attn(hidden_states, positions, forward_batch)
         return hidden_states, residual, prev_router_hidden_states
@@ -1776,19 +1816,8 @@ class ZayaDecoderMLPLayer(nn.Module):
             if isinstance(self.input_norm, RMSNorm)
             else hidden_states.dtype
         )
-        if self.res_scale is not None:
-            residual, hidden_states = self.res_scale(residual, hidden_states)
-        if residual is not None:
-            # No explicit .float() on either side: the residual stream is
-            # already fp32 (so residual.float() was a no-op) and a mixed
-            # fp32 + bf16 add type-promotes to fp32 inside the one add kernel,
-            # which is bit-identical to casting first. Saves a per-layer
-            # aten::copy_ -- the largest single op in the decode profile.
-            residual = residual + hidden_states
-        else:
-            residual = hidden_states.float()
-        hidden_states = _apply_norm_with_fp32_residual(
-            self.input_norm, residual, target_dtype
+        hidden_states, residual = _residual_scale_norm(
+            self.res_scale, self.input_norm, residual, hidden_states, target_dtype
         )
         # DP attention: the attention layers kept each DP replica's tokens
         # local, but the experts (and their EP / MoE-TP all-reduce) must run over
