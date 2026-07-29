@@ -1370,11 +1370,21 @@ class ZayaRouter(nn.Module):
         self.topk = int(moe_router_topk)
         self.mlp_expansion = int(mlp_expansion)
 
+        # The router is left unquantized. Its final projection is
+        # ``mlp_expansion -> num_experts (+1 for the MOD skip slot)``, which for
+        # ZAYA1 is 25 -- not a multiple of 16, so an FP8 GEMM rejects it outright
+        # ("mat2 shape (256x25) must be divisible by 16") and online
+        # --quantization fp8 fails at the first router forward. Quantizing it buys
+        # nothing anyway: the whole router is ~0.1% of the layer's weights, while
+        # the experts it selects are ~99%. Routing precision also feeds an argmax,
+        # where fp8 rounding could flip expert choice for near-ties.
+        router_quant_config = None
+
         self.down_proj = ReplicatedLinear(
             self.hidden_size,
             self.mlp_expansion,
             bias=True,
-            quant_config=quant_config,
+            quant_config=router_quant_config,
             prefix=add_prefix("down_proj", prefix),
         )
 
@@ -1394,7 +1404,7 @@ class ZayaRouter(nn.Module):
                 self.mlp_expansion,
                 self.mlp_expansion,
                 bias=True,
-                quant_config=quant_config,
+                quant_config=router_quant_config,
                 prefix=add_prefix("router_mlp.0", prefix),
             ),
             self.non_linearity,
@@ -1402,7 +1412,7 @@ class ZayaRouter(nn.Module):
                 self.mlp_expansion,
                 self.mlp_expansion,
                 bias=True,
-                quant_config=quant_config,
+                quant_config=router_quant_config,
                 prefix=add_prefix("router_mlp.2", prefix),
             ),
             self.non_linearity,
@@ -1410,7 +1420,7 @@ class ZayaRouter(nn.Module):
                 self.mlp_expansion,
                 self.num_experts,
                 bias=False,
-                quant_config=quant_config,
+                quant_config=router_quant_config,
                 prefix=add_prefix("router_mlp.4", prefix),
             ),
         )
