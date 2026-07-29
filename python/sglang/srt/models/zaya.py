@@ -953,6 +953,42 @@ class CCA(nn.Module):
             return value_full
         return value_full[:, self.k_head_start : self.k_head_end, :].contiguous()
 
+    def _compute_value_per_rank(
+        self, hidden_states: torch.Tensor, v2_input: torch.Tensor
+    ) -> torch.Tensor:
+        """This rank's V heads, running only the projections that feed them.
+
+        ``val_proj1`` supplies the first ``num_k_heads_full // 2`` K heads and
+        ``val_proj2`` the rest (the HF layout, see their construction). When this
+        rank's head range falls entirely inside one of those, the other
+        projection is dead work: skipping it drops a GEMM, the ``cat`` and the
+        ``contiguous`` copy that slicing the concatenated tensor needed. That is
+        the common case for ZAYA1 -- ``num_query_groups`` is 2, so at
+        ``attn_tp == 2`` each rank owns exactly one projection's output.
+
+        Falls back to computing both and slicing when the range straddles the
+        boundary (or the split is not head-aligned), which is also the tp=1 path.
+        """
+        head_dim = self.head_dim
+        start, end = self.k_head_start, self.k_head_end
+        v1_heads = self.num_k_heads_full // 2
+        aligned = self.num_k_heads_full % 2 == 0
+
+        if aligned and end <= v1_heads:
+            value, _ = self.val_proj1(hidden_states)
+            value = value[:, start * head_dim : end * head_dim]
+        elif aligned and start >= v1_heads:
+            value, _ = self.val_proj2(v2_input)
+            value = value[
+                :, (start - v1_heads) * head_dim : (end - v1_heads) * head_dim
+            ]
+        else:
+            v1, _ = self.val_proj1(hidden_states)
+            v2, _ = self.val_proj2(v2_input)
+            value = torch.cat([v1, v2], dim=-1)[:, start * head_dim : end * head_dim]
+
+        return value.reshape(value.shape[0], self.num_k_heads, head_dim)
+
     def _forward_no_state(
         self, hs: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1109,12 +1145,7 @@ class CCA(nn.Module):
             out_dtype=hidden_states.dtype,
         )
 
-        v1, _ = self.val_proj1(hidden_states)
-        v2, _ = self.val_proj2(v2_input)
-        value_full = torch.cat([v1, v2], dim=-1).view(
-            T, self.num_k_heads_full, self.head_dim
-        )
-        value = self._slice_v_per_rank(value_full)
+        value = self._compute_value_per_rank(hidden_states, v2_input)
         return query, key, value
 
 
@@ -1591,12 +1622,30 @@ class ZayaBlock(nn.Module):
             # without double-counting ``mod_out``. The two steps are
             # ``mod_premask_experts`` / ``mod_blend`` so the math is testable
             # without a live distributed group.
-            mod_out = hidden_states * probs
-            mod_mask, masked_experts = mod_premask_experts(
-                experts_out, indices, self.num_moe_experts
-            )
-            masked_experts = self._reduce_experts(masked_experts)
-            hidden_out = mod_blend(masked_experts, mod_mask, mod_out)
+            from sglang.kernels.ops.moe import zaya_mod as _mod
+
+            if _mod.covered(experts_out, indices, hidden_states, probs):
+                # Two kernels instead of six elementwise launches; each
+                # recomputes the skip predicate from ``indices``, so no mask
+                # tensor is materialized or threaded across the reduce.
+                masked_experts = _mod.mod_premask(
+                    experts_out, indices, self.num_moe_experts
+                )
+                masked_experts = self._reduce_experts(masked_experts)
+                hidden_out = _mod.mod_blend(
+                    masked_experts,
+                    indices,
+                    hidden_states,
+                    probs,
+                    self.num_moe_experts,
+                )
+            else:
+                mod_out = hidden_states * probs
+                mod_mask, masked_experts = mod_premask_experts(
+                    experts_out, indices, self.num_moe_experts
+                )
+                masked_experts = self._reduce_experts(masked_experts)
+                hidden_out = mod_blend(masked_experts, mod_mask, mod_out)
         else:
             hidden_out = self._reduce_experts(self.experts(hidden_states, topk_out))
 
