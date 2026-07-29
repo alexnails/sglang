@@ -1799,8 +1799,29 @@ class ZayaDecoderMLPLayer(nn.Module):
         # multiplies the tokens by ``attn_tp_size`` -- a no-op at attn_tp=1 (so
         # tp=2/dp=2 was correct) but corrupting every value once attn_tp>1 (e.g.
         # tp=4/dp=2 on 74B doubled them, producing garbage output).
+        # The gather is needed only when the MoE-TP group is *wider* than the
+        # attention-TP group, i.e. when it spans DP replicas: then a token must be
+        # visible to every MoE rank for the expert shards to see it. When
+        # ``moe_tp == attn_tp`` (e.g. --moe-dp-size equal to the attention DP size)
+        # each replica owns a self-contained MoE over its own ranks, the token is
+        # already replicated across them by ``attn_tp_all_reduce``, and the
+        # gather/scatter pair is pure overhead.
+        #
+        # This matters a lot: profiling tp=8/dp=4 on the 74B put ~83% of decode GPU
+        # time in collectives, of which the per-MoE-layer all-gather alone was
+        # 29%. Skipping it when the groups coincide removes 60 all-gathers and 60
+        # scatters per step.
+        # Compare against the width of the group ``_reduce_experts`` actually
+        # reduces over -- expert-parallel AND MoE-tensor-parallel -- not moe_tp
+        # alone. Under EP (``--ep-size 8``) moe_tp collapses to 1 while the reduce
+        # still spans all 8 ranks, so keying off moe_tp alone would skip a gather
+        # that is required and silently drop every token the rank does not own.
+        parallel = get_parallel()
+        moe_reduce_width = parallel.moe_ep_size * parallel.moe_tp_size
         use_dp_gather = (
-            get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none()
+            parallel.attn_dp_size > 1
+            and moe_reduce_width > parallel.attn_tp_size
+            and get_moe_a2a_backend().is_none()
         )
         if use_dp_gather:
             hidden_states, local_hidden_states = (
