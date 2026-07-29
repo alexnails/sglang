@@ -654,6 +654,16 @@ class CCA(nn.Module):
             torch.zeros(self.decode_conv_groups, ch_per_group),
             persistent=False,
         )
+        # Same folded coefficients, laid out as a grouped ``conv1d`` weight
+        # ``[C_out, C_in/groups, kernel]``. The fold is a convolution -- the same
+        # 3-tap kernel applies at every output position -- so it serves the
+        # multi-timestep extend path as well as the single-step decode one,
+        # replacing conv_qk's two MIOpen grouped convs with one.
+        self.register_buffer(
+            "fold_conv1d_weight",
+            torch.zeros(self.in_out_ch, ch_per_group, self.decode_conv_taps),
+            persistent=False,
+        )
         # The folded buffers are only valid once ``fold_decode_conv`` has run
         # against loaded weights. Until then ``forward`` must keep using the real
         # ``conv_qk`` -- consuming the zero-initialized buffers would silently
@@ -936,10 +946,28 @@ class CCA(nn.Module):
                 self.decode_conv_bias.dtype
             )
         )
+        # [G, Co_g, Ci_g, taps] -> [G*Co_g, Ci_g, taps] == [C, C/groups, kernel]
+        self.fold_conv1d_weight.copy_(
+            folded.reshape(groups * cg, cg, taps).to(self.fold_conv1d_weight.dtype)
+        )
         self._decode_conv_folded = True
 
     def _conv_qk_run(self, padded: torch.Tensor) -> torch.Tensor:
-        """Run ``conv_qk`` on ``[N, C, S + total_padding]`` → ``[N, C, S]``."""
+        """Run the conv on ``[N, C, S + total_padding]`` -> ``[N, C, S]``.
+
+        Uses the single folded grouped conv when the weights have been folded,
+        which is exactly equivalent to the two-stage ``conv_qk`` (see
+        :meth:`fold_decode_conv`) and halves the number of grouped-conv launches
+        in the extend path. Falls back to the real two stages otherwise, so an
+        unfolded module -- a CPU unit test -- still exercises the reference.
+        """
+        if self._decode_conv_folded:
+            return F.conv1d(
+                padded,
+                self.fold_conv1d_weight,
+                self.decode_conv_bias.reshape(-1),
+                groups=self.decode_conv_groups,
+            )
         return self.conv_qk(padded)
 
     # ----- forward modes ---------------------------------------------------
