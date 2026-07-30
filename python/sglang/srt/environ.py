@@ -864,6 +864,17 @@ class Envs:
     # replica's rows instead of just this one's.
     SGLANG_OPT_ZAYA_GLOBAL_RESIDUAL = EnvBool(False)
 
+    # ZAYA1: run the prefill CCA conv as one varlen Triton kernel pair instead of
+    # the per-request host loop in cca_extend. The loop issues O(batch) launches
+    # per layer and reads CPU sequence lengths, which is also what blocks the
+    # prefill CUDA graph; the fused path is driven entirely by device tensors.
+    SGLANG_OPT_ZAYA_FUSED_CCA_PREFILL = EnvBool(False)
+    # ZAYA1: fold the decode conv's grouped matmul into the window build instead
+    # of materializing the [T, C, taps] window for a separate batched GEMM. This
+    # one is launch-neutral by construction (see the kernel module) -- it is here
+    # to be measured, not because it is expected to win.
+    SGLANG_OPT_ZAYA_FUSED_CCA_DECODE = EnvBool(False)
+
     # Unified Radix Tree
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
     # Registered TreeCore backend serving the unified radix cache.

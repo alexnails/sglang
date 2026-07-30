@@ -1604,5 +1604,361 @@ class TestZayaPartialGatherFoldsTheAttnReduce(CustomTestCase):
         )
 
 
+def _reference_extend_conv(
+    qk: torch.Tensor,
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    conv_state: torch.Tensor,
+    prev_hs_state: torch.Tensor,
+    seq_lens: List[int],
+    slot_ids: List[int],
+    has_prefix: List[bool],
+    total_padding: int,
+    groups: int,
+):
+    """Per-request torch reference for the fused prefill conv.
+
+    Deliberately the naive formulation -- one ``F.conv1d`` per request with an
+    explicitly built left pad -- rather than a copy of ``cca_extend``, so the two
+    agree only if the varlen indexing is right.
+    """
+    qk_out = torch.empty_like(qk)
+    v2_out = torch.empty_like(hidden_states)
+    new_conv_state = conv_state.clone()
+    new_prev_hs = prev_hs_state.clone()
+
+    start = 0
+    for i, seq_len in enumerate(seq_lens):
+        end = start + seq_len
+        slot = slot_ids[i]
+        cur = qk[start:end].transpose(0, 1).unsqueeze(0)  # [1, C, S]
+        if has_prefix[i]:
+            left = conv_state[slot].unsqueeze(0).to(cur.dtype)
+        else:
+            left = cur.new_zeros((1, cur.shape[1], total_padding))
+        padded = torch.cat([left, cur], dim=-1)
+        out = torch.nn.functional.conv1d(padded, weight, bias, groups=groups)
+        qk_out[start:end] = out.squeeze(0).transpose(0, 1)
+        new_conv_state[slot] = (
+            padded[..., -total_padding:].squeeze(0).to(conv_state.dtype)
+        )
+
+        hs_cur = hidden_states[start:end]
+        if has_prefix[i]:
+            first = prev_hs_state[slot].squeeze(-1).to(hs_cur.dtype).unsqueeze(0)
+        else:
+            first = hs_cur.new_zeros((1, hs_cur.shape[-1]))
+        v2_out[start:end] = torch.cat([first, hs_cur[:-1]], dim=0)
+        new_prev_hs[slot] = hs_cur[-1].unsqueeze(-1).to(prev_hs_state.dtype)
+        start = end
+
+    return qk_out, v2_out, new_conv_state, new_prev_hs
+
+
+class TestCCAFusedPrefillConv(CustomTestCase):
+    """Fused varlen prefill conv vs the per-request torch reference.
+
+    The fused kernel resolves each token's request, start offset, pool slot and
+    prefix flag from device tensors instead of a host loop. Every one of those is a
+    silent-corruption path: a token attributed to the wrong request reads another
+    request's conv history, and nothing downstream notices.
+    """
+
+    GROUPS = 3
+    CG = 16  # tl.dot needs a tile at least 16 wide
+    HIDDEN = 8
+    TOTAL_PADDING = 2
+
+    def _inputs(self, seq_lens: List[int], has_prefix: List[bool], seed: int = 0):
+        torch.manual_seed(seed)
+        channels = self.GROUPS * self.CG
+        taps = self.TOTAL_PADDING + 1
+        total = sum(seq_lens)
+        num_slots = len(seq_lens) + 2
+        dev = "cuda"
+        dt = torch.bfloat16
+        return dict(
+            qk=torch.randn(total, channels, device=dev, dtype=dt),
+            hidden_states=torch.randn(total, self.HIDDEN, device=dev, dtype=dt),
+            weight=torch.randn(channels, self.CG, taps, device=dev, dtype=dt) * 0.1,
+            bias=torch.randn(channels, device=dev, dtype=dt) * 0.1,
+            conv_state=torch.randn(
+                num_slots, channels, self.TOTAL_PADDING, device=dev, dtype=dt
+            ),
+            prev_hs_state=torch.randn(num_slots, self.HIDDEN, 1, device=dev, dtype=dt),
+            seq_lens=seq_lens,
+            has_prefix=has_prefix,
+        )
+
+    def _run(self, seq_lens, has_prefix, slot_ids=None, seed=0):
+        from sglang.kernels.ops.attention import cca_conv1d
+
+        args = self._inputs(seq_lens, has_prefix, seed)
+        slot_ids = slot_ids or list(range(len(seq_lens)))
+        offsets = [0]
+        for s_len in seq_lens:
+            offsets.append(offsets[-1] + s_len)
+        cu = torch.tensor(offsets, dtype=torch.int32, device="cuda")
+        slots = torch.tensor(slot_ids, dtype=torch.int64, device="cuda")
+        prefix = torch.tensor(has_prefix, dtype=torch.bool, device="cuda")
+
+        ref_qk, ref_v2, ref_cs, ref_ph = _reference_extend_conv(
+            args["qk"],
+            args["hidden_states"],
+            args["weight"],
+            args["bias"],
+            args["conv_state"],
+            args["prev_hs_state"],
+            seq_lens,
+            slot_ids,
+            has_prefix,
+            self.TOTAL_PADDING,
+            self.GROUPS,
+        )
+
+        conv_state = args["conv_state"].clone()
+        prev_hs_state = args["prev_hs_state"].clone()
+        self.assertTrue(
+            cca_conv1d.covered(
+                args["qk"],
+                args["hidden_states"],
+                args["weight"],
+                args["bias"],
+                conv_state,
+                prev_hs_state,
+                cu,
+                prefix,
+                slots,
+                self.TOTAL_PADDING,
+                self.GROUPS,
+            )
+        )
+        got_qk, got_v2 = cca_conv1d.cca_conv1d_fn(
+            args["qk"],
+            args["hidden_states"],
+            args["weight"],
+            args["bias"],
+            conv_state,
+            prev_hs_state,
+            cu,
+            prefix,
+            slots,
+            self.TOTAL_PADDING,
+            self.GROUPS,
+        )
+        return (got_qk, got_v2, conv_state, prev_hs_state), (
+            ref_qk,
+            ref_v2,
+            ref_cs,
+            ref_ph,
+        )
+
+    def _assert_matches(self, got, ref):
+        names = ("qk_out", "v2_input", "conv_state", "prev_hs_state")
+        for name, g, r in zip(names, got, ref):
+            torch.testing.assert_close(
+                g.float(), r.float(), rtol=2e-2, atol=2e-2, msg=f"{name} mismatch"
+            )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused conv is a GPU kernel")
+    def test_fresh_prefill_multi_request(self):
+        got, ref = self._run([5, 3, 8], [False, False, False])
+        self._assert_matches(got, ref)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused conv is a GPU kernel")
+    def test_resumed_prefix_reads_carried_state(self):
+        """Mixed prefix flags: the halo taps must come from each slot's history."""
+        got, ref = self._run([6, 4, 7], [True, False, True])
+        self._assert_matches(got, ref)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused conv is a GPU kernel")
+    def test_chunk_shorter_than_the_conv_window(self):
+        """A 1-token chunk with a prefix: the outgoing window is mostly carried.
+
+        This is the branch where the new conv_state is not fully determined by the
+        current chunk, so the tail write has to shift the incoming history rather
+        than just copy the last tokens.
+        """
+        got, ref = self._run([1, 2, 1], [True, True, True])
+        self._assert_matches(got, ref)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused conv is a GPU kernel")
+    def test_non_identity_slot_mapping(self):
+        """Slots are pool indices, not request indices, and need not be ordered."""
+        got, ref = self._run([4, 4, 4], [True, True, True], slot_ids=[3, 0, 2])
+        self._assert_matches(got, ref)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused conv is a GPU kernel")
+    def test_request_longer_than_one_token_tile(self):
+        """Tokens are tiled in blocks of 64; a request must span tiles correctly."""
+        got, ref = self._run([200, 17], [True, False])
+        self._assert_matches(got, ref)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused conv is a GPU kernel")
+    def test_single_request(self):
+        """One request exercises the degenerate binary search (a single step)."""
+        got, ref = self._run([37], [True])
+        self._assert_matches(got, ref)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused conv is a GPU kernel")
+    def test_covered_rejects_the_unfolded_two_stage_conv(self):
+        """Without the folded weight there is nothing for this kernel to apply."""
+        from sglang.kernels.ops.attention import cca_conv1d
+
+        args = self._inputs([4], [False])
+        cu = torch.tensor([0, 4], dtype=torch.int32, device="cuda")
+        self.assertFalse(
+            cca_conv1d.covered(
+                args["qk"],
+                args["hidden_states"],
+                None,
+                args["bias"],
+                args["conv_state"],
+                args["prev_hs_state"],
+                cu,
+                torch.zeros(1, dtype=torch.bool, device="cuda"),
+                torch.zeros(1, dtype=torch.int64, device="cuda"),
+                self.TOTAL_PADDING,
+                self.GROUPS,
+            )
+        )
+
+
+class TestCCAFusedDecodeConv(CustomTestCase):
+    """Fused decode conv (window + shift + matmul) vs the existing two-launch path.
+
+    The reference here is the unfused chain the model runs today, so this pins the
+    claim that folding the grouped matmul into the window build changes nothing
+    numerically -- and that the in-place history shift still reads each tap before
+    it is overwritten.
+    """
+
+    GROUPS = 3
+    CG = 16
+    HIDDEN = 8
+    TOTAL_PADDING = 2
+
+    def _run(self, num_tokens: int, slot_ids: List[int]):
+        from sglang.kernels.ops.attention import cca_conv1d_update
+
+        torch.manual_seed(0)
+        channels = self.GROUPS * self.CG
+        taps = self.TOTAL_PADDING + 1
+        dev, dt = "cuda", torch.bfloat16
+        num_slots = max(s for s in slot_ids) + 2
+
+        qk = torch.randn(num_tokens, channels, device=dev, dtype=dt)
+        hs = torch.randn(num_tokens, self.HIDDEN, device=dev, dtype=dt)
+        weight = (
+            torch.randn(self.GROUPS, self.CG, self.CG * taps, device=dev, dtype=dt)
+            * 0.1
+        )
+        bias = torch.randn(self.GROUPS, self.CG, device=dev, dtype=dt) * 0.1
+        conv_state = torch.randn(
+            num_slots, channels, self.TOTAL_PADDING, device=dev, dtype=dt
+        )
+        prev_hs = torch.randn(num_slots, self.HIDDEN, 1, device=dev, dtype=dt)
+        slots = torch.tensor(slot_ids, dtype=torch.int64, device=dev)
+
+        # Reference: build the window, apply the einsum, shift the pools.
+        live = [s for s in slot_ids if s >= 0]
+        ref_cs, ref_ph = conv_state.clone(), prev_hs.clone()
+        left = conv_state.index_select(0, slots.clamp(min=0))
+        window = torch.cat([left, qk.unsqueeze(-1)], dim=-1)
+        grouped = window.reshape(num_tokens, self.GROUPS, -1)
+        ref_qk = (
+            torch.einsum("tgk,gok->tgo", grouped.float(), weight.float()) + bias.float()
+        ).reshape(num_tokens, -1)
+        ref_prev = prev_hs.index_select(0, slots.clamp(min=0)).squeeze(-1)
+        for i, s in enumerate(slot_ids):
+            if s >= 0:
+                ref_cs[s] = window[i, :, -self.TOTAL_PADDING :]
+                ref_ph[s] = hs[i].unsqueeze(-1)
+
+        got_cs, got_ph = conv_state.clone(), prev_hs.clone()
+        self.assertTrue(
+            cca_conv1d_update.covered(
+                qk,
+                hs,
+                weight,
+                bias,
+                got_cs,
+                got_ph,
+                slots,
+                self.TOTAL_PADDING,
+                self.GROUPS,
+            )
+        )
+        got_qk, got_prev = cca_conv1d_update.cca_conv1d_update(
+            qk,
+            hs,
+            weight,
+            bias,
+            got_cs,
+            got_ph,
+            slots,
+            self.TOTAL_PADDING,
+            self.GROUPS,
+        )
+        torch.testing.assert_close(got_qk.float(), ref_qk.float(), rtol=2e-2, atol=2e-2)
+        if live:
+            idx = torch.tensor(live, device=dev)
+            torch.testing.assert_close(
+                got_cs.index_select(0, idx).float(),
+                ref_cs.index_select(0, idx).float(),
+            )
+            torch.testing.assert_close(
+                got_ph.index_select(0, idx).float(),
+                ref_ph.index_select(0, idx).float(),
+            )
+        return got_prev, ref_prev
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused conv is a GPU kernel")
+    def test_matches_the_unfused_chain(self):
+        got, ref = self._run(24, list(range(24)))
+        torch.testing.assert_close(got.float(), ref.float())
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused conv is a GPU kernel")
+    def test_spans_multiple_token_tiles(self):
+        got, ref = self._run(80, list(range(80)))
+        torch.testing.assert_close(got.float(), ref.float())
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused conv is a GPU kernel")
+    def test_padded_rows_leave_the_pool_untouched(self):
+        """Batch padding writes negative slot ids; those rows must touch no state."""
+        from sglang.kernels.ops.attention import cca_conv1d_update
+
+        torch.manual_seed(1)
+        channels = self.GROUPS * self.CG
+        taps = self.TOTAL_PADDING + 1
+        dev, dt = "cuda", torch.bfloat16
+        qk = torch.randn(4, channels, device=dev, dtype=dt)
+        hs = torch.randn(4, self.HIDDEN, device=dev, dtype=dt)
+        weight = (
+            torch.randn(self.GROUPS, self.CG, self.CG * taps, device=dev, dtype=dt)
+            * 0.1
+        )
+        bias = torch.randn(self.GROUPS, self.CG, device=dev, dtype=dt) * 0.1
+        conv_state = torch.randn(3, channels, self.TOTAL_PADDING, device=dev, dtype=dt)
+        prev_hs = torch.randn(3, self.HIDDEN, 1, device=dev, dtype=dt)
+        before_cs, before_ph = conv_state.clone(), prev_hs.clone()
+        slots = torch.tensor([-1, -1, -1, -1], dtype=torch.int64, device=dev)
+
+        cca_conv1d_update.cca_conv1d_update(
+            qk,
+            hs,
+            weight,
+            bias,
+            conv_state,
+            prev_hs,
+            slots,
+            self.TOTAL_PADDING,
+            self.GROUPS,
+        )
+        self.assertTrue(torch.equal(conv_state, before_cs))
+        self.assertTrue(torch.equal(prev_hs, before_ph))
+
+
 if __name__ == "__main__":
     unittest.main()

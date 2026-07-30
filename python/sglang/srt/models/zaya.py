@@ -45,7 +45,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Iterable
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import msgspec
 import torch
@@ -218,7 +218,7 @@ def _apply_norm_with_fp32_residual(
 def cca_extend(
     qk: torch.Tensor,
     hidden_states: torch.Tensor,
-    conv_qk: nn.Module,
+    conv_fn: Callable[[torch.Tensor], torch.Tensor],
     conv_state: torch.Tensor,
     prev_hs_state: torch.Tensor,
     slot_ids: List[int],
@@ -228,15 +228,22 @@ def cca_extend(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Prefill / extend conv-state step (v1, pure torch).
 
-    Walks each request in the batch, applies ``conv_qk`` with the request's own
+    Walks each request in the batch, applies ``conv_fn`` with the request's own
     initial state (zeros on a fresh first chunk, the cached ``conv_state`` slot
     otherwise), writes the updated ``conv_state`` / ``prev_hs_state`` back, and
     returns the concatenated ``(qk_out, v2_input)`` in the original token layout.
 
+    ``conv_fn`` maps ``[N, C, S + total_padding] -> [N, C, S]``; callers pass
+    :meth:`CCA._conv_qk_run` so the folded single grouped conv is used when it is
+    available.
+
     ``slot_ids`` is the host mirror of the per-request MambaPool slot indices and
     ``has_prefix[i]`` is ``True`` when request ``i`` resumes a cached prefix.
 
-    The Triton swap (:func:`cca_conv1d_fn`) removes this per-request loop.
+    The launch count here grows with the batch and the loop trip count comes from
+    ``extend_seq_lens_cpu``, which is also what blocks the prefill CUDA graph;
+    :func:`cca_conv1d_fn <sglang.kernels.ops.attention.cca_conv1d.cca_conv1d_fn>`
+    is the device-driven replacement.
     """
     dtype = hidden_states.dtype
     if total_padding is None:
@@ -267,7 +274,7 @@ def cca_extend(
             ].transpose(0, 1)
             start = end
 
-        packed_out = conv_qk(packed)  # [1, C, offsets_in[-1] - pad]
+        packed_out = conv_fn(packed)  # [1, C, offsets_in[-1] - pad]
 
         start = 0
         for i, s in enumerate(seq_lens):
@@ -298,7 +305,7 @@ def cca_extend(
                 left_pad = qk_cur.new_zeros((1, in_out_ch, total_padding))
             padded = torch.cat([left_pad, qk_cur], dim=-1)
 
-            out = conv_qk(padded)  # [1, C, S_cur]
+            out = conv_fn(padded)  # [1, C, S_cur]
             qk_out[start:end] = out.squeeze(0).transpose(0, 1)
 
             new_state = padded[..., -total_padding:]
@@ -347,7 +354,32 @@ def cca_decode(
     if total_padding is None:
         total_padding = conv_state.shape[-1]
 
+    from sglang.kernels.ops.attention import cca_conv1d_update as _fused_update
     from sglang.kernels.ops.attention import cca_state_step as _state_step
+
+    if envs.SGLANG_OPT_ZAYA_FUSED_CCA_DECODE.get() and _fused_update.covered(
+        qk,
+        hidden_states,
+        decode_conv_weight,
+        decode_conv_bias,
+        conv_state,
+        prev_hs_state,
+        mamba_indices,
+        total_padding,
+        decode_conv_groups or 0,
+    ):
+        # One kernel for the window, the history shift and the grouped matmul.
+        return _fused_update.cca_conv1d_update(
+            qk,
+            hidden_states,
+            decode_conv_weight,
+            decode_conv_bias,
+            conv_state,
+            prev_hs_state,
+            mamba_indices,
+            total_padding,
+            decode_conv_groups,
+        )
 
     if _state_step.covered(
         qk, hidden_states, conv_state, prev_hs_state, mamba_indices, total_padding
@@ -399,20 +431,19 @@ def cca_decode(
 
 
 def cca_conv1d_fn(*args, **kwargs):
-    raise NotImplementedError(
-        "Fused CCA prefill conv-with-state kernel not implemented yet; "
-        "the model uses cca_extend (v1 torch) in the meantime."
-    )
+    """Fused varlen prefill conv-with-state; see the kernel module for the contract."""
+    from sglang.kernels.ops.attention.cca_conv1d import cca_conv1d_fn as _fused
+
+    return _fused(*args, **kwargs)
 
 
 def cca_conv1d_update(*args, **kwargs):
-    raise NotImplementedError(
-        "Fused CCA decode conv-with-state kernel not implemented yet; "
-        "the model uses cca_decode (v1 torch) in the meantime. The state "
-        "plumbing around the conv is already fused -- see "
-        "sglang.kernels.ops.attention.cca_state_step -- so what remains here is "
-        "folding the grouped matmul itself into that kernel."
+    """Fused decode conv-with-state (window + grouped matmul in one kernel)."""
+    from sglang.kernels.ops.attention.cca_conv1d_update import (
+        cca_conv1d_update as _fused,
     )
+
+    return _fused(*args, **kwargs)
 
 
 def _cca_decode_conv(
@@ -957,6 +988,73 @@ class CCA(nn.Module):
         )
         self._decode_conv_folded = True
 
+    def _run_extend_conv(
+        self,
+        qk: torch.Tensor,
+        hidden_states: torch.Tensor,
+        meta,
+        conv_state: torch.Tensor,
+        prev_hs_state: torch.Tensor,
+        extend_seq_lens_cpu: List[int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the prefill conv-with-state, preferring the fused varlen kernel.
+
+        The fused path needs the folded single grouped weight and the backend's
+        device-side request metadata; when either is missing it falls back to the
+        reference host loop in :func:`cca_extend`.
+        """
+        from sglang.kernels.ops.attention import cca_conv1d as _conv1d
+
+        if envs.SGLANG_OPT_ZAYA_FUSED_CCA_PREFILL.get():
+            bias = self.decode_conv_bias.reshape(-1)
+            weight = self.fold_conv1d_weight if self._decode_conv_folded else None
+            if _conv1d.covered(
+                qk,
+                hidden_states,
+                weight,
+                bias,
+                conv_state,
+                prev_hs_state,
+                meta.query_start_loc,
+                meta.has_initial_state,
+                meta.cache_indices,
+                self.total_padding,
+                self.decode_conv_groups,
+            ):
+                _log_dataflow_decision(
+                    f"cca prefill: fused varlen kernel, {qk.shape[0]} tokens over "
+                    f"{meta.query_start_loc.shape[0] - 1} requests"
+                )
+                return _conv1d.cca_conv1d_fn(
+                    qk,
+                    hidden_states,
+                    weight,
+                    bias,
+                    conv_state,
+                    prev_hs_state,
+                    meta.query_start_loc,
+                    meta.has_initial_state,
+                    meta.cache_indices,
+                    self.total_padding,
+                    self.decode_conv_groups,
+                )
+            _log_dataflow_decision(
+                "cca prefill: fused kernel declined by covered(), running the "
+                f"per-request host loop (folded={self._decode_conv_folded})"
+            )
+
+        return cca_extend(
+            qk,
+            hidden_states,
+            self._conv_qk_run,
+            conv_state,
+            prev_hs_state,
+            meta.slot_ids_cpu,
+            meta.has_prefix_cpu,
+            extend_seq_lens_cpu,
+            self.total_padding,
+        )
+
     def _conv_qk_run(self, padded: torch.Tensor) -> torch.Tensor:
         """Run the conv on ``[N, C, S + total_padding]`` -> ``[N, C, S]``.
 
@@ -1149,16 +1247,13 @@ class CCA(nn.Module):
                 decode_conv_groups=self.decode_conv_groups,
             )
         else:
-            qk_out, v2_input = cca_extend(
+            qk_out, v2_input = self._run_extend_conv(
                 qk,
                 hidden_states,
-                self.conv_qk,
+                meta,
                 conv_state,
                 prev_hs_state,
-                meta.slot_ids_cpu,
-                meta.has_prefix_cpu,
                 forward_batch.extend_seq_lens_cpu,
-                self.total_padding,
             )
 
         query_conv = qk_out[:, : self.latent_q_dim].view(
