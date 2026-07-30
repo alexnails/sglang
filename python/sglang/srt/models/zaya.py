@@ -708,6 +708,10 @@ class CCA(nn.Module):
         # graph capture and bake stale constants into the replayed graph.
         self._decode_conv_folded = False
 
+        # Tri-state cache for ``_fused_prefill_conv_allowed``; None == not yet
+        # resolved (it reads server args, which do not exist this early).
+        self._fused_prefill_conv_ok: Optional[bool] = None
+
         # Per-K-head learnable temperature scalar (per-rank slice).
         self.temp = nn.Parameter(torch.zeros(self.num_k_heads))
 
@@ -988,6 +992,35 @@ class CCA(nn.Module):
         )
         self._decode_conv_folded = True
 
+    def _fused_prefill_conv_allowed(self) -> bool:
+        """Whether the fused varlen prefill conv may run, resolved once.
+
+        The fused conv and the prefill CUDA graph are each correct alone and
+        corrupt together: under capture the fused path yields all-zero logits,
+        meaning the conv state it writes is wrong, and the cause is not yet
+        understood. The graph is the larger win and works with the reference host
+        loop, so it takes precedence.
+
+        Resolved lazily rather than in ``__init__`` because the server args it
+        reads do not exist that early, and reached only once the env flag is on so
+        a module built outside a server (a CPU unit test) never touches them.
+        """
+        if self._fused_prefill_conv_ok is None:
+            from sglang.srt.model_executor.cuda_graph_config import Backend
+
+            prefill_graph_on = (
+                get_global_server_args().cuda_graph_config.prefill.backend
+                != Backend.DISABLED
+            )
+            self._fused_prefill_conv_ok = not prefill_graph_on
+            if prefill_graph_on:
+                _log_dataflow_decision(
+                    "cca prefill: fused kernel disabled because the prefill CUDA "
+                    "graph is enabled; the two are not yet compatible (the fused "
+                    "conv under capture produces zero logits)"
+                )
+        return self._fused_prefill_conv_ok
+
     def _run_extend_conv(
         self,
         qk: torch.Tensor,
@@ -1005,7 +1038,10 @@ class CCA(nn.Module):
         """
         from sglang.kernels.ops.attention import cca_conv1d as _conv1d
 
-        if envs.SGLANG_OPT_ZAYA_FUSED_CCA_PREFILL.get():
+        if (
+            envs.SGLANG_OPT_ZAYA_FUSED_CCA_PREFILL.get()
+            and self._fused_prefill_conv_allowed()
+        ):
             bias = self.decode_conv_bias.reshape(-1)
             weight = self.fold_conv1d_weight if self._decode_conv_folded else None
             if _conv1d.covered(

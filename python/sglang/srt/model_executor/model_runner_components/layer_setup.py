@@ -58,12 +58,15 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
                 # Mamba layer with split op support - store the layer itself
                 attn_layer = layer
 
-        if attn_layer is not None:
-            attention_layers.append(attn_layer)
-            mha_companion_layers.append(mha_companion_layer)
-        elif hasattr(layer, "mixer"):
-            attention_layers.append(None)
-            mha_companion_layers.append(None)
+        # Always append, so both lists stay indexable by layer id -- which is
+        # what the consumers require: ``radix_attention`` reads
+        # ``context.attention_layers[layer_id]``. Layers that hold no attention
+        # at all (a MoE-only layer in an alternating stack, a mamba mixer)
+        # contribute a None placeholder that no attention layer's forward ever
+        # reads. Appending only when attention was found would shorten the list
+        # and silently shift every entry past the first such layer.
+        attention_layers.append(attn_layer)
+        mha_companion_layers.append(mha_companion_layer)
 
         moe_block = None
         moe_fusion = None
@@ -78,6 +81,10 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
         if hasattr(layer, "moe") and hasattr(layer.moe, "experts"):
             moe_block = layer.moe.experts
             moe_fusion = layer.moe
+        # ZAYA1 names its MoE mixer zaya_block to match the HF checkpoint keys.
+        if hasattr(layer, "zaya_block") and hasattr(layer.zaya_block, "experts"):
+            moe_block = layer.zaya_block.experts
+            moe_fusion = layer.zaya_block
         # For NemotronH MoE layers using 'mixer' attribute
         if hasattr(layer, "mixer") and hasattr(layer.mixer, "experts"):
             moe_block = layer.mixer.experts

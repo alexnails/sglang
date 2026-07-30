@@ -100,6 +100,7 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
         self._has_prefix_cpu: Optional[List[bool]] = None
         self._cache_indices: Optional[torch.Tensor] = None
         self._cache_indices_buf: Optional[torch.Tensor] = None
+        self._has_initial_state_buf: Optional[torch.Tensor] = None
 
     def _reset_step_state(self):
         self._has_initial_state = None
@@ -107,10 +108,17 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
         self._has_prefix_cpu = None
 
     def _alloc_cache_indices_buf(self, max_bs: int):
-        # Persistent int64 index buffer, refilled in place per step so the
-        # captured (cuda or cpu) graph reads a stable address.
+        # Persistent index buffers, refilled in place per step so the captured
+        # (cuda or cpu) graph reads a stable address. ``_has_initial_state_buf``
+        # matters once the PREFILL graph is captured: a fused extend conv reads
+        # the prefix mask from inside the graph, and the eager path derives it
+        # freshly each step (``extend_prefix_lens > 0``), so without a stable
+        # home the graph would bake the address of a per-step temporary.
         self._cache_indices_buf = torch.empty(
             max_bs, dtype=torch.int64, device=self.device
+        )
+        self._has_initial_state_buf = torch.empty(
+            max_bs, dtype=torch.bool, device=self.device
         )
 
     def _refresh_cache_indices(self):
@@ -149,6 +157,21 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
             # backend's own mamba_cache_indices.
             self._cache_indices = idx.to(torch.long).clamp(min=0)
 
+    def _resolve_has_initial_state(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        """Per-request "resumes a cached prefix" mask, in a graph-stable buffer.
+
+        Refills the persistent buffer in place when it is allocated and wide
+        enough and hands out a view; otherwise (eager, or a batch beyond the
+        buffer) a fresh mask is fine.
+        """
+        mask = forward_batch.extend_prefix_lens > 0
+        buf = self._has_initial_state_buf
+        if buf is None or mask.shape[0] > buf.shape[0]:
+            return mask
+        n = mask.shape[0]
+        buf[:n].copy_(mask)
+        return buf[:n]
+
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         super().init_cuda_graph_state(max_bs, max_num_tokens)
         self._alloc_cache_indices_buf(max_bs)
@@ -169,7 +192,7 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
             and not mode.is_target_verify()
             and not mode.is_draft_extend_v2()
         ):
-            self._has_initial_state = forward_batch.extend_prefix_lens > 0
+            self._has_initial_state = self._resolve_has_initial_state(forward_batch)
             if self._cache_indices is not None:
                 self._slot_ids_cpu = self._cache_indices.tolist()
                 self._has_prefix_cpu = [

@@ -64,6 +64,7 @@ class MambaAttnBackendBase(AttentionBackend):
         self.retrieve_parent_token_list = []
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
+        self.cached_cuda_graph_extend_query_start_loc: Optional[torch.Tensor] = None
         self.conv_states_shape: tuple[int, int] = None
 
     def _translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
@@ -185,14 +186,35 @@ class MambaAttnBackendBase(AttentionBackend):
                     if retrieve_next_token is not None:
                         retrieve_parent_token = torch.empty_like(retrieve_next_token)
             else:
-                query_start_loc = torch.empty(
-                    (bs + 1,), dtype=torch.int32, device=self.device
-                )
+                # Refill the persistent buffer in place when it is allocated and
+                # wide enough, so a captured prefill graph reads an address this
+                # pre-replay hook keeps current; fall back to a temporary when
+                # there is no graph (eager) or the batch outgrows the buffer.
+                extend_buf = self.cached_cuda_graph_extend_query_start_loc
+                if extend_buf is not None and bs + 1 <= extend_buf.shape[0]:
+                    query_start_loc = extend_buf[: bs + 1]
+                else:
+                    query_start_loc = torch.empty(
+                        (bs + 1,), dtype=torch.int32, device=self.device
+                    )
                 query_start_loc[:bs] = forward_batch.extend_start_loc
                 query_start_loc[bs] = (
                     forward_batch.extend_start_loc[-1]
                     + forward_batch.extend_seq_lens[-1]
                 )
+                if extend_buf is not None and query_start_loc.shape[0] < (
+                    tail := extend_buf.shape[0]
+                ):
+                    # A captured prefill graph bakes its grid from the batch size
+                    # seen at CAPTURE, which is larger than most replays. Give
+                    # every request slot past this batch a zero length by
+                    # flooding the tail with the final offset, so a kernel that
+                    # walks the captured request count sees start == end and does
+                    # nothing for them. Left stale, those slots would still hold
+                    # capture-time offsets and (valid, clamped) pool slot ids, and
+                    # a per-request state write would scribble on another
+                    # request's conv state.
+                    extend_buf[bs + 1 : tail] = query_start_loc[bs]
                 if (
                     forward_batch.mamba_track_mask is not None
                     and forward_batch.mamba_track_mask.any()
@@ -452,6 +474,13 @@ class MambaAttnBackendBase(AttentionBackend):
             step=draft_token_num,
             dtype=torch.int32,
             device=self.device,
+        )
+        # Extend needs a stable address too once the PREFILL graph is captured:
+        # the cu-seqlens are per-batch data (not an arange like decode's), and a
+        # kernel reading them from inside a captured graph would otherwise bake
+        # the address of a per-step temporary and read freed memory at replay.
+        self.cached_cuda_graph_extend_query_start_loc = torch.empty(
+            (max_bs + 1,), dtype=torch.int32, device=self.device
         )
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
