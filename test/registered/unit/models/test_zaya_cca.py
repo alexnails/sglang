@@ -1398,5 +1398,211 @@ class TestZayaCCATensorParallel(CustomTestCase):
             )
 
 
+@contextmanager
+def _dp_layout(sizes: List[int], rank: int, is_max_len: bool):
+    """Install ``sizes`` as the per-rank padded token counts, viewed from ``rank``.
+
+    Mirrors what ``prepare_mlp_sync_batch`` publishes for a real forward: the DP
+    rank globals plus the process-wide DP buffer metadata.
+    """
+    from sglang.srt.layers import dp_attention as dpa
+
+    saved = (dpa._ATTN_DP_RANK, dpa._ATTN_DP_SIZE)
+    saved_buffer = (
+        dpa._DpGatheredBufferWrapper._global_dp_buffer_len,
+        dpa._DpGatheredBufferWrapper._local_dp_buffer_len,
+        dpa._DpGatheredBufferWrapper._dp_max_padding,
+        dpa._DpGatheredBufferWrapper._global_num_tokens,
+    )
+    dpa._ATTN_DP_RANK, dpa._ATTN_DP_SIZE = rank, len(sizes)
+    dpa.set_dp_buffer_len(sum(sizes), sizes[rank], is_max_len, list(sizes))
+    try:
+        yield
+    finally:
+        dpa._ATTN_DP_RANK, dpa._ATTN_DP_SIZE = saved
+        dpa.set_dp_buffer_len(*saved_buffer)
+
+
+class TestZayaGlobalResidualLayout(CustomTestCase):
+    """Row arithmetic for the global-residual DP dataflow.
+
+    On that dataflow the residual stream lives in the global DP layout and each
+    attention layer slices its own rows back out of it, so the CPU offsets in
+    ``GlobalResidualLayout`` and the device-side offsets that ``dp_gather_partial``
+    writes at (``get_dp_local_info``, a cumsum over ``global_num_tokens_gpu``) must
+    describe the same rows. Nothing at runtime cross-checks them: if they drift,
+    attention silently reads another replica's tokens.
+    """
+
+    def _layout(self, sizes: List[int], rank: int, is_max_len: bool):
+        from unittest import mock
+
+        from sglang.srt.environ import envs
+        from sglang.srt.models import zaya
+
+        # The parallel-layout precondition is orthogonal to the arithmetic under
+        # test and needs a live runtime context, so stub it out.
+        with _dp_layout(sizes, rank, is_max_len), mock.patch.object(
+            zaya, "dp_gather_required", return_value=True
+        ), envs.SGLANG_OPT_ZAYA_GLOBAL_RESIDUAL.override(True):
+            return zaya.global_residual_layout()
+
+    def _device_slice(self, sizes: List[int], rank: int):
+        from sglang.srt.layers.dp_attention import get_dp_local_info
+
+        forward_batch = SimpleNamespace(
+            dp_local_start_pos=None,
+            dp_local_num_tokens=None,
+            global_num_tokens_gpu=torch.tensor(sizes, dtype=torch.int32),
+        )
+        with _dp_layout(sizes, rank, is_max_len=False):
+            start, length = get_dp_local_info(forward_batch)
+        return int(start), int(length)
+
+    def test_offsets_match_the_gather_destination(self):
+        """SUM_LEN: unequal per-rank counts, so a wrong cumsum shows up as a shift."""
+        sizes = [3, 7, 1, 5]
+        for rank in range(len(sizes)):
+            layout = self._layout(sizes, rank, is_max_len=False)
+            self.assertEqual(
+                (layout.local_start, layout.local_len),
+                self._device_slice(sizes, rank),
+                f"CPU layout disagrees with get_dp_local_info at rank {rank}",
+            )
+
+    def test_offsets_match_under_max_len_padding(self):
+        """MAX_LEN: every rank padded to the same width (the cuda-graph layout)."""
+        sizes = [8, 8, 8, 8]
+        for rank in range(len(sizes)):
+            layout = self._layout(sizes, rank, is_max_len=True)
+            self.assertEqual(
+                (layout.local_start, layout.local_len),
+                (rank * 8, 8),
+            )
+
+    def test_slices_tile_the_buffer_without_gaps_or_overlap(self):
+        """Every row of the global buffer belongs to exactly one replica.
+
+        The MoE layers run over the whole buffer, so a gap would feed the experts
+        uninitialized rows and an overlap would double-count a token.
+        """
+        sizes = [3, 7, 1, 5]
+        covered = torch.zeros(sum(sizes), dtype=torch.int32)
+        for rank in range(len(sizes)):
+            layout = self._layout(sizes, rank, is_max_len=False)
+            covered[layout.local_start : layout.local_start + layout.local_len] += 1
+        self.assertTrue(torch.equal(covered, torch.ones_like(covered)))
+
+    def test_idle_replica_gets_an_empty_slice(self):
+        """A replica with no requests must slice to zero rows, not to its neighbour's.
+
+        Its attention still runs (and returns early on the empty batch) and it must
+        still join the gather, so the layout has to survive a zero-width block.
+        """
+        sizes = [4, 0, 4]
+        layout = self._layout(sizes, 1, is_max_len=False)
+        self.assertEqual((layout.local_start, layout.local_len), (4, 0))
+        hidden = torch.arange(8 * 2, dtype=torch.float32).reshape(8, 2)
+        self.assertEqual(layout.local_view(hidden).shape, (0, 2))
+
+    def test_local_view_is_a_contiguous_alias(self):
+        """Attention and the gather both assert contiguity on what they are handed."""
+        layout = self._layout([3, 7, 1, 5], 1, is_max_len=False)
+        hidden = torch.randn(16, 4)
+        view = layout.local_view(hidden)
+        self.assertTrue(view.is_contiguous())
+        self.assertEqual(view.data_ptr(), hidden[3].data_ptr())
+
+    def test_disabled_by_default_without_touching_parallel_state(self):
+        """Flag off must yield the DP-local dataflow, and decide that first.
+
+        The env check has to short-circuit ahead of the parallel-layout probe, or
+        merely importing the model on a machine with no runtime context breaks.
+        """
+        from sglang.srt.models import zaya
+
+        with _dp_layout([3, 7, 1, 5], 0, is_max_len=False):
+            self.assertIsNone(zaya.global_residual_layout())
+
+
+class TestZayaPartialGatherFoldsTheAttnReduce(CustomTestCase):
+    """The algebra that lets one collective replace two.
+
+    The global-residual dataflow drops ``attn_tp_all_reduce`` from the attention
+    layer and gathers the *unreduced* o_proj partials instead: every attention-TP
+    rank of a replica memcpys its partial into the same slot of the global buffer,
+    so the all-reduce that gathers across replicas also sums within them. These
+    cases pin that equivalence, and the failure mode of getting it wrong (using the
+    replicate gather, which takes rank 0's rows and discards the rest).
+    """
+
+    HIDDEN = 4
+
+    def _gather(self, partials: List[List[torch.Tensor]], sizes: List[int], is_partial):
+        """Replay ``_dp_gather_via_all_reduce`` over all ranks on host tensors.
+
+        Each rank zero-fills the buffer and memcpys its own rows into its replica's
+        slot -- only attention-TP rank 0 does so on the replicate gather -- and the
+        all-reduce leaves the sum of those per-rank buffers behind.
+        """
+        from sglang.srt.layers.dp_attention import get_dp_local_info
+
+        total = torch.zeros(sum(sizes), self.HIDDEN)
+        for replica, rank_partials in enumerate(partials):
+            forward_batch = SimpleNamespace(
+                dp_local_start_pos=None,
+                dp_local_num_tokens=None,
+                global_num_tokens_gpu=torch.tensor(sizes, dtype=torch.int32),
+            )
+            with _dp_layout(sizes, replica, is_max_len=False):
+                start, length = get_dp_local_info(forward_batch)
+            for attn_tp_rank, partial in enumerate(rank_partials):
+                if not is_partial and attn_tp_rank != 0:
+                    continue
+                contribution = torch.zeros(sum(sizes), self.HIDDEN)
+                contribution[int(start) : int(start) + int(length)] = partial
+                total = total + contribution
+        return total
+
+    def _partials(self, sizes: List[int], attn_tp_size: int):
+        torch.manual_seed(0)
+        return [
+            [torch.randn(rows, self.HIDDEN) for _ in range(attn_tp_size)]
+            for rows in sizes
+        ]
+
+    def test_partial_gather_equals_reduce_then_replicate_gather(self):
+        sizes = [3, 7, 1, 5]
+        partials = self._partials(sizes, attn_tp_size=2)
+        # Baseline: reduce within the replica, then gather the reduced rows.
+        reduced = [[sum(rank_partials)] for rank_partials in partials]
+        baseline = self._gather(reduced, sizes, is_partial=False)
+        folded = self._gather(partials, sizes, is_partial=True)
+        torch.testing.assert_close(folded, baseline)
+
+    def test_replicate_gather_of_partials_drops_a_rank(self):
+        """Guards the swap this campaign has already made in the other direction.
+
+        ``dp_gather_replicate`` is correct for already-reduced rows and wrong for
+        partials: it keeps attention-TP rank 0's contribution and silently discards
+        every other rank's, which at attn_tp=1 is invisible and at attn_tp=2 is
+        garbage output.
+        """
+        sizes = [3, 7, 1, 5]
+        partials = self._partials(sizes, attn_tp_size=2)
+        folded = self._gather(partials, sizes, is_partial=True)
+        wrong = self._gather(partials, sizes, is_partial=False)
+        self.assertFalse(torch.allclose(folded, wrong))
+
+    def test_single_attn_tp_rank_makes_the_two_gathers_agree(self):
+        """At attn_tp=1 there is nothing to sum, so both gathers must coincide."""
+        sizes = [3, 7, 1, 5]
+        partials = self._partials(sizes, attn_tp_size=1)
+        torch.testing.assert_close(
+            self._gather(partials, sizes, is_partial=True),
+            self._gather(partials, sizes, is_partial=False),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

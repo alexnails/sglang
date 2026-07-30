@@ -47,6 +47,7 @@ import re
 from collections.abc import Iterable
 from typing import List, Optional, Tuple
 
+import msgspec
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -58,10 +59,14 @@ from sglang.srt.distributed import (
     moe_expert_parallel_all_reduce,
     moe_tensor_model_parallel_all_reduce,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
+    dp_gather_partial,
     dp_gather_replicate,
     dp_scatter,
+    get_attention_dp_rank,
+    get_dp_global_num_tokens,
     get_global_dp_buffer,
     get_local_dp_buffer,
     is_dp_attention_enabled,
@@ -1315,6 +1320,7 @@ class ZayaAttention(nn.Module):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        reduce_output: bool = True,
     ) -> torch.Tensor:
         # Idle forward: under DP attention a replica with no requests this step
         # still runs a forward (to join the MoE layers' gather/scatter) with T=0.
@@ -1354,7 +1360,14 @@ class ZayaAttention(nn.Module):
         # o_proj is RowParallel with ``reduce_results=False``; reduce the partial
         # sums across the attention-TP group (equals the global TP group unless
         # DP attention is enabled). A size-1 group makes this a no-op.
-        if self.tp_size > 1:
+        #
+        # ``reduce_output=False`` returns the per-rank partial instead. The
+        # global-residual dataflow uses it to fold this reduction into the DP
+        # gather: ``dp_gather_partial`` has every attention-TP rank memcpy its
+        # partial into the *same* slot of the global buffer, so the all-reduce
+        # that gathers across replicas sums the partials within each replica as a
+        # side effect -- one collective doing both jobs.
+        if reduce_output and self.tp_size > 1:
             output = attn_tp_all_reduce(output)
         return output
 
@@ -1714,6 +1727,104 @@ class ZayaBlock(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def dp_gather_required() -> bool:
+    """Whether the MoE layers need to see the *global* token set.
+
+    A token must be visible to every rank the expert reduce spans, so the gather
+    is needed exactly when that reduce is wider than the attention-TP group, i.e.
+    when it crosses DP replicas. When ``moe_tp == attn_tp`` (e.g. --moe-dp-size
+    equal to the attention DP size) each replica owns a self-contained MoE over
+    its own ranks, the token is already replicated across them by
+    ``attn_tp_all_reduce``, and the gather/scatter pair is pure overhead.
+
+    Compare against the width of the group ``ZayaBlock._reduce_experts`` actually
+    reduces over -- expert-parallel AND MoE-tensor-parallel -- not moe_tp alone.
+    Under EP (``--ep-size 8``) moe_tp collapses to 1 while the reduce still spans
+    all 8 ranks, so keying off moe_tp alone would skip a gather that is required
+    and silently drop every token the rank does not own.
+    """
+    parallel = get_parallel()
+    moe_reduce_width = parallel.moe_ep_size * parallel.moe_tp_size
+    return (
+        parallel.attn_dp_size > 1
+        and moe_reduce_width > parallel.attn_tp_size
+        and get_moe_a2a_backend().is_none()
+    )
+
+
+class GlobalResidualLayout(msgspec.Struct, frozen=True):
+    """Where this DP replica's rows sit inside the global DP buffer.
+
+    Present only on the global-residual dataflow (see
+    ``SGLANG_OPT_ZAYA_GLOBAL_RESIDUAL``), where the fp32 residual stream and the
+    normed hidden states are held in the global layout -- every rank holds every
+    replica's rows -- rather than the DP-local one. That lets a single
+    ``dp_gather_partial`` of the o_proj partials do the work of both the
+    attention-TP all-reduce and the MoE layer's separate gather, and removes the
+    MoE scatter: three collectives per attention+MoE layer pair become two, and
+    the norms pay for it by running over every replica's rows.
+    """
+
+    local_start: int
+    local_len: int
+
+    def local_view(self, global_rows: torch.Tensor) -> torch.Tensor:
+        """This replica's rows of a global-layout tensor, as a view.
+
+        A row slice of a contiguous 2D tensor is itself contiguous, which the
+        attention kernels and the gather's ``local_tokens`` assert require.
+        """
+        return global_rows[self.local_start : self.local_start + self.local_len]
+
+
+_logged_dataflow_decisions: set[str] = set()
+
+
+def _log_dataflow_decision(message: str) -> None:
+    """Log a dataflow decision once per distinct message.
+
+    Deduping on the *whole* message, shapes included, is deliberate: an earlier
+    A/B in this campaign was declined by a layout precondition and produced
+    baseline-identical numbers that read as a clean null result. A per-reason
+    dedupe would not have caught it either, because the decline happened first at
+    prefill and would have masked the decode decision behind it.
+    """
+    if message not in _logged_dataflow_decisions:
+        _logged_dataflow_decisions.add(message)
+        logger.info(message)
+
+
+def global_residual_layout() -> Optional[GlobalResidualLayout]:
+    """Layout for this forward, or None to run the DP-local dataflow."""
+    if not envs.SGLANG_OPT_ZAYA_GLOBAL_RESIDUAL.get():
+        return None
+    if not dp_gather_required():
+        _log_dataflow_decision(
+            "zaya global residual: declined, the expert reduce does not span DP "
+            "replicas so there is no gather to fold into"
+        )
+        return None
+    # The padded per-rank token counts: the same list that sized the global
+    # buffer (``set_dp_buffer_len``) and that ``get_dp_local_info`` cumsums on
+    # the device to place the gather's memcpy. Deriving the CPU row arithmetic
+    # from that one source is what keeps it from drifting out of agreement with
+    # where the gather actually writes -- including inside a captured CUDA graph,
+    # where every rank is padded to the bucket's token count.
+    sizes = get_dp_global_num_tokens()
+    if sizes is None:
+        _log_dataflow_decision(
+            "zaya global residual: declined, DP buffer metadata is unset"
+        )
+        return None
+    rank = get_attention_dp_rank()
+    layout = GlobalResidualLayout(local_start=sum(sizes[:rank]), local_len=sizes[rank])
+    _log_dataflow_decision(
+        f"zaya global residual: active, rows per rank {sizes}, this rank "
+        f"[{layout.local_start}, {layout.local_start + layout.local_len})"
+    )
+    return layout
+
+
 def _residual_scale_norm(
     res_scale: Optional[ResidualScaling],
     norm: nn.Module,
@@ -1802,6 +1913,7 @@ class ZayaDecoderATTLayer(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         prev_router_hidden_states: Optional[torch.Tensor] = None,
+        global_residual: Optional[GlobalResidualLayout] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         target_dtype = (
             self.input_norm.weight.dtype
@@ -1811,7 +1923,30 @@ class ZayaDecoderATTLayer(nn.Module):
         hidden_states, residual = _residual_scale_norm(
             self.res_scale, self.input_norm, residual, hidden_states, target_dtype
         )
-        hidden_states = self.self_attn(hidden_states, positions, forward_batch)
+        if global_residual is None:
+            hidden_states = self.self_attn(hidden_states, positions, forward_batch)
+            return hidden_states, residual, prev_router_hidden_states
+
+        # Global-residual dataflow: the residual stream -- and so the normed
+        # hidden states just computed -- cover every replica's rows, but attention
+        # is DP-local, so it runs on this replica's slice against its own
+        # positions and conv state. The partial gather then both sums the
+        # attention-TP partials and lifts the result back to the global layout,
+        # which is what the next (MoE) layer needs, so it needs no gather of its
+        # own and no scatter afterwards.
+        #
+        # The gather sits here rather than inside ``ZayaAttention.forward``
+        # deliberately: a replica idle this step returns early from that function
+        # before o_proj, and it must still take part in the collective or the
+        # ranks that are busy hang.
+        partial = self.self_attn(
+            global_residual.local_view(hidden_states),
+            positions,
+            forward_batch,
+            reduce_output=False,
+        )
+        hidden_states = get_global_dp_buffer(get_tp_group())
+        dp_gather_partial(hidden_states, partial, forward_batch)
         return hidden_states, residual, prev_router_hidden_states
 
 
@@ -1848,6 +1983,7 @@ class ZayaDecoderMLPLayer(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         prev_router_hidden_states: Optional[torch.Tensor] = None,
+        global_residual: Optional[GlobalResidualLayout] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         target_dtype = (
             self.input_norm.weight.dtype
@@ -1857,6 +1993,17 @@ class ZayaDecoderMLPLayer(nn.Module):
         hidden_states, residual = _residual_scale_norm(
             self.res_scale, self.input_norm, residual, hidden_states, target_dtype
         )
+        if global_residual is not None:
+            # Global-residual dataflow: the preceding attention layer's partial
+            # gather already left the hidden states in the global layout, so the
+            # experts can run on them directly. This is where that dataflow pays
+            # off -- no gather here, and no scatter after, because the residual
+            # this feeds back into is global too.
+            hidden_states, prev_router_hidden_states = self.zaya_block(
+                hidden_states, prev_router_hidden_states
+            )
+            return hidden_states, residual, prev_router_hidden_states
+
         # DP attention: the attention layers kept each DP replica's tokens
         # local, but the experts (and their EP / MoE-TP all-reduce) must run over
         # the *full* token set. Gather the DP-local normed hidden states into the
@@ -1876,30 +2023,11 @@ class ZayaDecoderMLPLayer(nn.Module):
         # multiplies the tokens by ``attn_tp_size`` -- a no-op at attn_tp=1 (so
         # tp=2/dp=2 was correct) but corrupting every value once attn_tp>1 (e.g.
         # tp=4/dp=2 on 74B doubled them, producing garbage output).
-        # The gather is needed only when the MoE-TP group is *wider* than the
-        # attention-TP group, i.e. when it spans DP replicas: then a token must be
-        # visible to every MoE rank for the expert shards to see it. When
-        # ``moe_tp == attn_tp`` (e.g. --moe-dp-size equal to the attention DP size)
-        # each replica owns a self-contained MoE over its own ranks, the token is
-        # already replicated across them by ``attn_tp_all_reduce``, and the
-        # gather/scatter pair is pure overhead.
-        #
-        # This matters a lot: profiling tp=8/dp=4 on the 74B put ~83% of decode GPU
-        # time in collectives, of which the per-MoE-layer all-gather alone was
-        # 29%. Skipping it when the groups coincide removes 60 all-gathers and 60
-        # scatters per step.
-        # Compare against the width of the group ``_reduce_experts`` actually
-        # reduces over -- expert-parallel AND MoE-tensor-parallel -- not moe_tp
-        # alone. Under EP (``--ep-size 8``) moe_tp collapses to 1 while the reduce
-        # still spans all 8 ranks, so keying off moe_tp alone would skip a gather
-        # that is required and silently drop every token the rank does not own.
-        parallel = get_parallel()
-        moe_reduce_width = parallel.moe_ep_size * parallel.moe_tp_size
-        use_dp_gather = (
-            parallel.attn_dp_size > 1
-            and moe_reduce_width > parallel.attn_tp_size
-            and get_moe_a2a_backend().is_none()
-        )
+        # Whether the gather is needed at all is ``dp_gather_required``; skipping
+        # it when the MoE and attention groups coincide matters a lot, because
+        # profiling tp=8/dp=4 on the 74B put ~83% of decode GPU time in
+        # collectives, of which the per-MoE-layer all-gather alone was 29%.
+        use_dp_gather = dp_gather_required()
         if use_dp_gather:
             hidden_states, local_hidden_states = (
                 get_global_dp_buffer(get_tp_group()),
@@ -2009,12 +2137,24 @@ class ZayaModel(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        global_residual = global_residual_layout()
+
         if self.pp_group.is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_tokens(input_ids)
             residual = None
+            if global_residual is not None:
+                # Seed the stream in the global layout. Layer 0 has no incoming
+                # residual, so its residual *is* these embeddings -- gathering
+                # them once here is what makes the residual global, and from then
+                # on each attention layer's partial gather keeps it that way at no
+                # extra cost. This is the one collective the dataflow adds, against
+                # the 60 attention-TP all-reduces it removes.
+                global_hidden = get_global_dp_buffer(get_tp_group())
+                dp_gather_replicate(global_hidden, hidden_states, forward_batch)
+                hidden_states = global_hidden
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
@@ -2029,15 +2169,26 @@ class ZayaModel(nn.Module):
                 positions=positions,
                 forward_batch=forward_batch,
                 prev_router_hidden_states=prev_router_hidden_states,
+                global_residual=global_residual,
             )
 
         if not self.pp_group.is_last_rank:
+            # Both streams stay global across the PP boundary; the next stage
+            # derives the same layout and carries on.
             return PPProxyTensors(
                 {
                     "hidden_states": hidden_states,
                     "residual": residual,
                 }
             )
+
+        if global_residual is not None:
+            # Back to DP-local for the final norm and the logits: this replica
+            # only produces logits for its own tokens, so narrowing here also
+            # keeps the last norm off the other replicas' rows.
+            hidden_states = global_residual.local_view(hidden_states)
+            if residual is not None:
+                residual = global_residual.local_view(residual)
 
         if self.res_scale is not None:
             residual, hidden_states = self.res_scale(residual, hidden_states)

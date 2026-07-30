@@ -855,6 +855,15 @@ class Envs:
     # build is not stuck on the slow path if the version check is too broad.
     SGLANG_ROCM_CUDA_GRAPH_FORCE_PYNCCL = EnvBool(None)
 
+    # ZAYA1: hold the residual stream in the global DP layout instead of the
+    # DP-local one. A tp=8/dp=4 decode step on the 74B issues three collectives
+    # per attention+MoE layer pair (attention-TP all-reduce, DP gather, MoE
+    # combine); a global residual lets one partial gather of the o_proj partials
+    # do the work of the first two, cutting the pair to two collectives and
+    # dropping the MoE scatter, at the cost of running each norm over every
+    # replica's rows instead of just this one's.
+    SGLANG_OPT_ZAYA_GLOBAL_RESIDUAL = EnvBool(False)
+
     # Unified Radix Tree
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
     # Registered TreeCore backend serving the unified radix cache.
