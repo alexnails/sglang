@@ -10,10 +10,25 @@ conv-channel work (``C`` channels, ``G`` groups) and the ``prev_hs`` carry (``H`
 channels) have different natural parallel shapes, so one kernel covering both
 would either run the ``H`` work ``G`` times over or collapse to a handful of
 programs. Two launches with the right decomposition beat one with the wrong one.
-What this can win is the ``[T, C, W]`` round-trip and, possibly, the GEMM itself:
+What it could win was the ``[T, C, W]`` round-trip and, possibly, the GEMM itself:
 ``cca_state_step``'s note that "a hand-rolled Triton matvec measured no better"
 was about a *matvec*, whereas decode at C=128 concurrency has enough tokens for a
-real tiled dot. Treat that as a hypothesis to measure, not a given.
+real tiled dot.
+
+**Measured, and it loses.** MI350X, 74B tp8/dp4, 1k in / 1k out, global residual
+and the fused prefill on in both arms, 3 reps with rep 1 discarded:
+
+    C     TPOT ms off -> on        output tok/s
+    32    15.93 -> 16.31 (+2.4%)   1954.7 -> 1901.5 (-2.7%)
+    128   18.81 -> 19.40 (+3.1%)   6503.0 -> 6315.2 (-2.9%)
+
+TPOT spread across reps was 0.05%, so that is a real regression, not noise: the
+tiled ``tl.dot`` does not catch rocBLAS's batched GEMM on this shape (batch 9,
+M=tokens, K=384, N=128), and there was no launch to save to pay for it. Kept
+behind ``SGLANG_OPT_ZAYA_FUSED_CCA_DECODE``, default off, because the useful
+artifact is the negative result -- the seam it replaced used to read as a TODO
+with an expected win. Do not re-attempt without a different idea; the decode
+conv is not where the time goes.
 
 Like its siblings it gates on ``covered()`` and tolerates the negative slot ids
 that batch padding writes -- those rows read and write no state and their outputs
