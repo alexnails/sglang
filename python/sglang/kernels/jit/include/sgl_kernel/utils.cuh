@@ -343,6 +343,15 @@ struct LaunchKernel {
   template <typename T, typename... Args>
   auto operator()(T&& kernel, Args&&... args) const -> void {
 #ifdef USE_ROCM
+    // `hipLaunchKernelGGL` expands to a `<<<>>>` launch and yields no status, so
+    // the check below has to read the thread's last-error slot -- which also
+    // holds errors left by *earlier, unrelated* HIP calls. Drain it first, or
+    // such an error is reported with this kernel's file:line and sends debugging
+    // after a kernel that never failed. Nothing is swallowed that matters: a
+    // sticky (context-killing) error is re-reported by the very next HIP call,
+    // so it still lands on the check below. The CUDA branch has no such problem
+    // -- it checks the status `cudaLaunchKernelEx` returns for this launch.
+    (void)::cudaGetLastError();
     hipLaunchKernelGGL(
         std::forward<T>(kernel),
         m_config.gridDim,

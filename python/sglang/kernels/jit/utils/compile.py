@@ -16,6 +16,7 @@ import torch
 from sglang.kernels.jit.utils.arch import get_default_target_flags, get_jit_cuda_arch
 from sglang.kernels.jit.utils.common import cache_once, is_hip_runtime
 from sglang.kernels.jit.utils.deps import REGISTERED_DEPENDENCIES
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from tvm_ffi import Module
@@ -157,11 +158,37 @@ def _tvm_ffi_version() -> str:
         return "unknown"
 
 
+def _release_defines() -> List[str]:
+    """Preprocessor defines shared by the host and device halves of a JIT build.
+
+    JIT builds are release builds (`-O3`), so they define `NDEBUG` like any other
+    release build -- until now they did not, which quietly made every `assert` in
+    a JIT kernel a shipped, always-on check.
+
+    That is not free on ROCm. HIP implements device `assert`/`printf` through
+    *hostcall*, so an armed assert pulls a hostcall buffer and an extra implicit
+    kernarg into the kernel (verified: with asserts live the built code object
+    carries `__assert_fail` and hostcall metadata; with `-DNDEBUG` it carries
+    neither). Hostcall in turn wants PCIe AtomicOps routed to the GPU, which some
+    virtualized ROCm hosts do not do (`AtomicOpsCtl: ReqEn-`, `amdgpu: PCIE
+    atomic ops is not supported`) -- a dependency no release kernel should carry
+    for the sake of a debug check.
+
+    Set `SGLANG_DEBUG_JIT_DEVICE_ASSERT=1` to build with asserts live again.
+    """
+    if envs.SGLANG_DEBUG_JIT_DEVICE_ASSERT.get():
+        return []
+    return ["-DNDEBUG"]
+
+
 def _jit_build_dir_name(module_name: str) -> str:
     # Key on arch + tvm-ffi ABI too (module_name only hashes sources), so a
-    # shared cache volume never reuses a cross-arch/ABI .so.
+    # shared cache volume never reuses a cross-arch/ABI .so. Compile flags are
+    # likewise outside `module_name`, so fold the build flavor in as well:
+    # flipping a define must not silently reuse the other flavor's .so.
     arch = get_jit_cuda_arch().target_name
-    return f"{module_name}__arch_{arch}__tvmffi_{_tvm_ffi_version()}"
+    flavor = hashlib.sha256(" ".join(_release_defines()).encode()).hexdigest()[:8]
+    return f"{module_name}__arch_{arch}__tvmffi_{_tvm_ffi_version()}__flags_{flavor}"
 
 
 def _make_wrapper(tup: Tuple[str, str]) -> str:
@@ -246,8 +273,8 @@ def load_jit(
     cuda_files = cuda_files or []
     external_cpp_files = external_cpp_files or []
     external_cuda_files = external_cuda_files or []
-    extra_cflags = extra_cflags or []
-    extra_cuda_cflags = extra_cuda_cflags or []
+    extra_cflags = _release_defines() + (extra_cflags or [])
+    extra_cuda_cflags = _release_defines() + (extra_cuda_cflags or [])
     extra_ldflags = extra_ldflags or []
     extra_include_paths = extra_include_paths or []
 

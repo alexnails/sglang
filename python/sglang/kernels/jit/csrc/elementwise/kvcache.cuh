@@ -205,7 +205,13 @@ __global__ void store_kvcache(const __grid_constant__ StoreKVCacheParams params)
 
   const auto index = *index_ptr;
   // A stale/OOB slot id would cause an illegal memory access in the store below;
-  // fail fast at the culprit instead. always-on (kvcache JIT compiles without NDEBUG).
+  // this pins the blame on the culprit instead. Debug-only, like any other
+  // `assert`: release JIT builds define NDEBUG, both because an armed device
+  // assert makes the kernel depend on ROCm hostcall (see `_release_defines()` in
+  // kernels/jit/utils/compile.py) and because a shipped always-on check does not
+  // belong in the KV write path. Rebuild with SGLANG_DEBUG_JIT_DEVICE_ASSERT=1
+  // to arm it; without it an OOB slot id still fails, as an illegal memory
+  // access rather than a named assert.
   assert(index >= 0 && index < size_limit);
   const auto k_src = pointer::offset(k_input, item_id * stride_k, split_id * kKSplitSize);
   const auto v_src = pointer::offset(v_input, item_id * stride_v, split_id * kVSplitSize);

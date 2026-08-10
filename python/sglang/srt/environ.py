@@ -308,6 +308,10 @@ class Envs:
     SGLANG_DISABLE_OUTLINES_DISK_CACHE = EnvBool(False)
 
     # Test & Debug
+    # Build JIT kernels with device-side `assert` live (drops `-DNDEBUG`). Off by
+    # default: ROCm implements device `assert` via hostcall, which needs PCIe
+    # AtomicOps. See `_release_defines()` in kernels/jit/utils/compile.py.
+    SGLANG_DEBUG_JIT_DEVICE_ASSERT = EnvBool(False)
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
     SGLANG_TEST_STUCK_DETOKENIZER = EnvFloat(0)
     SGLANG_TEST_STUCK_DP_CONTROLLER = EnvFloat(0)
