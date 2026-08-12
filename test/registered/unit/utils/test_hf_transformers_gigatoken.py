@@ -254,6 +254,28 @@ class TestGigatokenBackend(CustomTestCase):
         self.assertEqual(info.vocab_size, expected.vocab_size)
         self.assertEqual(info.decoded_vocab, expected.decoded_vocab)
 
+    def test_deepcopy_keeps_working(self):
+        """The accelerated tokenizer must survive `copy.deepcopy`.
+
+        `MultimodalProcessorExecutor.__init__` deepcopies the whole processor to
+        get one clone per worker. The gigatoken backend is a Rust object that
+        cannot be pickled, so before `__deepcopy__` was added this raised
+        `TypeError: cannot pickle 'builtins.BPETokenizer' object`, sglang caught
+        it, and every multimodal server silently dropped to synchronous
+        processing — observed on a live server, not hypothetical.
+        """
+        import copy
+
+        clone = copy.deepcopy(self.accel)
+        text = "Hello, world! 日本語 🚀"
+        self.assertEqual(clone.encode(text), self.baseline.encode(text))
+        self.assertEqual(
+            clone.decode(clone.encode(text)),
+            self.baseline.decode(self.baseline.encode(text)),
+        )
+        # The clone shares the backend rather than building a second cache.
+        self.assertIs(clone._gigatoken, self.accel._gigatoken)
+
     def test_idempotent(self):
         """get_tokenizer applies acceleration once; re-applying must not stack
         another subclass (which would recurse through super() forever)."""

@@ -31,6 +31,7 @@ tokenized differently.
 
 from __future__ import annotations
 
+import copy
 import logging
 from typing import Any, Optional
 
@@ -254,6 +255,30 @@ class _GigatokenMethods:
         return self._gigatoken_decode(
             token_ids, kwargs.get("skip_special_tokens", False)
         )
+
+    def __deepcopy__(self, memo):
+        """Copy the tokenizer while sharing the gigatoken backend.
+
+        The backend is a Rust object that cannot be pickled, and the default
+        deepcopy reaches it through this instance's `__dict__`. That matters
+        because `MultimodalProcessorExecutor` deepcopies the whole processor to
+        get one clone per worker: without this, the copy raises and sglang
+        silently falls back to synchronous multimodal processing.
+
+        Sharing rather than rebuilding is safe — gigatoken's encode holds the
+        GIL, so concurrent callers of one backend serialize — and it keeps the
+        clones from each allocating another pretoken cache.
+        """
+        cls = type(self)
+        clone = cls.__new__(cls)
+        memo[id(self)] = clone
+        for name, value in self.__dict__.items():
+            object.__setattr__(
+                clone,
+                name,
+                value if name == "_gigatoken" else copy.deepcopy(value, memo),
+            )
+        return clone
 
     def batch_decode(self, sequences=None, *args: Any, **kwargs: Any) -> list[str]:
         if args or not self._gigatoken_can_decode(kwargs):
