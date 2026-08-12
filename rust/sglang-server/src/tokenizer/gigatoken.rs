@@ -31,7 +31,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use gigatoken_rs::bpe::tiktoken::Tokenizer as GtTokenizer;
+// The crate-root re-export: gigatoken's `bpe` module is `pub(crate)`.
+use gigatoken_rs::Tokenizer as GtTokenizer;
 use gigatoken_rs::load_tokenizer::hf::{HfTokenizer, load_hf_slice};
 
 use crate::error::Error;
