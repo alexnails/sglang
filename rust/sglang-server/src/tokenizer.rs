@@ -20,6 +20,9 @@ use crate::message::{Request, RequestKind, TokenIds};
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::TmEvent;
 
+#[cfg(feature = "gigatoken")]
+pub mod gigatoken;
+
 /// Pluggable text→token-ids backend. `Send + Sync` so one instance is shared
 /// (read-only) across all pinned workers.
 pub trait TextTokenizer: Send + Sync {
@@ -60,6 +63,67 @@ pub fn load_tokenizer(
     .map_err(|e| format!("tokenizer load failed ({file}): {e}"))?;
     tracing::info!(%path, "loaded tokenizer");
     Ok(Some(tokenizer))
+}
+
+/// The `TextTokenizer` the encode pool runs on, selected by `--tokenizer-backend`.
+///
+/// `huggingface` (the default) wraps the already-loaded dynamo tokenizer.
+/// `gigatoken` replaces only the encode step — the stage that dominates this
+/// side's latency — and verifies its ids against the dynamo tokenizer at load.
+/// Anything gigatoken cannot back byte-identically (unsupported vocabulary, ids
+/// that do not match, or a build without the `gigatoken` cargo feature) logs why
+/// and keeps the dynamo tokenizer, so the flag costs speed and never correctness.
+pub fn build_text_tokenizer(
+    loaded: &dynamo_tokenizers::Tokenizer,
+    tokenizer_path: &str,
+    revision: Option<&str>,
+    tokenizer_backend: &str,
+) -> Arc<dyn TextTokenizer> {
+    let reference = Arc::new(DynamoTokenizer::new(loaded.clone()));
+    if tokenizer_backend != "gigatoken" {
+        return reference;
+    }
+    #[cfg(not(feature = "gigatoken"))]
+    {
+        let _ = (tokenizer_path, revision);
+        tracing::warn!(
+            "--tokenizer-backend=gigatoken was requested but this build has no \
+             gigatoken support (cargo feature 'gigatoken' off); using the default \
+             tokenizer"
+        );
+        reference
+    }
+    #[cfg(feature = "gigatoken")]
+    {
+        match load_gigatoken(tokenizer_path, revision, reference.as_ref()) {
+            Ok(tokenizer) => {
+                let (prefix, suffix) = tokenizer.affixes();
+                tracing::info!(
+                    ?prefix,
+                    ?suffix,
+                    "gigatoken encode backend enabled (ids verified against the \
+                     default tokenizer); detokenization stays on the default backend"
+                );
+                Arc::new(tokenizer)
+            }
+            Err(why) => {
+                tracing::warn!("{why}; using the default tokenizer for encode");
+                reference
+            }
+        }
+    }
+}
+
+#[cfg(feature = "gigatoken")]
+fn load_gigatoken(
+    tokenizer_path: &str,
+    revision: Option<&str>,
+    reference: &dyn TextTokenizer,
+) -> Result<gigatoken::GigatokenTokenizer, String> {
+    let file = resolve_model_file(tokenizer_path, revision, "tokenizer.json")
+        .ok_or_else(|| format!("gigatoken: tokenizer.json not found for '{tokenizer_path}'"))?;
+    let bytes = std::fs::read(&file).map_err(|e| format!("gigatoken: reading {file}: {e}"))?;
+    gigatoken::GigatokenTokenizer::load(&bytes, reference)
 }
 
 /// Resolve a model file from the tokenizer source: a dir → `dir/<file>`, a file →
@@ -150,6 +214,85 @@ fn strip_auto_specials(mut ids: Vec<i32>, auto_specials: &[i32]) -> Vec<i32> {
         ids.drain(..auto_specials.len());
     }
     ids
+}
+
+/// Probes for [`derive_affixes`]: unrelated strings that tokenize differently,
+/// one ASCII and one not, so agreement between them is evidence the affixes are
+/// constant rather than content-dependent.
+//
+// `allow(dead_code)`: only the `gigatoken` backend calls the affix machinery, and
+// that feature cannot be enabled until gigatoken builds as a stable-Rust
+// dependency (see the feature's comment in Cargo.toml). It stays compiled — and
+// exercised by the unit tests below — rather than gated off, so the parity gate
+// cannot rot while the dependency is blocked.
+#[cfg_attr(not(feature = "gigatoken"), allow(dead_code))]
+const AFFIX_PROBES: [&str; 3] = ["gigatoken affix probe", "下一个 42 probe", "a"];
+
+/// Derive the `(prefix, suffix)` a reference tokenizer's post-processor puts
+/// around a sequence, by diffing its output against a bare encoder's.
+///
+/// Used to teach an alternate backend — one whose `encode` applies no
+/// post-processor, i.e. HuggingFace's `add_special_tokens=False` — what specials
+/// the reference adds, so the two produce identical ids.
+///
+/// This doubles as the parity gate. Requiring the bare ids to appear *verbatim*
+/// inside the reference output checks the whole content region token for token,
+/// on every probe, so a vocabulary the alternate backend tokenizes differently
+/// cannot reach the pool. `Err` means "do not use that backend for this model".
+///
+/// Ungated (and unit-tested) on purpose: this is the correctness-critical half
+/// of an alternate encode backend, so it type-checks and runs in every build
+/// regardless of which backends are compiled in.
+#[cfg_attr(not(feature = "gigatoken"), allow(dead_code))]
+fn derive_affixes(
+    reference: &dyn TextTokenizer,
+    mut bare_encode: impl FnMut(&str) -> Vec<i32>,
+) -> Result<(Vec<i32>, Vec<i32>), String> {
+    let mut resolved: Option<(Vec<i32>, Vec<i32>)> = None;
+    for probe in AFFIX_PROBES {
+        let bare = bare_encode(probe);
+        if bare.is_empty() {
+            return Err(format!(
+                "alternate backend encoded probe {probe:?} to nothing"
+            ));
+        }
+        let expected = reference
+            .encode(probe)
+            .map_err(|e| format!("reference tokenizer failed on probe {probe:?}: {e}"))?;
+        let start = find_subslice(&expected, &bare).ok_or_else(|| {
+            format!(
+                "ids for probe {probe:?} do not appear in the reference tokenizer's \
+                 output ({} ids vs {}); refusing this backend for this vocabulary",
+                bare.len(),
+                expected.len(),
+            )
+        })?;
+        let affixes = (
+            expected[..start].to_vec(),
+            expected[start + bare.len()..].to_vec(),
+        );
+        match &resolved {
+            None => resolved = Some(affixes),
+            Some(first) if *first == affixes => {}
+            Some(first) => {
+                return Err(format!(
+                    "special tokens are not a constant affix pair (probe {probe:?} \
+                     implies {affixes:?}, an earlier probe implied {first:?})"
+                ));
+            }
+        }
+    }
+    // AFFIX_PROBES is non-empty, so the loop always resolved.
+    resolved.ok_or_else(|| "no affix probes configured".to_string())
+}
+
+/// Index where `needle` occurs contiguously in `haystack`.
+#[cfg_attr(not(feature = "gigatoken"), allow(dead_code))]
+fn find_subslice(haystack: &[i32], needle: &[i32]) -> Option<usize> {
+    if needle.len() > haystack.len() {
+        return None;
+    }
+    (0..=haystack.len() - needle.len()).find(|&i| &haystack[i..i + needle.len()] == needle)
 }
 
 /// One tokenizer worker: pulls a `Request` off the shared inbox, fills
@@ -312,6 +455,99 @@ mod tests {
         fn auto_specials(&self) -> Vec<i32> {
             vec![0]
         }
+    }
+
+    /// Reference that wraps one id per byte in BOS(0) … EOS(9) — an HF
+    /// tokenizer whose post-processor adds specials on both sides.
+    struct AffixedTokenizer;
+    impl TextTokenizer for AffixedTokenizer {
+        fn encode(&self, text: &str) -> Result<TokenIds, Error> {
+            let mut ids = vec![0];
+            ids.extend(text.bytes().map(|b| b as i32));
+            ids.push(9);
+            Ok(ids)
+        }
+    }
+
+    /// The bare (`add_special_tokens=False`) counterpart of `AffixedTokenizer`.
+    fn bare_bytes(text: &str) -> Vec<i32> {
+        text.bytes().map(|b| b as i32).collect()
+    }
+
+    #[test]
+    fn find_subslice_locates_the_content_region() {
+        assert_eq!(find_subslice(&[0, 1, 2, 9], &[1, 2]), Some(1));
+        assert_eq!(find_subslice(&[1, 2], &[1, 2]), Some(0));
+        assert_eq!(find_subslice(&[1, 2], &[1, 2, 3]), None);
+        assert_eq!(find_subslice(&[1, 2, 3], &[3, 2]), None);
+    }
+
+    /// Both affixes must be recovered, not just the prefix.
+    ///
+    /// The `auto_specials` probe (`encode("")`) can only see what a tokenizer
+    /// PREPENDS. An alternate backend fed a prefix-only affix set would drop
+    /// every prompt's trailing special — silently, since ids stay plausible.
+    #[test]
+    fn derive_affixes_recovers_prefix_and_suffix() {
+        let (prefix, suffix) =
+            derive_affixes(&AffixedTokenizer, bare_bytes).expect("constant affixes");
+        assert_eq!(prefix, vec![0], "prefix");
+        assert_eq!(suffix, vec![9], "suffix");
+    }
+
+    /// A backend whose ids differ from the reference must be REFUSED, not
+    /// approximated. This is the whole safety argument for allowing an
+    /// alternate encoder: a vocabulary it tokenizes differently never reaches
+    /// the pool, so the flag cannot change what the model sees.
+    #[test]
+    fn derive_affixes_rejects_a_backend_that_tokenizes_differently() {
+        // One id per CHARACTER, where the reference uses one per BYTE: identical
+        // for ASCII, divergent as soon as a probe is non-ASCII.
+        let by_char = |text: &str| text.chars().map(|c| c as i32).collect();
+        let err =
+            derive_affixes(&AffixedTokenizer, by_char).expect_err("divergent ids must be refused");
+        assert!(
+            err.contains("do not appear in the reference"),
+            "expected a parity rejection, got: {err}"
+        );
+    }
+
+    /// Specials that are not a constant affix pair (here: content-dependent)
+    /// must be refused too — deriving from one probe and applying it to every
+    /// request would corrupt prompts whose affixes differ.
+    #[test]
+    fn derive_affixes_rejects_content_dependent_specials() {
+        /// Prepends one BOS per input byte, so probes of different lengths
+        /// imply different affixes.
+        struct VariableAffix;
+        impl TextTokenizer for VariableAffix {
+            fn encode(&self, text: &str) -> Result<TokenIds, Error> {
+                let mut ids = vec![0; text.len()];
+                ids.extend(text.bytes().map(|b| b as i32));
+                Ok(ids)
+            }
+        }
+        let err = derive_affixes(&VariableAffix, bare_bytes)
+            .expect_err("content-dependent affixes must be refused");
+        assert!(
+            err.contains("not a constant affix pair"),
+            "expected an affix-consistency rejection, got: {err}"
+        );
+    }
+
+    /// A reference that cannot encode a probe must surface as an error rather
+    /// than a silently empty affix set.
+    #[test]
+    fn derive_affixes_propagates_a_reference_failure() {
+        struct Broken;
+        impl TextTokenizer for Broken {
+            fn encode(&self, _text: &str) -> Result<TokenIds, Error> {
+                Err(Error::Tokenize("boom".into()))
+            }
+        }
+        let err =
+            derive_affixes(&Broken, bare_bytes).expect_err("must not be treated as no affixes");
+        assert!(err.contains("reference tokenizer failed"), "got: {err}");
     }
 
     /// `skip_special_tokens` strips the probed prefix: template-rendered

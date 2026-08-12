@@ -43,6 +43,10 @@ dynamo-parsers = "7.0.1"
 dynamo-protocols = "5.1.0"
 dynamo-renderer = "5.0.0"
 flume = "0.12.0"
+# SIMD byte-pair encoder for the tokenizer pool — see the `gigatoken` feature
+# below for why the dependency is commented out rather than optional.
+#
+# gigatoken = { git = "https://github.com/marcelroed/gigatoken", rev = "<rev>", optional = true }
 # Safe POD slice casts (feature buffers viewed as bytes for the shm copy).
 bytemuck = "1"
 itertools = "0.14"
@@ -62,6 +66,34 @@ regex-syntax = "=0.8.11"
 # pyo3 bindings so it links as a plain rlib; renamed so `use sglang_mm::…` reads
 # naturally while the crate keeps its own artifact name in the shared target/.
 sglang_mm = { package = "sglang-mm", path = "../sglang-mm", default-features = false }
+
+[features]
+default = []
+# `--tokenizer-backend=gigatoken`: swap the encode pool's backend for gigatoken
+# (`src/tokenizer/gigatoken.rs`). Tokenize is 93-97% of this side's latency at
+# prompts of 16K tokens and up, and gigatoken encodes ~100x faster per token.
+#
+# The dependency above is COMMENTED OUT, not `optional = true`, because cargo
+# parses an optional dependency's manifest during resolution even when the
+# feature is off — so merely declaring it fails the build for everyone. As of
+# gigatoken fac0114b3 three things block it as a stable-Rust dependency:
+#   1. it needs nightly (`#![feature(portable_simd)]`), used only by its
+#      SentencePiece path — which this integration refuses anyway;
+#   2. its manifest sets `[profile.profiling] rustflags`, which a stable cargo
+#      rejects outright (unstable `profile-rustflags`) — this is the one that
+#      breaks resolution;
+#   3. its pyo3/numpy deps are not optional and enable `abi3-py310`, which cargo
+#      would unify into this crate's own pyo3 — the same hazard `sglang_mm`
+#      documents below, which is why that one is consumed with
+#      `default-features = false`.
+# It is also not published to crates.io. To try the backend, uncomment the
+# dependency, point it at a checkout with those three fixed, and build with
+# `--features gigatoken`.
+#
+# Independent of all that, the correctness-critical half — affix derivation and
+# the parity gate in `tokenizer::derive_affixes`, plus the backend dispatch in
+# `build_text_tokenizer` — is compiled and tested in every build.
+gigatoken = []
 
 [dev-dependencies]
 # `Router::oneshot` for handler-level router tests.

@@ -72,6 +72,12 @@ pub struct ServerArgs {
     /// HF revision, used only when `tokenizer_path` is a repo id. `None` → main.
     #[serde(default)]
     pub revision: Option<String>,
+    /// `--tokenizer-backend`. Only `gigatoken` is acted on here (it swaps the
+    /// encode pool's backend); the Python-only values fall through to the
+    /// default dynamo tokenizer, as does `gigatoken` itself when it cannot back
+    /// the model byte-identically. Empty in older blobs → default.
+    #[serde(default = "default_tokenizer_backend")]
+    pub tokenizer_backend: String,
     /// HTTP bind address (see [`Self::bind`]).
     #[serde(default = "default_host")]
     pub host: String,
@@ -218,6 +224,9 @@ fn default_disaggregation_mode() -> String {
 }
 fn default_worker_num() -> usize {
     1
+}
+fn default_tokenizer_backend() -> String {
+    "huggingface".into()
 }
 
 impl ServerArgs {

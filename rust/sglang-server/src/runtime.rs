@@ -175,9 +175,17 @@ pub fn start(cfg: RuntimeConfig) -> Result<Runtime, String> {
     )?;
     // The `TextTokenizer` view of it, shared by the tokenizer pool and the MM
     // worker path (which encodes the placeholder-expanded prompt itself).
-    let text_tokenizer: Option<Arc<dyn tokenizer::TextTokenizer>> = dyn_tokenizer
-        .as_ref()
-        .map(|t| Arc::new(tokenizer::DynamoTokenizer::new(t.clone())) as _);
+    // `--tokenizer-backend` selects the encoder here; detokenization always uses
+    // the dynamo tokenizer below.
+    let text_tokenizer: Option<Arc<dyn tokenizer::TextTokenizer>> =
+        dyn_tokenizer.as_ref().map(|t| {
+            tokenizer::build_text_tokenizer(
+                t,
+                &cfg.server_args.tokenizer_path,
+                cfg.server_args.revision.as_deref(),
+                &cfg.server_args.tokenizer_backend,
+            )
+        });
 
     // Shared: MM workers park, the Python drain pops, tm-ingress purges.
     let mm_sidecar: crate::mm::Sidecar = Default::default();
