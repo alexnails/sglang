@@ -78,9 +78,10 @@ def store_cache(
         v_row_bytes (int): Value row width in bytes; differs from row_bytes for
             asymmetric KV (head_dim != v_head_dim). Inferred from v when 0.
         size_limit (int): Valid slot bound (cache row count = real slots + the
-            reserved padding slot); an index outside [0, size_limit) fails fast
-            (device assert) instead of an illegal memory access. Defaults to the
-            cache row count when 0.
+            reserved padding slot); an index outside [0, size_limit) trips the
+            kernel's debug assert (see SGLANG_DEBUG_JIT_DEVICE_ASSERT) instead of
+            silently running into an illegal memory access. Defaults to the cache
+            row count when 0.
         reserved_skip_index (int): If nonnegative, writes targeting this index
             are skipped. Defaults to the reserved CUDA-graph padding slot 0;
             pass -1 to disable skipping.
