@@ -1713,7 +1713,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             else:
                 x_for_gate = x
 
-            if in_piecewise_or_breakable_cuda_graph:
+            # The *_graph head-gate helpers are imported only under `if _is_cuda`
+            # (they are Dynamo-safe custom ops with no ROCm build), so on HIP this
+            # branch would raise NameError. `use_dsa_indexer_fusion` is likewise
+            # `_is_cuda and ...`, leaving no reachable path and making GLM-5.2 fail
+            # to start under the *default* prefill graph mode. Fall through to the
+            # eager head-gate on HIP.
+            if in_piecewise_or_breakable_cuda_graph and _is_cuda:
                 if self.use_dsa_indexer_fusion:
                     weights = scale_head_gate_graph(
                         weights_raw,
