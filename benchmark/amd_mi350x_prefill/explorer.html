@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*,*::before,*::after{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0}
+img,svg{display:block;max-width:100%}
+button{font:inherit;color:inherit}
+table{border-collapse:collapse}
+</style>
+<title>MI350X Prefill — Config Explorer</title>
+<style>
+:root{
+  --bg:#FBFBFD; --panel:#FFFFFF; --panel-2:#F3F5F8; --line:#DFE4EC; --line-soft:#EDF0F5;
+  --ink:#131820; --ink-2:#4A5567; --ink-3:#7C8798;
+  --accent:#1E7F97; --accent-soft:#DCEEF3;
+  --grid:#E6EAF1; --crosshair:#B9C2D0;
+  --m-oss:#C96A24; --m-qwen:#2F7FC4; --m-glm:#7E56C2; --m-gemma:#4A8F33; --m-kimi:#C24467;
+  --shadow:0 1px 2px rgba(19,24,32,.06),0 8px 24px rgba(19,24,32,.06);
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --bg:#0E1116; --panel:#151A21; --panel-2:#1B222B; --line:#262F3B; --line-soft:#1E252E;
+    --ink:#E7ECF3; --ink-2:#A6B1C2; --ink-3:#75808F;
+    --accent:#3FB3CC; --accent-soft:#123039;
+    --grid:#1E2530; --crosshair:#3A4553;
+    --m-oss:#E4823C; --m-qwen:#5AA9E6; --m-glm:#A98BE8; --m-gemma:#6BBF59; --m-kimi:#DE6B8A;
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 28px rgba(0,0,0,.35);
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0E1116; --panel:#151A21; --panel-2:#1B222B; --line:#262F3B; --line-soft:#1E252E;
+  --ink:#E7ECF3; --ink-2:#A6B1C2; --ink-3:#75808F;
+  --accent:#3FB3CC; --accent-soft:#123039;
+  --grid:#1E2530; --crosshair:#3A4553;
+  --m-oss:#E4823C; --m-qwen:#5AA9E6; --m-glm:#A98BE8; --m-gemma:#6BBF59; --m-kimi:#DE6B8A;
+  --shadow:0 1px 2px rgba(0,0,0,.4),0 8px 28px rgba(0,0,0,.35);
+}
+*{box-sizing:border-box}
+body{
+  margin:0; background:var(--bg); color:var(--ink);
+  font:400 14px/1.55 ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  font-variant-numeric:tabular-nums; -webkit-font-smoothing:antialiased;
+}
+.sans{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;font-variant-numeric:normal}
+.wrap{max-width:1240px;margin:0 auto;padding:0 24px 80px}
+header{border-bottom:1px solid var(--line);margin-bottom:22px}
+.head-in{max-width:1240px;margin:0 auto;padding:26px 24px 18px;display:flex;flex-wrap:wrap;gap:18px;align-items:flex-end;justify-content:space-between}
+h1{font-size:19px;font-weight:600;margin:0;letter-spacing:-.01em}
+.sub{color:var(--ink-3);font-size:11.5px;letter-spacing:.09em;text-transform:uppercase;margin-top:5px}
+.stats{display:flex;gap:26px;flex-wrap:wrap}
+.stat b{display:block;font-size:18px;font-weight:600;line-height:1.2}
+.stat span{font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--ink-3)}
+
+.bar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:18px}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:7px;overflow:hidden;background:var(--panel)}
+.seg button{
+  appearance:none;border:0;background:transparent;color:var(--ink-2);cursor:pointer;
+  font:inherit;font-size:12px;padding:7px 13px;letter-spacing:.02em;
+}
+.seg button+button{border-left:1px solid var(--line)}
+.seg button[aria-pressed="true"]{background:var(--accent-soft);color:var(--accent);font-weight:600}
+.seg button:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+.lbl{font-size:10.5px;letter-spacing:.09em;text-transform:uppercase;color:var(--ink-3);margin-right:2px}
+
+.rail{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:20px}
+.chip{
+  display:flex;align-items:center;gap:8px;padding:8px 13px;border-radius:8px;cursor:pointer;
+  border:1px solid var(--line);background:var(--panel);color:var(--ink-2);font:inherit;font-size:12.5px;
+  transition:border-color .12s,color .12s;
+}
+.chip:hover{border-color:var(--crosshair)}
+.chip:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.chip[aria-pressed="true"]{color:var(--ink);border-color:currentColor}
+.chip .dot{width:9px;height:9px;border-radius:50%;background:currentColor;flex:none}
+.chip[aria-pressed="false"] .dot{opacity:.28}
+.chip .tp{font-size:10.5px;color:var(--ink-3);letter-spacing:.05em}
+.chip[disabled]{opacity:.42;cursor:not-allowed}
+
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow)}
+.plot{padding:16px 12px 8px;margin-bottom:26px;position:relative}
+svg{display:block;width:100%;height:auto;overflow:visible}
+.axis-t{font-size:10.5px;fill:var(--ink-3);letter-spacing:.02em}
+.axis-title{font-size:10.5px;fill:var(--ink-3);letter-spacing:.09em;text-transform:uppercase}
+.gridline{stroke:var(--grid);stroke-width:1}
+.pt{cursor:pointer}
+.pt-hit{fill:transparent}
+
+#tip{
+  position:absolute;pointer-events:none;opacity:0;transition:opacity .1s;z-index:5;
+  background:var(--panel-2);border:1px solid var(--line);border-radius:9px;padding:10px 12px;
+  box-shadow:var(--shadow);font-size:11.5px;min-width:186px;
+}
+#tip .t-h{display:flex;align-items:center;gap:7px;font-weight:600;margin-bottom:7px;font-size:12px}
+#tip .t-h .dot{width:8px;height:8px;border-radius:50%;flex:none}
+#tip dl{display:grid;grid-template-columns:auto auto;gap:3px 14px;margin:0}
+#tip dt{color:var(--ink-3)}
+#tip dd{margin:0;text-align:right}
+
+.grid2{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:18px;margin-bottom:26px}
+@media(max-width:900px){.grid2{grid-template-columns:1fr}}
+.card h2{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--ink-3);margin:0;padding:14px 16px 0;font-weight:600}
+.card .body{padding:12px 16px 16px}
+pre{
+  margin:0;background:var(--panel-2);border:1px solid var(--line-soft);border-radius:8px;
+  padding:13px 14px;overflow-x:auto;font-size:11.5px;line-height:1.65;color:var(--ink-2);
+}
+pre b{color:var(--ink);font-weight:600}
+.note{font-size:12px;color:var(--ink-2);line-height:1.6;margin:11px 0 0}
+.warn{border-left:2px solid var(--m-oss);padding-left:11px;color:var(--ink-2);font-size:12px;line-height:1.6;margin-top:11px}
+
+.tbl-wrap{overflow-x:auto;border-radius:12px}
+table{border-collapse:collapse;width:100%;font-size:12px;min-width:640px}
+th,td{padding:8px 12px;text-align:right;border-bottom:1px solid var(--line-soft);white-space:nowrap}
+th{font-size:10px;letter-spacing:.07em;text-transform:uppercase;color:var(--ink-3);font-weight:600;
+   position:sticky;top:0;background:var(--panel);border-bottom:1px solid var(--line)}
+th:first-child,td:first-child{text-align:left}
+tbody tr:hover{background:var(--panel-2)}
+tbody tr.best td{font-weight:600;color:var(--ink)}
+.bar-cell{position:relative}
+.bar-cell i{position:absolute;left:0;top:50%;transform:translateY(-50%);height:15px;opacity:.16;border-radius:2px}
+.tag{display:inline-block;font-size:9.5px;letter-spacing:.07em;text-transform:uppercase;padding:2px 6px;border-radius:4px;background:var(--accent-soft);color:var(--accent);margin-left:6px}
+footer{color:var(--ink-3);font-size:11.5px;border-top:1px solid var(--line);padding-top:16px;margin-top:34px;line-height:1.7}
+@media(prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+
+</head>
+<body>
+<header>
+  <div class="head-in">
+    <div>
+      <h1>MI350X Prefill — Config Explorer</h1>
+      <div class="sub">gfx950 · CDNA4 · ROCm 7.2 · OSL=1 · 521 measured points</div>
+    </div>
+    <div class="stats">
+      <div class="stat"><b>5<span style="color:var(--ink-3);font-weight:400">/5</span></b><span>models complete</span></div>
+      <div class="stat"><b>2.0&times;</b><span>DP over TP</span></div>
+      <div class="stat"><b>cc=1</b><span>66–98% of peak</span></div>
+    </div>
+  </div>
+</header>
+
+<div class="wrap">
+  <div class="bar">
+    <span class="lbl">Workload</span>
+    <div class="seg" id="wl">
+      <button data-w="W1" aria-pressed="true">8k uncached</button>
+      <button data-w="W2" aria-pressed="false">64k cached</button>
+    </div>
+    <span class="lbl" style="margin-left:8px">Throughput</span>
+    <div class="seg" id="norm">
+      <button data-n="total" aria-pressed="true">total</button>
+      <button data-n="gpu" aria-pressed="false">per GPU</button>
+    </div>
+    <span class="lbl" style="margin-left:8px">Latency axis</span>
+    <div class="seg" id="scale">
+      <button data-s="log" aria-pressed="true">log</button>
+      <button data-s="lin" aria-pressed="false">linear</button>
+    </div>
+  </div>
+
+  <div class="rail" id="rail"></div>
+
+  <div class="card plot">
+    <svg id="chart" viewBox="0 0 980 470" role="img" aria-label="Throughput against time-to-first-token by concurrency"></svg>
+    <div id="tip"></div>
+  </div>
+
+  <div class="grid2">
+    <div class="card">
+      <h2>Optimal config <span id="cfg-model" style="color:var(--ink);letter-spacing:0;text-transform:none;font-size:12px"></span></h2>
+      <div class="body"><pre id="cfg"></pre><div id="cfg-note"></div></div>
+    </div>
+    <div class="card">
+      <h2>Reading this model</h2>
+      <div class="body sans" id="detail" style="font-size:12.5px;line-height:1.65;color:var(--ink-2)"></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:26px">
+    <h2>Measured points <span id="tbl-cap" style="color:var(--ink-3);letter-spacing:.05em;font-size:10px"></span></h2>
+    <div class="body" style="padding-top:8px">
+      <div class="tbl-wrap"><table id="tbl"></table></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Parallelism — gpt-oss-120B, 4 GPUs in every arm</h2>
+    <div class="body">
+      <div class="tbl-wrap"><table id="dp"></table></div>
+      <p class="note sans">Matched <b>aggregate</b> concurrency. Above cc=2, four TP1 replicas beat one TP4 engine on throughput <em>and</em> latency simultaneously — no trade. Solo 8k prefill: TP1 125.2 ms, TP2 125.6 ms, TP4 75.5 ms, so TP2 buys nothing and TP4 recovers only 1.66&times; on 4&times; the silicon.</p>
+      <p class="warn">On the cached workload this reverses without prefix-affinity routing: DP4 round-robin drops to 81.75% hit and 304,369 tok/s against TP4's 467,657. With <code>cache_aware</code> it recovers to 90.75% and 582,715 — the best arm measured.</p>
+    </div>
+  </div>
+
+  <footer>
+    Prefill isolated at OSL=1; TTFT is p50 unless noted. Cached-workload hit ceilings are tokenizer-dependent and each model was measured against its own realized ceiling rather than the nominal 93.75% — gpt-oss 93.73%, GLM 93.69%, Gemma 93.74%, Qwen 93.75%, Kimi 93.80%. Cached-workload throughput counts cache hits and runs ~16&times; inflated; true new-token rates are called out per model. GLM-5.2 W1 shows endpoints only. gpt-oss was re-measured end-to-end on one host and build after a tokenizer provenance gap; its earlier figures came from a different host and a base 15,476 commits apart, so cross-run deltas there are build-confounded.
+  </footer>
+</div>
+
+<script>
+const M = {
+  oss:{name:"gpt-oss-120B",tp:4,c:"--m-oss",
+    cfg:["SGLANG_USE_AITER=1","--tp 4","--attention-backend triton","--prefill-attention-backend triton","--decode-attention-backend aiter","--page-size 64","--chunked-prefill-size 32768","--max-prefill-tokens 32768","--prefill-max-requests 4","--mem-fraction-static 0.85"],
+    hi:["--attention-backend triton","--decode-attention-backend aiter","--page-size 64","--prefill-max-requests 4"],
+    note:"<b>--attention-backend triton</b> is load-bearing: omit it and the unified value defaults to aiter, firing the mem-fraction haircut (0.85&nbsp;&rarr;&nbsp;0.7225) and costing 16% of the KV pool. <b>QuickReduce is on the active path</b> — the image sets <code>ROCM_QUICK_REDUCE_QUANTIZATION=INT8</code>, and forcing it off costs &minus;14.9% at cc128.",
+    detail:"aiter cannot serve <b>prefill</b> here — no compiled CK instance for its trait tuple. The 2&nbsp;GB error message is a red herring: a probe with a 410&nbsp;MB per-layer K buffer failed identically. aiter decode and page&nbsp;&gt;&nbsp;1 only work jointly — aiter decode at page 1 is a &minus;20% regression. Chunk 65536 does not beat 32768. <b>Dropping --prefill-max-requests 4 costs up to &minus;4.9%</b> on this build. Tokenizer choice is <b>not</b> a factor: gigatoken and fastokens differ by less than the drift control everywhere except W2 cc=1 (&minus;3.0%). One config serves both workloads.",
+    W1:[[1,107603,75.5],[2,112071,144.8],[4,131683,245.9],[8,137992,467.9],[16,141656,900.6],[32,141626,1792.1],[64,140390,3607.4],[128,142135,7382.4]],
+    W2:[[1,414318,160.8],[2,454562,299.8],[4,516703,519.5],[8,648294,811.5],[16,677702,1534.5],[32,656073,3158.6],[64,657055,6251.3],[128,652689,12457.5]],
+    W2note:"Throughput counts cached tokens (~15.9&times; inflated). True new-token rate at peak is <b>42,652 tok/s</b>."},
+  qwen:{name:"Qwen3.5-27B-FP8",tp:4,c:"--m-qwen",
+    cfg:["SGLANG_USE_AITER=1","--tp 4","--attention-backend aiter","--page-size 16","--mamba-backend triton","--linear-attn-backend triton","--chunked-prefill-size 65536","--max-prefill-tokens 65536","--mem-fraction-static 0.85"],
+    hi:["--chunked-prefill-size 65536","--max-prefill-tokens 65536","--page-size 16"],
+    note:"<b>--max-prefill-tokens</b> must be raised with the chunk or the 16384 default binds (~2.7%). <b>0.85 resolves to 0.7225</b> here — aiter with context&nbsp;&gt;&nbsp;8192.",
+    detail:"Not dense: a 64-layer hybrid, 48 GDN linear-attention + 16 full-attention, only 1 layer in 4 holding KV. Chunk ladder is monotonic — 65536 carries 14–16 requests per forward pass in 19 passes against 4–6 in 56 at 16384, and that 2.9&times; pass reduction is the whole +10.4%. <b>page 1024 is structurally impossible</b>: mamba_track_interval must divide by it.",
+    W1:[[1,41566,195],[2,42794,379],[4,44177,688],[8,47518,1348],[16,48744,2675],[32,49055,5308],[64,49204,10602],[128,49328,21094]],
+    W2:[[1,313586,223],[2,347042,410],[4,383057,735],[8,428953,1299],[16,445373,2480],[32,454713,4834],[64,448600,9244],[128,441460,19415]],
+    W2note:"Throughput counts cached tokens (~16&times; inflated). True new-token rate at cc=32 is <b>28,525 tok/s</b>."},
+  glm:{name:"GLM-5.2-FP8",tp:8,c:"--m-glm",
+    cfg:["SGLANG_USE_AITER=1","--tp 8","--page-size 64","--kv-cache-dtype bfloat16","--dsa-prefill-backend aiter","--dsa-decode-backend tilelang","--chunked-prefill-size 32768","--max-prefill-tokens 32768","--mem-fraction-static 0.85","--cuda-graph-backend-prefill disabled"],
+    hi:["--cuda-graph-backend-prefill disabled","--chunked-prefill-size 32768"],
+    note:"Prefill graphs <b>auto-disable</b> here, so the stock path works — but explicitly passing <code>breakable</code> or <code>tc_piecewise</code> trips an assertion at graph capture. The flag above just pins what already resolves. <b>--page-size 1024 hangs the server.</b>",
+    detail:"The only model needing different chunks per workload: 16384 for 8k, 32768 for 64k. If one config must serve both, 32768 costs W1 ~2–3% while 16384 costs W2 ~11%. Its DSA indexer cost is <b>per-token, not per-pass</b> — batching width matched prediction exactly (5&rarr;9&rarr;16) yet per-pass time scaled proportionally, so there is nothing fixed to amortise and chunk 65536 is &minus;12.1%.",
+    W1:[[1,18386,444],[128,19490,47400]], W1partial:true,
+    W2:[[1,201145,338],[8,212237,null],[32,211136,null],[128,206978,37261]]},
+  gemma:{name:"Gemma-4-31B",tp:2,c:"--m-gemma",
+    cfg:["--tp 2","--attention-backend triton","--page-size 1","--chunked-prefill-size 32768","--max-prefill-tokens 32768","--mem-fraction-static 0.85","--swa-full-tokens-ratio 0.8","TVM_FFI_CACHE_DIR=<writable>"],
+    hi:["--page-size 1","TVM_FFI_CACHE_DIR=<writable>"],
+    note:"Do <b>not</b> pass <code>--cuda-graph-backend-prefill</code> — sglang auto-disables prefill graphs for this multimodal arch and the flag <b>overrides that</b>, re-enabling a broken path. Backend split is illegal here.",
+    detail:"Sharpest saturation measured: <b>cc=1 is 98.5% of peak</b> and throughput is flat within &plusmn;3.5% while TTFT scales exactly linearly (412&nbsp;ms &times; cc). Server batch width is chunk&#8725;ISL = 4–5 regardless of client concurrency. <b>Page 1 wins decisively</b> — page 1024 costs &minus;24.5% with no hit-rate loss and no pool bloat. Group count matters more than any flag: 8 groups overflow the pool and retain 0 of 8 prefixes, costing 3.05&times;.",
+    W1:[[1,19918,412.0],[2,20215,811.6],[4,20035,1623.4],[8,20155,3219.1],[16,19749,6641.9],[32,19708,13300.8],[64,19570,26647.9],[128,19523,53414.6]],
+    W2:[[1,93512,630],[2,91230,1112],[4,89083,2107],[8,93624,3961],[16,105744,7645],[32,95791,16124],[64,91116,32832]]},
+  kimi:{name:"Kimi K2.7-Code",tp:4,c:"--m-kimi",
+    cfg:["SGLANG_USE_AITER=1","--tp 4","--trust-remote-code","--mem-fraction-static 1.0","--chunked-prefill-size 32768","--max-prefill-tokens 32768","--page-size 1","--tokenizer-backend huggingface","--enable-cache-report"],
+    hi:["--trust-remote-code","--mem-fraction-static 1.0","--chunked-prefill-size 32768","--page-size 1"],
+    note:"<b>Chunk &gt; 32768 faults the GPU</b> at cc&nbsp;&ge;&nbsp;8 — 40960 / 49152 / 65536 all die on a read-only-page write; 32768 and 16384 hold to cc128. The AITER mem-fraction haircut is <b>unavoidable</b> here (the DeepSeek-family override forces the unified backend back to aiter even if you pass triton), so pass <b>1.0</b> to land on an effective 0.85.",
+    detail:"Multimodal — <code>KimiK25ForConditionalGeneration</code> with a 27-layer MoonViT tower — so <b>--trust-remote-code</b> is mandatory or the tokenizer manager dies at startup. Batching width <em>exceeds</em> the predictor (9.0 observed against 8.1 at chunk 32768), passes fall 34&nbsp;&rarr;&nbsp;18, and true new-token throughput rises 14.4% — so it lands with Qwen, and what capped the win was the crash ceiling on chunk size, not memory. <b>Zero retractions and zero OOM across all 111 points</b>; the largest model in the campaign never hit a memory limit. Page 1 wins monotonically, and the mechanism is visible in the hit rate: 93.80&nbsp;&rarr;&nbsp;92.51% at page 1024 as prefix matches truncate on page boundaries.",
+    W1:[[1,8135,1004],[2,8266,1975],[4,10584,3089],[8,11463,5706],[16,12150,10757],[32,12141,21569],[64,12132,43188],[128,12089,86597]],
+    W2:[[1,82054,799],[2,87623,1502],[4,91573,2873],[8,106425,4930],[16,117715,8826],[32,123998,16775],[64,124450,31544],[128,124032,35429]],
+    W2note:"Throughput counts cached tokens (16.1&times; inflated). True new-token rate at peak is <b>7,715 tok/s</b>."}
+};
+const DP = {
+  cc:[1,2,4,8,16,32,64,128],
+  A:[[108202,75.5],[108319,145.0],[132608,246.2],[139716,467.8],[139507,898.5],[143199,1798],[143177,3596],[142773,7355]],
+  B:[[65181,125.5],[129791,125.9],[133699,245.0],[153855,429.3],[171672,742.1],[167242,1523],[168107,3070],[165394,6017]],
+  C:[[65526,125.2],[131601,124.7],[264433,123.6],[272204,238.9],[290020,448.3],[291522,845.1],[285758,1721],[289179,3394]]
+};
+let ST={w:"W1",norm:"total",scale:"log",sel:["oss","qwen","glm","gemma"],focus:"oss"};
+const $=s=>document.querySelector(s), NS="http://www.w3.org/2000/svg";
+const cvar=n=>getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const fmt=n=>n==null?"—":n>=10000?Math.round(n).toLocaleString():n>=100?Math.round(n).toLocaleString():n.toFixed(1);
+
+function rows(k){const m=M[k];return (m[ST.w]||[]).filter(r=>r[1]!=null&&r[2]!=null)
+  .map(r=>({cc:r[0],tp:ST.norm==="gpu"?r[1]/m.tp:r[1],raw:r[1],t:r[2]}));}
+
+function rail(){
+  $("#rail").innerHTML=Object.entries(M).map(([k,m])=>{
+    const on=ST.sel.includes(k);
+    return `<button class="chip" data-k="${k}" ${m.pending?"disabled":""} aria-pressed="${on}"
+      style="color:${m.pending?"var(--ink-3)":`var(${m.c})`}">
+      <span class="dot"></span>${m.name}<span class="tp">TP${m.tp}</span>${m.pending?'<span class="tag">running</span>':''}</button>`;
+  }).join("");
+  $("#rail").querySelectorAll(".chip").forEach(b=>b.onclick=()=>{
+    const k=b.dataset.k;
+    ST.sel=ST.sel.includes(k)?ST.sel.filter(x=>x!==k):[...ST.sel,k];
+    if(ST.sel.length===0)ST.sel=[k];
+    if(ST.sel.includes(k))ST.focus=k; else if(ST.focus===k)ST.focus=ST.sel[0];
+    render();
+  });
+}
+
+function draw(){
+  const W=980,H=470,L=68,R=22,T=18,B=54, s=$("#chart"); s.innerHTML="";
+  const data=ST.sel.map(k=>({k,m:M[k],pts:rows(k)})).filter(d=>d.pts.length);
+  if(!data.length){s.innerHTML=`<text x="${W/2}" y="${H/2}" text-anchor="middle" class="axis-t">no data for this workload</text>`;return;}
+  const all=data.flatMap(d=>d.pts);
+  const tmin=Math.min(...all.map(p=>p.t)), tmax=Math.max(...all.map(p=>p.t));
+  const ymax=Math.max(...all.map(p=>p.tp))*1.08;
+  const lg=ST.scale==="log";
+  const x0=lg?Math.log10(tmin*0.72):0, x1=lg?Math.log10(tmax*1.35):tmax*1.06;
+  const X=t=>L+((lg?Math.log10(t):t)-x0)/(x1-x0)*(W-L-R);
+  const Y=v=>H-B-(v/ymax)*(H-T-B);
+  const g=(n,a={})=>{const e=document.createElementNS(NS,n);for(const k in a)e.setAttribute(k,a[k]);return e;};
+
+  for(let i=0;i<=5;i++){const v=ymax*i/5;
+    s.appendChild(g("line",{x1:L,x2:W-R,y1:Y(v),y2:Y(v),class:"gridline"}));
+    const t=g("text",{x:L-10,y:Y(v)+4,"text-anchor":"end",class:"axis-t"});t.textContent=fmt(v);s.appendChild(t);}
+  const ticks=lg?[100,200,500,1000,2000,5000,10000,20000,50000].filter(v=>v>=tmin*0.72&&v<=tmax*1.35)
+    :[0,.25,.5,.75,1].map(f=>tmax*1.06*f);
+  ticks.forEach(v=>{const t=g("text",{x:X(v),y:H-B+20,"text-anchor":"middle",class:"axis-t"});
+    t.textContent=v>=1000?(v/1000)+"s":Math.round(v)+"ms";s.appendChild(t);
+    s.appendChild(g("line",{x1:X(v),x2:X(v),y1:T,y2:H-B,class:"gridline"}));});
+  let a=g("text",{x:L,y:H-14,class:"axis-title"});a.textContent="TTFT p50 →";s.appendChild(a);
+  a=g("text",{x:0,y:0,class:"axis-title",transform:`translate(16,${T+12}) rotate(0)`});
+  a.textContent=(ST.norm==="gpu"?"tok/s/GPU":"tok/s")+" ↑";s.appendChild(a);
+
+  data.forEach(d=>{
+    const col=cvar(d.m.c), foc=d.k===ST.focus, o=foc?1:.42;
+    const pl=g("polyline",{points:d.pts.map(p=>`${X(p.t)},${Y(p.tp)}`).join(" "),
+      fill:"none",stroke:col,"stroke-width":foc?2.4:1.6,"stroke-opacity":o,
+      "stroke-linejoin":"round","stroke-linecap":"round"});
+    if(M[d.k][ST.w+"partial"])pl.setAttribute("stroke-dasharray","5 4");
+    s.appendChild(pl);
+    d.pts.forEach(p=>{
+      s.appendChild(g("circle",{cx:X(p.t),cy:Y(p.tp),r:foc?4.5:3.4,fill:col,"fill-opacity":o,
+        stroke:cvar("--panel"),"stroke-width":1.5}));
+      const hit=g("circle",{cx:X(p.t),cy:Y(p.tp),r:16,class:"pt pt-hit"});
+      hit.addEventListener("mouseenter",()=>tip(p,d,X(p.t),Y(p.tp),col));
+      hit.addEventListener("mouseleave",()=>$("#tip").style.opacity=0);
+      hit.addEventListener("click",()=>{ST.focus=d.k;render();});
+      s.appendChild(hit);
+      if(foc){const t=g("text",{x:X(p.t),y:Y(p.tp)-11,"text-anchor":"middle",class:"axis-t"});
+        t.setAttribute("fill",col);t.textContent=p.cc;s.appendChild(t);}
+    });
+  });
+}
+function tip(p,d,px,py,col){
+  const el=$("#tip"),peak=Math.max(...rows(d.k).map(r=>r.tp));
+  el.innerHTML=`<div class="t-h"><span class="dot" style="background:${col}"></span>${d.m.name}</div>
+    <dl><dt>concurrency</dt><dd>${p.cc}</dd>
+    <dt>${ST.norm==="gpu"?"tok/s/GPU":"tok/s"}</dt><dd>${fmt(p.tp)}</dd>
+    <dt>% of peak</dt><dd>${(p.tp/peak*100).toFixed(1)}%</dd>
+    <dt>TTFT p50</dt><dd>${p.t>=1000?(p.t/1000).toFixed(1)+" s":p.t+" ms"}</dd></dl>`;
+  const r=$("#chart").getBoundingClientRect(),c=$(".plot").getBoundingClientRect();
+  el.style.opacity=1;
+  el.style.left=Math.min(px/980*r.width+r.left-c.left+16,c.width-206)+"px";
+  el.style.top=(py/470*r.height+r.top-c.top-12)+"px";
+}
+function panels(){
+  const m=M[ST.focus];
+  $("#cfg-model").textContent=m.name;
+  $("#cfg").innerHTML=m.cfg.map(l=>m.hi.includes(l)?`<b>${l}</b>`:l).join("\n");
+  $("#cfg-note").innerHTML=m.note?`<p class="warn">${m.note}</p>`:"";
+  $("#detail").innerHTML=m.detail||"<span style='color:var(--ink-3)'>Pending.</span>";
+  const rs=rows(ST.focus),peak=rs.length?Math.max(...rs.map(r=>r.tp)):0;
+  $("#tbl-cap").textContent=`${m.name} · ${ST.w==="W1"?"8k uncached":"64k cached"}`;
+  $("#tbl").innerHTML=rs.length?`<thead><tr><th>cc</th><th>${ST.norm==="gpu"?"tok/s/GPU":"tok/s"}</th>
+    <th>% of peak</th><th>TTFT p50</th><th>vs cc=1 TTFT</th></tr></thead><tbody>`+
+    rs.map(r=>`<tr class="${r.tp===peak?"best":""}"><td>${r.cc}</td>
+      <td class="bar-cell"><i style="background:var(${m.c});width:${r.tp/peak*68}px"></i>${fmt(r.tp)}</td>
+      <td>${(r.tp/peak*100).toFixed(1)}%</td>
+      <td>${r.t>=1000?(r.t/1000).toFixed(1)+" s":r.t+" ms"}</td>
+      <td>${(r.t/rs[0].t).toFixed(1)}×</td></tr>`).join("")+"</tbody>"
+    :`<tbody><tr><td style="color:var(--ink-3)">No points for this workload yet.</td></tr></tbody>`;
+  if(ST.w==="W2"&&m.W2note)$("#tbl-cap").insertAdjacentHTML("afterend","");
+}
+function dptbl(){
+  const n=ST.norm==="gpu"?4:1;
+  $("#dp").innerHTML=`<thead><tr><th>agg cc</th><th>TP4</th><th>DP2×TP2</th><th>DP4×TP1</th>
+    <th>DP4 gain</th><th>TP4 TTFT</th><th>DP4 TTFT</th></tr></thead><tbody>`+
+    DP.cc.map((c,i)=>{const a=DP.A[i][0]/n,b=DP.B[i][0]/n,d=DP.C[i][0]/n,g=d/a;
+      return `<tr class="${g>1.9?"best":""}"><td>${c}</td><td>${fmt(a)}</td><td>${fmt(b)}</td>
+      <td class="bar-cell"><i style="background:var(--m-oss);width:${d/(DP.C[5][0]/n)*66}px"></i>${fmt(d)}</td>
+      <td style="color:${g>=1?"var(--m-gemma)":"var(--m-kimi)"}">${g.toFixed(2)}×</td>
+      <td>${DP.A[i][1]>=1000?(DP.A[i][1]/1000).toFixed(1)+" s":DP.A[i][1]+" ms"}</td>
+      <td>${DP.C[i][1]>=1000?(DP.C[i][1]/1000).toFixed(1)+" s":DP.C[i][1]+" ms"}</td></tr>`;}).join("")+"</tbody>";
+}
+function render(){rail();draw();panels();dptbl();}
+document.querySelectorAll(".seg").forEach(seg=>seg.querySelectorAll("button").forEach(b=>b.onclick=()=>{
+  seg.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed","false"));
+  b.setAttribute("aria-pressed","true");
+  if(b.dataset.w)ST.w=b.dataset.w; if(b.dataset.n)ST.norm=b.dataset.n; if(b.dataset.s)ST.scale=b.dataset.s;
+  render();}));
+render();
+addEventListener("resize",draw);
+matchMedia("(prefers-color-scheme:dark)").addEventListener("change",draw);
+</script>
+
+</body>
+</html>
