@@ -1,0 +1,455 @@
+{
+  "campaign": {
+    "title": "AMD MI350X prefill optimization — 5 models x 2 workloads",
+    "hardware": "AMD Instinct MI350X (gfx950, CDNA4, 256 CU, 287.7 GiB HBM3E), ROCm 7.2 userspace on 7.0.2 host driver",
+    "hosts": ["rx3 = 165.245.142.253", "rx4 = 129.212.181.245", "devbox an-kg2 (mi350-digitalocean)"],
+    "branch": "https://github.com/alexnails/sglang @ perf/amd-mi350x-full-stack (f25dca3f6f)",
+    "total_measured_points": 319,
+    "models_complete": 4,
+    "models_pending": ["kimi-k2.7"],
+    "workloads": {
+      "W1": {
+        "name": "8k ISL uncached",
+        "client": "--dataset-name random --random-input-len 8192 --random-output-len 1 --random-range-ratio 1.0",
+        "server": "--disable-radix-cache",
+        "verification": "server #cached-token: 0 on every prefill pass"
+      },
+      "W2": {
+        "name": "64k ISL at ~93.75% nominal cache hit",
+        "client": "--dataset-name generated-shared-prefix --gsp-output-len 1",
+        "server": "radix cache ON",
+        "note": "Nominal 61440/4096 realizes to 67.5k-76.4k depending on tokenizer. Back-solve gsp lengths per model; the achievable hit-rate ceiling is realized-prefix/realized-total and is tokenizer-dependent (90.9%-93.75% measured)."
+      },
+      "concurrency_ladder": [1, 2, 4, 8, 16, 32, 64, 128],
+      "osl": 1,
+      "metric": "TTFT (prefill-only; validated equivalent to a dedicated prefill path within 1.5%)"
+    }
+  },
+
+  "cross_cutting_findings": [
+    {
+      "finding": "Concurrency dominates every flag tuned",
+      "detail": "cc=1 delivers 84.3% (Qwen W1), 90.4% (gpt-oss W1 @cc4), 94% (GLM W1) and 98.5% (Gemma W1) of peak throughput. Going to cc=128 buys 2-6% throughput for ~95-110x the TTFT.",
+      "implication": "For prefill-only serving the operating point matters more than any config knob measured. Optimal bands: W1 cc=1-4, W2 cc=8-32."
+    },
+    {
+      "finding": "Data parallelism beats tensor parallelism for prefill",
+      "detail": "4xTP1 behind a prefix-affinity router: 2.0x TP4's per-GPU throughput AND 2.1x better TTFT uncached; +25% throughput with the best TTFT of any arm cached. Crossover at aggregate cc=2.",
+      "mechanism": "TP scales badly: solo 8k prefill is 125.2 ms at TP1, 125.6 ms at TP2 (two GPUs buy nothing), 75.5 ms at TP4 (39-41% efficiency). Dominant cost is shrinking GEMM/MoE tiles, NOT the all-reduce — TP2 with a 2-rank all-reduce is slower per GPU than TP4 with 4 ranks.",
+      "caveat": "Round-robin routing instead of prefix-affinity turns the 2x win into a 35% LOSS on cached traffic (hit rate -8.8pt). Affinity balances cleanly only when group count divides replica count."
+    },
+    {
+      "finding": "Chunk size on cached workloads sets batching WIDTH, not splitting depth",
+      "detail": "With ~93% hits only ~4.4k of ~70k tokens per request are new, so chunk governs requests-batched-per-forward-pass. Predictor: requests/pass ~= chunk / new-tokens-per-request. Verified on Qwen (14-16 req/pass in 19 passes at 65536 vs 4-6 in 56 at 16384).",
+      "outcome_is_model_specific": "Whether wider batching PAYS depends on how much fixed per-pass cost exists to amortise: Qwen +10.4%, gpt-oss null, GLM -12.1% (per-token DSA cost, nothing fixed to amortise), Gemma a Pareto trade (throughput -7%, TTFT -12.9%)."
+    },
+    {
+      "finding": "Page size is entirely model-specific with four different answers",
+      "detail": "gpt-oss requires 64 (1024 costs -18.5% via cache-match granularity); Gemma wants 1 (64 costs -13.5%, 1024 -24.5%, with NO hit-rate loss and NO pool bloat — mechanism unexplained); GLM is forced to 64 and 1024 hangs the server; Qwen cannot exceed 256 (assert mamba_track_interval % page_size == 0)."
+    }
+  ],
+
+  "models": [
+    {
+      "id": "gpt-oss-120b",
+      "status": "complete",
+      "tp": 4,
+      "measured_points": 90,
+      "errors": 0,
+      "dropped_requests": 0,
+      "report": "https://claude.ai/code/artifact/fdfd6daf-f7b9-4022-a3f3-5c610864be72",
+      "config_serves_both_workloads": true,
+      "config": {
+        "SGLANG_USE_AITER": 1,
+        "--tp": 4,
+        "--attention-backend": "triton",
+        "--prefill-attention-backend": "triton",
+        "--decode-attention-backend": "aiter",
+        "--page-size": 64,
+        "--chunked-prefill-size": 32768,
+        "--max-prefill-tokens": 32768,
+        "--mem-fraction-static": 0.85,
+        "--tokenizer-backend": "fastokens",
+        "--cuda-graph-backend-prefill": "breakable"
+      },
+      "config_notes": [
+        "--attention-backend triton MUST be passed alongside the split flags. Omitting it lets the unified value default to aiter, which fires the mem-fraction haircut (0.85 -> 0.7225) and costs 16% of the KV pool.",
+        "aiter decode and page_size > 1 only work JOINTLY: aiter decode at page 1 is a -20% regression, page size on triton alone is +0.07%. Page size saturates at 64 (64/128/256 within noise), independently matching vLLM's --block-size=64.",
+        "aiter cannot be used as a PREFILL attention backend on this model — no compiled CK instance for its trait tuple (window_size + sink_ptr at head_dim 64). The INT32_MAX/2GB error message is a red herring: a probe with a 410 MB per-layer K buffer, 5x under the stated bound, failed identically.",
+        "--prefill-max-requests is a -0.12% no-op here; realized ISL is exactly 8192 (verified three ways), so no sliver exists.",
+        "chunk 65536 does NOT win (+0.1-0.96%); saturated at 32768."
+      ],
+      "build": {
+        "image": "lmsysorg/sglang-rocm:v0.5.16-rocm720-mi35x-20260806",
+        "version": "0.5.16.dev20260806+g3654740347",
+        "patches_applied": ["extend-attention retile + SWA loop bounds", "JIT NDEBUG"],
+        "quickreduce_fix": "not applied — shown inert (ROCM_QUICK_REDUCE_QUANTIZATION defaults to NONE, early-returns before init_custom_qr; AiterCustomAllreduce used instead)"
+      },
+      "results": {
+        "W1_peak_tok_s": 146002,
+        "W1_peak_tok_s_per_gpu": 36501,
+        "W2_peak_tok_s_served": 691104,
+        "concurrency_band": {"W1": "cc1-8", "W2": "cc8-32"},
+        "cc4_fraction_of_peak": 0.904,
+        "cc128_cost": "last 9.6% of throughput for 94.8x TTFT"
+      },
+      "W2_hit_rate": {
+        "ceiling": 90.9,
+        "achieved": 90.75,
+        "why_below_nominal": "question inflates 4096 -> 6250 tokens (+53%) while system prompt barely moves; realized ISL 67,560 = 61,310 prefix + 6,250 question"
+      },
+      "data_parallel": {
+        "verdict": "4xTP1 + prefix-affinity router is the best configuration on BOTH workloads",
+        "crossover_aggregate_cc": 2,
+        "W1_tok_s_by_cc": {
+          "1":   {"TP4": 108202, "DP2xTP2": 65181,  "DP4xTP1": 65526},
+          "2":   {"TP4": 108319, "DP2xTP2": 129791, "DP4xTP1": 131601},
+          "4":   {"TP4": 132608, "DP2xTP2": 133699, "DP4xTP1": 264433},
+          "8":   {"TP4": 139716, "DP2xTP2": 153855, "DP4xTP1": 272204},
+          "16":  {"TP4": 139507, "DP2xTP2": 171672, "DP4xTP1": 290020},
+          "32":  {"TP4": 143199, "DP2xTP2": 167242, "DP4xTP1": 291522},
+          "64":  {"TP4": 143177, "DP2xTP2": 168107, "DP4xTP1": 285758},
+          "128": {"TP4": 142773, "DP2xTP2": 165394, "DP4xTP1": 289179}
+        },
+        "W1_ttft_p50_ms_by_cc": {
+          "1": {"TP4": 75.5, "DP2xTP2": 125.5, "DP4xTP1": 125.2},
+          "2": {"TP4": 145.0, "DP2xTP2": 125.9, "DP4xTP1": 124.7},
+          "4": {"TP4": 246.2, "DP2xTP2": 245.0, "DP4xTP1": 123.6},
+          "8": {"TP4": 467.8, "DP2xTP2": 429.3, "DP4xTP1": 238.9},
+          "16": {"TP4": 898.5, "DP2xTP2": 742.1, "DP4xTP1": 448.3},
+          "32": {"TP4": 1798, "DP2xTP2": 1523, "DP4xTP1": 845.1},
+          "64": {"TP4": 3596, "DP2xTP2": 3070, "DP4xTP1": 1721},
+          "128": {"TP4": 7355, "DP2xTP2": 6017, "DP4xTP1": 3394}
+        },
+        "tp_scaling_solo_8k_prefill_ms": {"TP1": 125.2, "TP2": 125.6, "TP4": 75.5},
+        "W2_routing": {
+          "TP4_1replica":        {"hit_pct": 90.53, "tok_s_cc128": 467657, "ttft_p50_cc32_ms": 3219},
+          "DP2_round_robin":     {"hit_pct": 87.53, "tok_s_cc128": 363478, "ttft_p50_cc32_ms": 3129},
+          "DP2_cache_aware":     {"hit_pct": 88.76, "tok_s_cc128": 408392, "ttft_p50_cc32_ms": 5115},
+          "DP4_round_robin":     {"hit_pct": 81.75, "tok_s_cc128": 304369, "ttft_p50_cc32_ms": 3924},
+          "DP4_cache_aware":     {"hit_pct": 90.75, "tok_s_cc128": 582715, "ttft_p50_cc32_ms": 2426}
+        },
+        "kv_capacity": {
+          "TP4":     {"mem_frac": 0.7225, "kv_gb_per_gpu": 81.5, "max_total_num_tokens": 11872192},
+          "DP2xTP2": {"mem_frac": 0.7225, "kv_gb_per_gpu": 74.1, "max_total_num_tokens_per_replica": 5398272},
+          "DP4xTP1": {"mem_frac": 0.7225, "kv_gb_per_gpu": 61.4, "max_total_num_tokens_per_replica": 2233984}
+        },
+        "notes": [
+          "Router overhead negligible (+0.14%); all arms ran behind the router so it is common-mode.",
+          "Degradation under round-robin is exactly N-fold prefix materialization (1,518,912 lost cached tokens vs 1,474,560 predicted, 3% over).",
+          "DP4 gives up 25% of node KV capacity to weight replication but never bound — no retractions or pool-full events in any arm."
+        ]
+      },
+      "caveats": [
+        "W2 cc1 is the one cell not measured at the intended hit rate (point sizing let it replay the pre-warm's own dataset at 99.91% cached)."
+      ]
+    },
+
+    {
+      "id": "qwen3.5-27b-fp8",
+      "status": "complete",
+      "tp": 4,
+      "measured_points": 60,
+      "errors": 0,
+      "fp8_gemm_misses": 0,
+      "config_serves_both_workloads": true,
+      "architecture_note": "NOT dense — a 64-layer hybrid: 48 GDN linear-attention + 16 full-attention layers (full_attention_interval 4), head_dim 256, VLM with mrope. Only 1 layer in 4 holds KV, hence the 6.67M token pool.",
+      "config": {
+        "SGLANG_USE_AITER": 1,
+        "--tp": 4,
+        "--attention-backend": "aiter",
+        "--page-size": 16,
+        "--mamba-backend": "triton",
+        "--linear-attn-backend": "triton",
+        "--chunked-prefill-size": 65536,
+        "--max-prefill-tokens": 65536,
+        "--mem-fraction-static": 0.85,
+        "--tokenizer-backend": "gigatoken",
+        "--context-length": "unset"
+      },
+      "config_notes": [
+        "--max-prefill-tokens MUST be raised with the chunk or the 16384 default binds (~2.7%). Flag semantics: raising above chunk is inert; lowering below chunk binds but does NOT collapse to the equivalent chunk's behaviour.",
+        "mem_fraction_static 0.85 resolves to 0.7225 here (aiter + context > 8192). max_total_num_tokens ~6.67M.",
+        "--page-size 1024 is structurally impossible: assert mamba_track_interval % page_size == 0, and mamba_track_interval defaults to 256. Hybrid-model-only constraint.",
+        "Prefill/decode backend split is worth +0.1% — nothing at OSL=1.",
+        "The tuned GEMM table must be a8w8_blockscale_bpreshuffle, NOT plain a8w8_blockscale, and must be extended to M=65536 (3456 -> 3540 rows, 135/135 probe hits)."
+      ],
+      "build": {
+        "image": "lmsysorg/sglang-rocm:v0.5.16-rocm720-mi35x-20260806",
+        "version": "0.5.16.dev20260806+g3654740347",
+        "method": "git apply -3 of individual feature commits",
+        "commits": ["06b0f7f3a1 GDN V-tile", "12006159be JIT NDEBUG", "52277afb9c gigatoken"]
+      },
+      "W1": {
+        "note": "ISL exactly 8192 server-side, 0% cache",
+        "columns": ["cc", "req_s", "in_tok_s", "pct_peak", "ttft_mean_ms", "ttft_p50", "ttft_p90", "ttft_p99", "ttft_std"],
+        "rows": [
+          [1, 5.074, 41566, 84.3, 197, 195, 197, 226, 7],
+          [2, 5.224, 42794, 86.8, 380, 379, 392, 425, 22],
+          [4, 5.393, 44177, 89.6, 733, 688, 931, 1143, 134],
+          [8, 5.801, 47518, 96.3, 1359, 1348, 1552, 1557, 159],
+          [16, 5.950, 48744, 98.8, 2497, 2675, 2701, 2701, 453],
+          [32, 5.988, 49055, 99.4, 4874, 5308, 5438, 5500, 1124],
+          [64, 6.006, 49204, 99.7, 9507, 10602, 10773, 10992, 2482],
+          [128, 6.022, 49328, 100.0, 18746, 21094, 21358, 21513, 5207]
+        ]
+      },
+      "W2": {
+        "note": "realized ISL 70,109 = 65,726.6 system + 4,382.9 question; inflation proportional so ratio stays 93.75%. in_tok_s counts CACHED tokens and is inflated ~16x — true new-token rate at cc=32 is 28,435 tok/s.",
+        "columns": ["cc", "req_s", "in_tok_s_inflated", "pct_peak", "ttft_mean_ms", "ttft_p50", "ttft_p90", "ttft_p99", "hit_pct"],
+        "rows": [
+          [1, 4.471, 313586, 69.0, 223, 223, 235, 272, 93.84],
+          [2, 4.955, 347042, 76.3, 397, 410, 412, 463, 94.07],
+          [4, 5.466, 383057, 84.2, 702, 735, 741, 762, 93.86],
+          [8, 6.121, 428953, 94.3, 1210, 1299, 1335, 1387, 93.85],
+          [16, 6.351, 445373, 97.9, 2393, 2480, 2651, 2664, 93.76],
+          [32, 6.488, 454713, 100.0, 4547, 4834, 5100, 5194, 93.73],
+          [64, 6.397, 448600, 98.7, 9017, 9244, 11598, 11904, 93.70],
+          [128, 6.298, 441460, 97.1, 17962, 19415, 21082, 21452, 93.71]
+        ]
+      },
+      "config_axes_at_cc32": {
+        "chunk_16384": {"req_s": 5.879, "delta_pct": -9.8},
+        "chunk_32768": {"req_s": 6.323, "delta_pct": -3.0},
+        "chunk_65536": {"req_s": 6.517, "delta_pct": 0.0, "baseline": true},
+        "page_64": {"req_s": 6.542, "delta_pct": 0.4},
+        "page_256": {"req_s": 5.372, "delta_pct": -17.6, "note": "p99 2x, hit falls to 92.25%"},
+        "prefill_decode_split": {"req_s": 6.523, "delta_pct": 0.1},
+        "context_73728": {"req_s": 6.448, "delta_pct": -1.1}
+      },
+      "batching_width_evidence": {
+        "chunk_65536": {"requests_per_pass": [14, 15, 16], "passes_for_128_reqs": 19},
+        "chunk_16384": {"requests_per_pass": [4, 5, 6], "passes_for_128_reqs": 56},
+        "predictor": "requests/pass ~= chunk / new-tokens-per-request (65536/4400=14.9, 16384/4400=3.7)"
+      },
+      "W2_hit_rate": {"ceiling": 93.75, "achieved_range": [93.70, 94.07], "back_solve_for_true_64k": "--gsp-system-prompt-len 57432 --gsp-question-len 3828"},
+      "open_issues": ["776 bf16 (not fp8) GEMM misses at M=65536,N=24,K=5120 — untuned shape in bf16_tuned_gemm.csv, present on all chunk-65536 arms"],
+      "drift": "+0.88% (cc32) / -0.23% (cc8) over ~50 min under contention; replicate spread 1.0-1.1% (W2), 0.14-1.5% (W1)"
+    },
+
+    {
+      "id": "glm-5.2-fp8",
+      "status": "complete",
+      "tp": 8,
+      "measured_points": 72,
+      "errors": 0,
+      "config_serves_both_workloads": false,
+      "config_differs_on": "chunked-prefill-size only",
+      "config": {
+        "SGLANG_USE_AITER": 1,
+        "--tp": 8,
+        "--page-size": 64,
+        "--kv-cache-dtype": "bfloat16",
+        "--dsa-prefill-backend": "aiter",
+        "--dsa-decode-backend": "tilelang",
+        "--mem-fraction-static": 0.85,
+        "--chunked-prefill-size": {"W1": 16384, "W2": 32768, "single_compromise": 32768},
+        "--max-prefill-tokens": "match the chunk",
+        "--tokenizer-backend": "gigatoken",
+        "--cuda-graph-backend-prefill": "disabled (REQUIRED — see below)"
+      },
+      "config_notes": [
+        "--cuda-graph-backend-prefill breakable is the DEFAULT and CRASHES GLM-5.2 on ROCm, so the model does not start out of the box. tc_piecewise fails identically; full fails differently (DeepseekSparseAttnBackend missing decode_cuda_graph_metadata). Only disabled works.",
+        "If one config must serve both workloads use chunk 32768: it costs W1 ~2-3%, whereas 16384 costs W2 ~11% at cc8.",
+        "mem_fraction_static 0.85 takes NO aiter haircut (backend resolves to dsa) — 0.8597 of 287.69 GiB used, KV 145.83 GB, max_total_num_tokens 1,563,392.",
+        "--max-prefill-tokens is NEVER inert; it resolves literally even at context_len=1048576. But its semantics are a BATCH-WIDTH limiter, not a chunking limiter: at mpt=4096 a single 8192-token request is still admitted whole. Chunking is governed solely by chunked_prefill_size.",
+        "--page-size is forced to 64 (sglang logs 'Setting page size to 64 for DeepSeek DSA'). Passing 1024 is actively harmful: it perturbs memory sizing (max_total_num_tokens 595,072 vs 1,563,392) and HUNG the server into a watchdog kill. The override reaches the attention path but not the memory-pool path — a real bug.",
+        "Tight --context-length buys 14 GB free VRAM and max_running_requests 4096 vs 2048."
+      ],
+      "build": {
+        "image": "lmsysorg/sglang-rocm:v0.5.17-rocm720-mi35x-20260813",
+        "branch_head": "97b20ceb92",
+        "method": "whole-tree mount: -v /data/logs/glm52/sgl-src:/sgl-src -e PYTHONPATH=/sgl-src/python",
+        "model": "zai-org/GLM-5.2-FP8 (756 GB, 141 shards), GlmMoeDsaForCausalLM, 78 layers + 1 MTP, MLA kv_lora_rank 512, DSA index_topk 2048, 256 experts / 8 active"
+      },
+      "results": {
+        "W1_cc1_tok_s": 18386,
+        "W1_cc128_tok_s": 19490,
+        "W1_throughput_gain_pct": 6.0,
+        "W1_ttft_ms": {"cc1": 444, "cc128": 47400, "growth": "107x"},
+        "W2_cc1_tok_s": 201145,
+        "W2_cc128_tok_s": 206978,
+        "W2_throughput_gain_pct": 2.9,
+        "W2_ttft_ms": {"cc1": 338, "cc128": 37261, "growth": "110x"},
+        "solo_tp8_prefill_ms": 444.3,
+        "solo_tok_s_per_gpu": 2298,
+        "useful_concurrency": "cc1-4 on both workloads"
+      },
+      "W2_chunk_ladder_tok_s": {
+        "note": "hit-rate control PASSED — server-side 93.69% identical on all three rungs",
+        "cc8":   {"16384": 188417, "32768": 212237, "65536": 212667},
+        "cc32":  {"16384": 195936, "32768": 211136, "65536": 188859},
+        "cc128": {"16384": 209100, "32768": 206978, "65536": 183732}
+      },
+      "mechanism": {
+        "conclusion": "GLM's DSA prefill cost is PER-TOKEN, not per-pass — there is nothing fixed to amortise, plus a superlinear penalty above ~32768 tokens/pass",
+        "evidence_1": "batching width matched the predictor exactly (W2 chunk/4311 + ~1 -> 5/9/16 observed, passes 136->69->35)",
+        "evidence_2": "per-pass time is proportional to tokens-per-pass: W1 cc128 819/1665/3331 ms (2.03x, 2.00x); W2 cc128 1229/2447/5434 ms (1.99x, 2.22x)",
+        "evidence_3": "--max-prefill-tokens 4096 collapsed width 5->1 and passes 33->128 (3.9x more passes) for a cost of only -1.84%"
+      },
+      "W2_hit_rate": {"ceiling": 93.69, "achieved": 93.69, "realized_isl": 68247, "prefix_inflation_pct": 4.1, "question_inflation_pct": 5.2},
+      "drift": "concentrated at high concurrency: -5.5% at cc128, -4.9% at cc32, but -0.26%/+0.07% at cc1/cc8 over 2h43m. Cross-boot comparisons at cc32/cc128 need >5.5% margins."
+    },
+
+    {
+      "id": "gemma-4-31b-it",
+      "status": "complete",
+      "tp": 2,
+      "measured_points": 97,
+      "errors": 0,
+      "config_serves_both_workloads": true,
+      "config": {
+        "--tp": 2,
+        "--attention-backend": "triton",
+        "--page-size": 1,
+        "--chunked-prefill-size": 32768,
+        "--max-prefill-tokens": 32768,
+        "--mem-fraction-static": 0.85,
+        "--swa-full-tokens-ratio": 0.8,
+        "--tokenizer-backend": "gigatoken",
+        "--cuda-graph-backend-prefill": "DO NOT PASS",
+        "--context-length": "optional (free)",
+        "TVM_FFI_CACHE_DIR": "REQUIRED — server dies at ~55 s without it"
+      },
+      "config_notes": [
+        "--cuda-graph-backend-prefill breakable CRASHES Gemma4 (ValueError: You must specify exactly one of input_ids or inputs_embeds). sglang AUTO-DISABLES the prefill graph for this multimodal arch; passing the flag OVERRIDES that auto-disable and re-enables a broken path.",
+        "Prefill/decode backend split is ILLEGAL: 'Gemma4 only supports trtllm_mha, triton, or intel_xpu attention backend'. gpt-oss's +18.3% cannot transfer.",
+        "--enable-aiter-allreduce-fusion is INERT — zero allreduce_fusion call sites in any gemma4*.py.",
+        "--prefill-max-requests 4 gains +1.3% throughput / -2.1% TTFT at cc>=32 despite realized ISL being exactly 8192, because the scheduler otherwise packs a 5th partial request (#new-seq: 5). W1-specific.",
+        "--swa-full-tokens-ratio: KEEP the 0.8 default. Lowering it scales the pool hugely (0.3 -> 1.35M, 0.15 -> 2.16M full-layer tokens) but is a clear loss (cc32: 37.1k vs 61.0k tok/s) — the SWA pool is the binding constraint and SWA tokens cost ~10x full-pool tokens (191 KB vs 19 KB)."
+      ],
+      "build": {
+        "image": "lmsysorg/sglang:v0.5.16-rocm720-mi35x",
+        "version": "0.5.16 release (fdebc938f7)",
+        "method": "git apply per feature commit",
+        "patches_applied": ["SWA extend-attention loop bounds", "gigatoken (+ gigatoken==0.10.0)"],
+        "not_applicable_confirmed": ["QuickReduce (disabled by default)", "JIT NDEBUG (python/sglang/kernels/jit/ does not exist in 0.5.16)", "GDN/MoE/retile (other models)"]
+      },
+      "W1": {
+        "note": "server-verified 0.00% cached, 512/512, 0 errors. Throughput flat within +/-3.5% while TTFT scales exactly linearly (412 ms x cc).",
+        "columns": ["cc", "tok_s", "ttft_p50_ms"],
+        "rows": [
+          [1, 19918, 412.0],
+          [2, 20215, 811.6],
+          [4, 20035, 1623.4],
+          [8, 20155, 3219.1],
+          [16, 19749, 6641.9],
+          [32, 19708, 13300.8],
+          [64, 19570, 26647.9],
+          [128, 19523, 53414.6]
+        ],
+        "cc1_pct_of_peak": 98.5,
+        "mechanism": "server batch width is chunk/ISL = 4-5 regardless of client cc; full_tok_usage peaks at 0.07 — W1 never touches the KV pool"
+      },
+      "W2": {
+        "note": "corrected protocol: constant ppg=32, per-rung flush; hit 90.2-90.9% every rung",
+        "columns": ["cc", "tok_s", "ttft_p50_ms", "req_per_pass", "passes"],
+        "rows": [
+          [1, 93512, 630, 1, 135],
+          [2, 91230, 1112, 2, 134],
+          [4, 89083, 2107, 2, 101],
+          [8, 93624, 3961, 4, 41],
+          [16, 105744, 7645, 7, 32],
+          [32, 95791, 16124, 9, 25],
+          [64, 91116, 32832, 9, 26]
+        ],
+        "cc1_pct_of_peak": 88,
+        "real_ceiling": "full_tok_usage saturates at 0.470 from cc=16"
+      },
+      "chunk_ladder": {
+        "W1_tok_s": {"cc1": {"16384": 19953, "32768": 19918, "65536": 19931},
+                      "cc32": {"16384": 19402, "32768": 19708, "65536": 19830},
+                      "cc128": {"16384": 19042, "32768": 19523, "65536": 19611}},
+        "W2_cc32_hit_matched": {"16384": {"tok_s": 93922, "passes": 51, "width": 5},
+                                 "32768": {"tok_s": 95791, "passes": 25, "width": 9},
+                                 "65536": {"tok_s": 88447, "passes": 19, "width": 15}},
+        "conclusion": "batching-width mechanism reproduces exactly (2.7x fewer passes) but does NOT buy throughput — 65536 is 7% slower. Only TTFT p50 improves monotonically (-12.9%). A genuine Pareto trade, unlike Qwen. Matches the prediction: with 50/60 sliding layers at window 1024, only 10 layers walk the long prefix, so there is little per-pass cost to amortise."
+      },
+      "page_size_ladder_W2_tok_s": {
+        "note": "hit-matched, pool flat. Gemma lost NO hit rate at any page size (90.5-91.3% at cc32), so this is NOT cache-match granularity (unlike gpt-oss) and NOT pool bloat. Mechanism unexplained; penalty grows with concurrency.",
+        "1":    {"cc8": 50328, "cc32": 87779, "cc128": 113292},
+        "64":   {"cc8": 49560, "cc32": 79870, "cc128": 97980},
+        "256":  {"cc8": 48996, "cc32": 76310, "cc128": 101423},
+        "1024": {"cc8": 48333, "cc32": 71351, "cc128": 85560}
+      },
+      "capacity_finding": {
+        "headline": "Group count decides W2 throughput by 3.05x",
+        "detail": "Realized 8 x 71.6k prefixes = 573k against a 599k pool produced a cyclic-LRU cliff: 6 x 76k prompts all retained, 8 x 76k retained 0/8. As-briefed 8-group W2 runs at 82.1% hit / 37,100 tok/s versus calibrated 4-group 113,292 tok/s at cc=128.",
+        "rule": "Keep the prefix working set under ~250k tokens"
+      },
+      "W2_hit_rate": {"ceiling": 93.74, "prefix_inflation_pct": 16.6, "question_inflation_pct": 17.2,
+                       "calibration_used": "--gsp-system-prompt-len 52851 --gsp-question-len 3528 -> realized 61424 + 4102 = 65527"},
+      "drift": "W1 replicated within +/-0.2% across 2.9 hours. W2 noisier: +/-1.8% at cc128/cc32 but -15% at cc8 — trust W2 cc>=16, treat W2 cc<=8 deltas as noise.",
+      "tokenizer_note": "gigatoken encode byte-identical to HF on all edge cases and every W1/W2 prompt. Its decode diverges only on runs of >=2 adjacent <0xNN> byte-fallback tokens (HF emits one U+FFFD each, gigatoken assembles bytes) — irrelevant here since the client tokenizes with HF and OSL=1."
+    },
+
+    {
+      "id": "kimi-k2.7",
+      "status": "running",
+      "tp": 4,
+      "tp_forced_reason": "64 heads under AITER MLA",
+      "expected_config": {
+        "SGLANG_USE_AITER": 1,
+        "--tp": 4,
+        "--mem-fraction-static": 0.85,
+        "--chunked-prefill-size": "ladder 16384/32768/65536",
+        "--max-prefill-tokens": "match the chunk",
+        "--tokenizer-backend": "huggingface",
+        "--cuda-graph-backend-prefill": "breakable (try; validate)"
+      },
+      "known_constraints": [
+        "W4A16 only — MXFP4 is ~7.5x faster but costs 2.2 pp gsm8k AND vLLM #36337 reports gibberish on MI350X/ROCm 7.2 (our exact stack)",
+        "gigatoken cannot load a TikToken tokenizer — fails loudly",
+        "Structural ceiling: CDNA4 has no native INT4, so W4A16 runs at the bf16 dequant ceiling (~2,632 tok/s/GPU measured previously)",
+        "gfx950 Triton MoE table is a PARTIAL hit: up-projection resolves, down-projection reports 'Down MoE config file not found', and 'Using default MoE kernel config' NEVER appears — the usual grep misleads",
+        "SWA / prefix-trim changes are inert (routes through AITER MLA, triton extend_attention compiles: 0)"
+      ],
+      "prediction": "Chunk behaviour closer to Qwen (AITER MLA with no sliding window walks the full cached prefix every layer = maximum fixed per-pass cost to amortise), UNLESS memory caps batching width first — the likely binding constraint on the largest model.",
+      "prior_measurements_to_confirm_or_refute": {
+        "W1_cc1_ttft_ms": 997.5,
+        "W2_64k_93.75pct_cached_ttft_ms": 810.4,
+        "note": "the cached 64k prompt was FASTER than an uncached 8k one"
+      }
+    }
+  ],
+
+  "methodology_rules": {
+    "mandatory_flags": {
+      "--random-range-ratio": "1.0 — the default 0.0 gives a mean of ~50% of nominal ISL and P99 +357%",
+      "--disable-radix-cache": "on the SERVER for uncached work; distinct prompts are not enough"
+    },
+    "W2_protocol": [
+      "Pin the seed across prewarm and measurement",
+      "Keep --gsp-prompts-per-group CONSTANT between prewarm and measurement (ppg-invariance is partial: ppg=1 vs ppg=16 prefix sets matched 8/8 for a fixed seed, but ppg=4 vs ppg=1 did not)",
+      "flush_cache before EVERY point — descending ladders otherwise re-run the previous rung's exact requests (observed 100.0% hit, 17 new tokens, 651k tok/s = void data)",
+      "Back-solve gsp lengths so REALIZED ISL lands near the target; nominal 61440/4096 realizes to 67.5k-76.4k depending on tokenizer",
+      "Size group count so the prefix working set fits the KV pool — 8 groups overflowed Gemma's and retained 0/8",
+      "Discriminating control for whether prewarm works: same ppg with a NON-matching seed. Only discriminates at low ppg; at ppg>=32 amortization and prewarm predictions converge."
+    ],
+    "reporting": [
+      "Report realized ISL and the computed hit-rate ceiling (realized-prefix / realized-total), not the nominal 93.75%",
+      "Quote per-point steady-state hit rate, not the whole-log aggregate (87.9% vs 93.7% on the same run — two denominators)",
+      "in_tok/s on cached workloads counts cached tokens and is inflated ~16x — report the true new-token rate separately",
+      "Exclude ttft = 0.0 records but report the fraction excluded",
+      "#running-req is NOT residency — it tracks cumulative requests processed. Use full_tok_usage and #new-seq; label concurrency client-offered",
+      "Include a drift control and state the contention boundary"
+    ],
+    "operational_traps": [
+      "ufw limit ssh is active — retries REFRESH the block. Use one ssh ControlMaster socket; detach long runs with nohup setsid",
+      "Never pattern-kill (pkill -f launch_server matches every agent's server AND your own shell). Kill by port: ss -ltnpH sport = :PORT -> PGID",
+      "HIP_VISIBLE_DEVICES REPLACES a container's GPU restriction rather than intersecting it — use --base-gpu-id on restricted containers",
+      "docker ps is blind to k3s pods — judge occupancy from rocm-smi --showmeminfo vram --csv in BYTES, never --showmemuse",
+      "The AOT build tracks no header dependencies — editing a .cuh yields a stale .so that runs cleanly and silently gives unpatched results",
+      "--enable-cache-report defaults off on the server on some builds (gpt-oss needed it; GLM and Gemma reported hit rates without it) — verify rather than assume"
+    ]
+  },
+
+  "open_issues": [
+    "MI355X: 32 idle GPUs on mi355x-amd-slurm, unreachable — the slurm jumpbox at 216.114.73.93 rejects both available SSH keys. Needs an ops request.",
+    "Upstream PR correction needed: QuickReduce is inert on most images (ROCM_QUICK_REDUCE_QUANTIZATION defaults to NONE and early-returns), so the 'shipped default' framing overstates the defect. It WAS set to INT8 by the image where the bug was found — the defect is real but image-dependent.",
+    "Unfiled bug: GLM --page-size 1024 hangs the server; the override reaches the attention path but not the memory-pool path.",
+    "Unfiled bug: prefill CUDA graphs are broken on ROCm for DSA models (GLM) and are wrongly re-enabled by the flag on multimodal models (Gemma).",
+    "Branch commit f25dca3f6f (DSA in-graph prefill HIP port) is UNVALIDATED on hardware — GLM's campaign ran entirely on disabled.",
+    "Qwen: 776 bf16 GEMM misses at M=65536,N=24,K=5120 — untuned shape in bf16_tuned_gemm.csv."
+  ]
+}
