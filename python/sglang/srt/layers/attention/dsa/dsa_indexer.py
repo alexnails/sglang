@@ -133,15 +133,19 @@ if TYPE_CHECKING:
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 
+# Device-agnostic pure-PyTorch head gates. Importing these only under `if
+# _is_cuda` left the piecewise/breakable branch below calling undefined names on
+# HIP, so GLM-5.2 could not start under the *default* prefill graph mode.
+from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
+    logits_head_gate_graph,
+    scale_head_gate_graph,
+)
+
 if _is_cuda:
     from sglang.kernels.ops.attention.dsv4 import fused_q_indexer_rope_first_quant
     from sglang.kernels.ops.quantization.dsv32 import (
         fused_k_indexer_norm_rope,
         fused_k_indexer_norm_rope_store,
-    )
-    from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
-        logits_head_gate_graph,
-        scale_head_gate_graph,
     )
 
     @register_custom_op(mutates_args=["topk_indices"])
@@ -1713,13 +1717,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             else:
                 x_for_gate = x
 
-            # The *_graph head-gate helpers are imported only under `if _is_cuda`
-            # (they are Dynamo-safe custom ops with no ROCm build), so on HIP this
-            # branch would raise NameError. `use_dsa_indexer_fusion` is likewise
-            # `_is_cuda and ...`, leaving no reachable path and making GLM-5.2 fail
-            # to start under the *default* prefill graph mode. Fall through to the
-            # eager head-gate on HIP.
-            if in_piecewise_or_breakable_cuda_graph and _is_cuda:
+            if in_piecewise_or_breakable_cuda_graph:
                 if self.use_dsa_indexer_fusion:
                     weights = scale_head_gate_graph(
                         weights_raw,
