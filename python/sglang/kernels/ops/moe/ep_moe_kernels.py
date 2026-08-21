@@ -2025,6 +2025,9 @@ def requant_launch_geometry(
     One program per expected row, never above the historical 32 and additionally
     capped by the expert count while rows are scarce, was the measured optimum
     across hidden sizes and expert counts -- so this only ever shrinks the grid.
+    The row count is rounded down to a power of two because the dispatcher's
+    estimate already rounds up (it adds the expert count before dividing), so an
+    exact average of 8 rows arrives as 9 and must not launch 16 programs.
     """
     g_block = (
         _REQUANT_G_BLOCK_MANY_EXPERTS
@@ -2035,7 +2038,7 @@ def requant_launch_geometry(
     g_block = min(g_block, 1 << (max(1, num_groups).bit_length() - 1))
     if expected_rows is None:
         return g_block, _REQUANT_M_GRID_MAX
-    m_grid = min(_REQUANT_M_GRID_MAX, triton.next_power_of_2(max(1, expected_rows)))
+    m_grid = min(_REQUANT_M_GRID_MAX, 1 << (max(1, expected_rows).bit_length() - 1))
     if expected_rows < _REQUANT_ROWS_SATURATED:
         cap = _REQUANT_TARGET_PROGRAMS // max(1, num_experts)
         m_grid = min(m_grid, 1 << (max(1, cap).bit_length() - 1))

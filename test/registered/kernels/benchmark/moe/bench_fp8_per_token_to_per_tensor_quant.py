@@ -1,9 +1,10 @@
 """Benchmark the W4AFP8 DeepEP low-latency requant against its previous geometry.
 
-``legacy`` launches the same kernel with the launch parameters this kernel shipped
-with (a 1024-element tile, 8 warps, 32 programs per expert regardless of how many
-rows are live); ``tuned`` goes through the wrapper, which sizes the tile from the
-expert count and the m-grid from the dispatcher's expected rows per expert.
+``legacy-geometry`` launches the current kernel with the launch parameters it
+shipped with (a 1024-element tile, 8 warps, 32 programs per expert regardless of
+how many rows are live), so this isolates the launch geometry and not the
+scale-loading rewrite; ``tuned`` goes through the wrapper, which sizes the tile
+from the expert count and the m-grid from the dispatcher's expected rows.
 """
 
 import torch
@@ -27,6 +28,16 @@ LEGACY_WARPS = 8
 LEGACY_M_GRID = 32
 
 
+def _expected_m(num_experts, rows):
+    """What the dispatcher would report for a uniform dispatch of ``rows`` per expert.
+
+    `_DeepEPDispatcherImplLowLatency.dispatch_a` computes
+    ``(dispatched_rows + num_experts) // num_experts``, so an exact average
+    arrives one higher; the production launch has to be benchmarked with that.
+    """
+    return (rows * num_experts + num_experts) // num_experts
+
+
 def _build(num_experts, m, k, rows):
     x = (torch.randn(num_experts, m, k, device="cuda") * 4).to(FP8)
     # DeepEP returns the last two scale dims column-major (for TMA).
@@ -40,22 +51,22 @@ def _build(num_experts, m, k, rows):
     masked_m = torch.full((num_experts,), rows, dtype=torch.int32, device="cuda")
     output_scale = torch.tensor([2.0], dtype=torch.float32, device="cuda")
     output = torch.empty((num_experts, m, k), dtype=FP8, device="cuda")
-    return x, x_scale, masked_m, output_scale, output, rows
+    return x, x_scale, masked_m, output_scale, output, _expected_m(num_experts, rows)
 
 
-def _tuned(x, x_scale, masked_m, output_scale, output, rows):
+def _tuned(x, x_scale, masked_m, output_scale, output, expected_m):
     fp8_per_token_to_per_tensor_quant_triton(
         x=x,
         x_scale=x_scale,
         masked_m=masked_m,
         output_scale=output_scale,
         output=output,
-        expected_rows=rows,
+        expected_rows=expected_m,
     )
     return output
 
 
-def _legacy(x, x_scale, masked_m, output_scale, output, rows):
+def _legacy_geometry(x, x_scale, masked_m, output_scale, output, expected_m):
     num_groups = x.size(2) // K_SCALE_BLOCK_SIZE
     grid = (triton.cdiv(num_groups, LEGACY_G_BLOCK), LEGACY_M_GRID, x.size(0))
     _fp8_per_token_quant_to_per_tensor_quant_kernel[grid](
@@ -75,7 +86,7 @@ def _legacy(x, x_scale, masked_m, output_scale, output, rows):
     return output
 
 
-FN_MAP = {"tuned": _tuned, "legacy": _legacy}
+FN_MAP = {"tuned": _tuned, "legacy-geometry": _legacy_geometry}
 
 # (hidden, local experts, padded rows): DeepSeek-V3 at EP8, then a 3584 hidden
 # size at a low and a high local-expert count.
@@ -84,7 +95,7 @@ SHAPES = [(7168, 8, 1024), (3584, 8, 1024), (3584, 56, 256)]
 
 @marker.parametrize("hidden,num_experts,m", SHAPES, [(7168, 8, 1024)])
 @marker.parametrize("rows", [8, 32, 128, 256], [8, 256])
-@marker.benchmark("impl", ["tuned", "legacy"])
+@marker.benchmark("impl", ["tuned", "legacy-geometry"])
 def benchmark(hidden: int, num_experts: int, m: int, rows: int, impl: str):
     if rows > m:
         marker.skip("more live rows than the payload holds")

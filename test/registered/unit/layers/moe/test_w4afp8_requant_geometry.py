@@ -14,8 +14,11 @@ PREVIOUS_FIXED_M_GRID = 32
 
 
 class TestRequantLaunchGeometry(CustomTestCase):
-    def test_unknown_row_count_keeps_the_previous_grid(self):
-        """A caller with no row estimate must land on the historical geometry."""
+    def test_unknown_row_count_keeps_the_previous_m_grid(self):
+        """A caller with no row estimate keeps the historical m-grid.
+
+        Only the m-grid: the tile width and warp count change for every caller.
+        """
         for num_experts in (8, 56):
             _, m_grid = requant_launch_geometry(K3_GROUPS, num_experts)
             self.assertEqual(m_grid, PREVIOUS_FIXED_M_GRID)
@@ -55,6 +58,19 @@ class TestRequantLaunchGeometry(CustomTestCase):
                 DSV3_GROUPS, num_experts, expected_rows=1024
             )
             self.assertEqual(m_grid, PREVIOUS_FIXED_M_GRID)
+
+    def test_dispatcher_round_up_does_not_bump_the_grid(self):
+        """`dispatch_a` reports (rows + num_experts) // num_experts, i.e. one high.
+
+        Rounding the grid up as well would launch twice the programs the sweep
+        found optimal at every power of two.
+        """
+        for rows in (4, 8, 16, 32):
+            exact = requant_launch_geometry(DSV3_GROUPS, 8, expected_rows=rows)[1]
+            reported = requant_launch_geometry(DSV3_GROUPS, 8, expected_rows=rows + 1)[
+                1
+            ]
+            self.assertEqual(reported, exact, f"rows={rows}")
 
     def test_m_grid_is_bounded_and_monotonic(self):
         previous = 0

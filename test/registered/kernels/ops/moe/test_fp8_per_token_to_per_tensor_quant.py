@@ -96,11 +96,12 @@ def test_masked_rows_and_group_tail(k, expected_rows, column_major_scales):
     )
 
 
-# 40 selects the 16-group tile (which 3584 also tails); 128 additionally caps the
-# m-grid below what the row estimate asks for.
-@pytest.mark.parametrize("num_experts", [40, 128])
-def test_many_experts(num_experts):
-    m = 24
+# Both counts select the 16-group tile (which 3584 also tails).  The row estimates
+# are the ones that make the expert cap bind: 40 experts cap at 16 programs and 128
+# at 8, so without the cap these would be 32 and 16.
+@pytest.mark.parametrize("num_experts,expected_rows", [(40, 32), (128, 16)])
+def test_many_experts(num_experts, expected_rows):
+    m = 48
     # Every expert gets a different row count, as a real dispatch would.
     masked = [(e * 7) % (m + 1) for e in range(num_experts)]
     _run_and_check(
@@ -108,7 +109,7 @@ def test_many_experts(num_experts):
         m=m,
         k=3584,
         masked=masked,
-        expected_rows=8,
+        expected_rows=expected_rows,
         column_major_scales=True,
     )
 
