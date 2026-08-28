@@ -189,7 +189,11 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
         # into the cached prefix, which the gather cannot express.
         assert max_window < chunk, (
             f"short-conv extra_buffer needs every conv window "
-            f"({self.conv_window_lens}) < mamba_cache_chunk_size ({chunk})"
+            f"({self.conv_window_lens}) < mamba_cache_chunk_size ({chunk}); "
+            f"the minimum viable chunk here is {max_window + 1}. This is "
+            "derived in ServerArgs.mamba_cache_chunk_size, which must not "
+            "take a conv-only model's mamba_chunk_size (its scan length, 1) "
+            "as the caching granularity."
         )
         assert server_args.mamba_track_interval >= chunk, (
             f"mamba_track_interval ({server_args.mamba_track_interval}) must be "
