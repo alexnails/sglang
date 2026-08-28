@@ -1606,6 +1606,483 @@ class TestCCAQKMixRopeCoverage(CustomTestCase):
         torch.testing.assert_close(key, ref_k)
 
 
+class TestCCAQKMixKVStore(CustomTestCase):
+    """The fused KV scatter must write exactly what ``set_kv_buffer`` would.
+
+    Correctness here is not self-announcing: a wrong slot, a wrong head stride or
+    a missed ``full_to_swa`` indirection does not crash, it corrupts KV and shows
+    up much later as degraded output. So this compares the pool contents against
+    a second, identical pool driven through the real ``set_kv_buffer`` -- on both
+    a sliding-window layer (where the write goes through ``full_to_swa`` into the
+    SWA sub-pool) and a full-attention layer (where it does not).
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _ensure_dist_initialized()
+        from sglang.srt.runtime_context import get_context
+
+        cls._server_args_override = get_context().override_server_args(
+            model_path="dummy"
+        )
+        cls._server_args_override.install()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._server_args_override.restore()
+
+    @staticmethod
+    def _make_pool(*, size, size_swa, head_num, head_dim, swa_ids, full_ids, device):
+        from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+        return SWAKVPool(
+            size=size,
+            size_swa=size_swa,
+            page_size=1,
+            dtype=torch.bfloat16,
+            head_num=head_num,
+            head_dim=head_dim,
+            swa_attention_layer_ids=swa_ids,
+            full_attention_layer_ids=full_ids,
+            device=device,
+            enable_memory_saver=False,
+        )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused kernel requires a GPU")
+    def test_fused_store_matches_set_kv_buffer_on_both_layer_kinds(self):
+        from sglang.kernels.ops.attention import cca_qk_mix as kernel
+        from sglang.srt.layers.radix_attention import RadixAttention
+        from sglang.srt.layers.rotary_embedding import get_rope
+        from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+
+        dev = "cuda"
+        # 8:1 GQA at head_dim 128 -- ZAYA1-74B at attn_tp=2.
+        nq, nk, hd, T = 8, 1, 128, 6
+        # Both sub-pools the same size so a *missed* full->SWA indirection would
+        # write an in-range but wrong row (caught by the comparison) rather than
+        # running off the end of a smaller SWA pool.
+        size, size_swa = 64, 64
+        # Layer 0 sliding, layer 2 full: the hybrid_layer_pattern _make_swa_config
+        # produces for [4096, 0, 0, 0].
+        swa_ids, full_ids = [0], [2]
+
+        torch.manual_seed(13)
+        rope = get_rope(
+            head_size=hd,
+            rotary_dim=hd,
+            max_position=256,
+            base=10_000,
+            is_neox_style=True,
+            partial_rotary_factor=0.5,
+        ).to(dev)
+
+        for layer_id in (0, 2):
+            with self.subTest(layer=layer_id, sliding=layer_id in swa_ids):
+                fused_pool = self._make_pool(
+                    size=size,
+                    size_swa=size_swa,
+                    head_num=nk,
+                    head_dim=hd,
+                    swa_ids=swa_ids,
+                    full_ids=full_ids,
+                    device=dev,
+                )
+                ref_pool = self._make_pool(
+                    size=size,
+                    size_swa=size_swa,
+                    head_num=nk,
+                    head_dim=hd,
+                    swa_ids=swa_ids,
+                    full_ids=full_ids,
+                    device=dev,
+                )
+                # Mirror SWATokenToKVPoolAllocator's mapping: one entry per full
+                # slot plus the trailing -1 sentinel. A random PERMUTATION, so it
+                # is injective (no two tokens race for one row) and non-identity
+                # (an unapplied indirection cannot pass by luck).
+                n_full = size + 1
+                mapping = torch.empty(n_full + 1, dtype=torch.int64, device=dev)
+                mapping[:n_full] = torch.randperm(n_full, device=dev)
+                mapping[-1] = -1
+                fused_pool.register_mapping(mapping)
+                ref_pool.register_mapping(mapping)
+
+                conv_qk = (
+                    torch.randn(T, (nq + nk) * hd, dtype=torch.bfloat16, device=dev)
+                    * 0.3
+                )
+                pre_q = torch.randn(T, nq * hd, dtype=torch.bfloat16, device=dev) * 0.3
+                base_k = torch.randn(T, nk * hd, dtype=torch.bfloat16, device=dev) * 0.3
+                value = torch.randn(T, nk, hd, dtype=torch.bfloat16, device=dev)
+                k_scale = torch.rand(nk, device=dev) + 0.5
+                positions = torch.arange(3, 3 + T, dtype=torch.int64, device=dev)
+                # Spread the write locations so a "slot == token index" bug fails.
+                out_cache_loc = torch.tensor(
+                    [5, 1, 40, 17, 2, 63], dtype=torch.int64, device=dev
+                )
+
+                is_sliding = layer_id in swa_ids
+                full_to_swa = mapping if is_sliding else None
+                k_cache = fused_pool.get_key_buffer(layer_id)
+                v_cache = fused_pool.get_value_buffer(layer_id)
+                self.assertTrue(
+                    kernel.store_covered(
+                        value,
+                        k_cache,
+                        v_cache,
+                        out_cache_loc,
+                        full_to_swa,
+                        num_k_heads=nk,
+                        head_dim=hd,
+                        num_tokens=T,
+                        out_dtype=torch.bfloat16,
+                        device=torch.device(dev),
+                    )
+                )
+
+                q_got, k_got = kernel.cca_qk_mix(
+                    conv_qk,
+                    pre_q,
+                    base_k,
+                    k_scale,
+                    num_q_heads=nq,
+                    num_k_heads=nk,
+                    head_dim=hd,
+                    q_scale=hd**0.5,
+                    out_dtype=torch.bfloat16,
+                    positions=positions,
+                    cos_sin_cache=rope.cos_sin_cache,
+                    rotary_dim=rope.rotary_dim,
+                    value=value,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    out_cache_loc=out_cache_loc,
+                    full_to_swa=full_to_swa,
+                )
+
+                # The reference: hand the SAME k/v to the real set_kv_buffer, via
+                # the same KVWriteLoc bundle the attention backend builds.
+                layer = RadixAttention(
+                    num_heads=nq,
+                    head_dim=hd,
+                    scaling=hd**-0.5,
+                    num_kv_heads=nk,
+                    layer_id=layer_id,
+                    sliding_window_size=4095 if is_sliding else -1,
+                )
+                swa_loc = (
+                    ref_pool.translate_loc_from_full_to_swa(out_cache_loc)
+                    if is_sliding
+                    else None
+                )
+                ref_pool.set_kv_buffer(
+                    layer,
+                    KVWriteLoc(out_cache_loc, swa_loc),
+                    k_got.contiguous(),
+                    value.contiguous(),
+                )
+
+                torch.testing.assert_close(
+                    fused_pool.get_key_buffer(layer_id),
+                    ref_pool.get_key_buffer(layer_id),
+                    rtol=0,
+                    atol=0,
+                )
+                torch.testing.assert_close(
+                    fused_pool.get_value_buffer(layer_id),
+                    ref_pool.get_value_buffer(layer_id),
+                    rtol=0,
+                    atol=0,
+                )
+                # And the pool actually received something -- an all-zero buffer
+                # would trivially match an all-zero reference.
+                self.assertGreater(
+                    fused_pool.get_key_buffer(layer_id).abs().sum().item(), 0.0
+                )
+                self.assertEqual(q_got.shape, (T, nq, hd))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused kernel requires a GPU")
+    def test_negative_slots_are_skipped(self):
+        # The full->SWA mapping's trailing -1 is how a padding row says "write
+        # nothing". Writing it as slot -1 (or as slot 0) would corrupt a live
+        # entry, so pin the skip.
+        from sglang.kernels.ops.attention import cca_qk_mix as kernel
+        from sglang.srt.layers.rotary_embedding import get_rope
+
+        dev = "cuda"
+        nq, nk, hd, T, rows = 8, 1, 128, 3, 8
+        torch.manual_seed(4)
+        rope = get_rope(
+            head_size=hd,
+            rotary_dim=hd,
+            max_position=64,
+            base=10_000,
+            is_neox_style=True,
+            partial_rotary_factor=0.5,
+        ).to(dev)
+        k_cache = torch.zeros(rows, nk, hd, dtype=torch.bfloat16, device=dev)
+        v_cache = torch.zeros(rows, nk, hd, dtype=torch.bfloat16, device=dev)
+        # Only token 1 has a live slot; tokens 0 and 2 map to the sentinel.
+        mapping = torch.full((rows + 1,), -1, dtype=torch.int64, device=dev)
+        mapping[1] = 4
+        out_cache_loc = torch.tensor([0, 1, 2], dtype=torch.int64, device=dev)
+
+        kernel.cca_qk_mix(
+            torch.randn(T, (nq + nk) * hd, dtype=torch.bfloat16, device=dev),
+            torch.randn(T, nq * hd, dtype=torch.bfloat16, device=dev),
+            torch.randn(T, nk * hd, dtype=torch.bfloat16, device=dev),
+            torch.ones(nk, device=dev),
+            num_q_heads=nq,
+            num_k_heads=nk,
+            head_dim=hd,
+            q_scale=hd**0.5,
+            out_dtype=torch.bfloat16,
+            positions=torch.arange(T, dtype=torch.int64, device=dev),
+            cos_sin_cache=rope.cos_sin_cache,
+            rotary_dim=rope.rotary_dim,
+            value=torch.randn(T, nk, hd, dtype=torch.bfloat16, device=dev),
+            k_cache=k_cache,
+            v_cache=v_cache,
+            out_cache_loc=out_cache_loc,
+            full_to_swa=mapping,
+        )
+        written = (k_cache.abs().sum(dim=(1, 2)) > 0).nonzero().flatten().tolist()
+        self.assertEqual(written, [4])
+        written_v = (v_cache.abs().sum(dim=(1, 2)) > 0).nonzero().flatten().tolist()
+        self.assertEqual(written_v, [4])
+
+
+class TestCCAQKMixStoreCoverage(CustomTestCase):
+    """``store_covered`` negatives.
+
+    A rejected input costs one extra ``set_kv_buffer`` launch; an input that
+    should have been rejected corrupts KV silently. So the gate is the part that
+    matters, and it is written to be checkable without a GPU: the device test is
+    an explicit equality against the caller's device rather than ``is_cuda``, so
+    every branch can be exercised on CPU tensors.
+    """
+
+    @staticmethod
+    def _ok_args(nk=2, hd=8, T=3, rows=17, dtype=torch.bfloat16):
+        return dict(
+            value=torch.zeros(T, nk, hd, dtype=dtype),
+            k_cache=torch.zeros(rows, nk, hd, dtype=dtype),
+            v_cache=torch.zeros(rows, nk, hd, dtype=dtype),
+            out_cache_loc=torch.zeros(T, dtype=torch.int64),
+            full_to_swa=None,
+        )
+
+    def _covered(self, **over):
+        from sglang.kernels.ops.attention import cca_qk_mix as kernel
+
+        args = self._ok_args()
+        args.update(over)
+        return kernel.store_covered(
+            args["value"],
+            args["k_cache"],
+            args["v_cache"],
+            args["out_cache_loc"],
+            args["full_to_swa"],
+            num_k_heads=2,
+            head_dim=8,
+            num_tokens=3,
+            out_dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+        )
+
+    def test_the_baseline_is_covered(self):
+        self.assertTrue(self._covered())
+
+    def test_rejects_non_flash_kv_layouts(self):
+        # The 5-D SHUFFLE (vectorized_5d) layout: (blocks, H, D//x, page, x).
+        self.assertFalse(self._covered(k_cache=torch.zeros(4, 2, 4, 1, 2)))
+        self.assertFalse(self._covered(v_cache=torch.zeros(4, 2, 1, 8, 2)))
+        # The 4-D HND layout: (pages, H, page_size, D). Its per-slot row is not a
+        # contiguous [H, D] block, so a flat slot index would land elsewhere.
+        self.assertFalse(self._covered(k_cache=torch.zeros(17, 2, 1, 8)))
+        # And the paged 4-D flash view a caller might reshape into.
+        self.assertFalse(self._covered(k_cache=torch.zeros(17, 1, 2, 8)))
+
+    def test_rejects_a_non_bf16_pool(self):
+        # An fp8 pool stores under a different store_dtype and needs per-tensor
+        # scales the kernel does not apply.
+        fp8 = torch.zeros(17, 2, 8, dtype=torch.float8_e4m3fn)
+        self.assertFalse(self._covered(k_cache=fp8))
+        self.assertFalse(self._covered(v_cache=torch.zeros(17, 2, 8).float()))
+        self.assertFalse(self._covered(value=torch.zeros(3, 2, 8).float()))
+
+    def test_rejects_shape_and_stride_mismatches(self):
+        # Wrong head count / head dim on either buffer.
+        self.assertFalse(
+            self._covered(k_cache=torch.zeros(17, 4, 8, dtype=torch.bfloat16))
+        )
+        self.assertFalse(
+            self._covered(v_cache=torch.zeros(17, 2, 16, dtype=torch.bfloat16))
+        )
+        # A non-unit innermost stride (a transposed or strided view).
+        strided = torch.zeros(17, 8, 2, dtype=torch.bfloat16).transpose(1, 2)
+        self.assertFalse(self._covered(k_cache=strided))
+        # V with the wrong token count.
+        self.assertFalse(
+            self._covered(value=torch.zeros(2, 2, 8, dtype=torch.bfloat16))
+        )
+        # A 2-D V (not yet reshaped into heads).
+        self.assertFalse(self._covered(value=torch.zeros(3, 16, dtype=torch.bfloat16)))
+
+    def test_rejects_bad_locs_and_mappings(self):
+        # Float locs, the wrong length, a 2-D loc.
+        self.assertFalse(self._covered(out_cache_loc=torch.zeros(3)))
+        self.assertFalse(self._covered(out_cache_loc=torch.zeros(4, dtype=torch.int64)))
+        self.assertFalse(
+            self._covered(out_cache_loc=torch.zeros(3, 1, dtype=torch.int64))
+        )
+        # A non-int64 or empty full->SWA mapping.
+        self.assertFalse(self._covered(full_to_swa=torch.zeros(18, dtype=torch.int32)))
+        self.assertFalse(self._covered(full_to_swa=torch.zeros(0, dtype=torch.int64)))
+        # A well-formed one is fine.
+        self.assertTrue(self._covered(full_to_swa=torch.zeros(18, dtype=torch.int64)))
+
+    def test_rejects_missing_arguments(self):
+        for missing in ("value", "k_cache", "v_cache", "out_cache_loc"):
+            with self.subTest(missing=missing):
+                self.assertFalse(self._covered(**{missing: None}))
+
+    def test_rejects_a_cross_device_buffer(self):
+        from sglang.kernels.ops.attention import cca_qk_mix as kernel
+
+        args = self._ok_args()
+        # A "meta" tensor stands in for a buffer that belongs to another device;
+        # the check is device equality, so it fires without needing two real ones.
+        self.assertFalse(
+            kernel.store_covered(
+                args["value"],
+                args["k_cache"].to("meta"),
+                args["v_cache"],
+                args["out_cache_loc"],
+                None,
+                num_k_heads=2,
+                head_dim=8,
+                num_tokens=3,
+                out_dtype=torch.bfloat16,
+                device=torch.device("cpu"),
+            )
+        )
+
+    def test_store_is_only_offered_when_the_rope_fused(self):
+        # Storing an un-rotated k would be silent KV corruption, and the rotation
+        # happens inside the same kernel -- so the store must never be enabled
+        # while the rope fell back. Pinned on the CPU fallback, where neither
+        # fuses.
+        _ensure_dist_initialized()
+        cca = _make_tiny_cca(seed=6)[0]
+        T = 3
+        hd, nq, nk = cca.head_dim, cca.num_q_heads, cca.num_k_heads
+        qk_out = torch.randn(T, (nq + nk) * hd)
+        q_raw = torch.randn(T, nq * hd)
+        k_raw = torch.randn(T, nk * hd)
+        from sglang.srt.models.zaya import CCAKVStore
+
+        store = CCAKVStore(
+            k_cache=torch.zeros(8, nk, hd),
+            v_cache=torch.zeros(8, nk, hd),
+            out_cache_loc=torch.arange(T, dtype=torch.int64),
+            full_to_swa=None,
+        )
+        cca._mix_and_normalize_qk(
+            qk_out,
+            q_raw,
+            k_raw,
+            qk_out[:, : nq * hd].view(T, nq, hd),
+            qk_out[:, nq * hd :].view(T, nk, hd),
+            q_raw.view(T, nq, hd),
+            k_raw.view(T, nk, hd),
+            out_dtype=torch.float32,
+            rope=None,
+            value=torch.randn(T, nk, hd),
+            kv_store=store,
+        )
+        self.assertFalse(cca.rope_fused)
+        self.assertFalse(cca.kv_store_fused)
+        # Nothing was written into the stand-in pool.
+        self.assertEqual(store.k_cache.abs().sum().item(), 0.0)
+
+
+class TestZayaAttentionKVStoreGate(CustomTestCase):
+    """``ZayaAttention._kv_store`` must decline every pool it cannot address.
+
+    The resolver is pure Python over the live pool objects, so its rejects are
+    checkable on CPU with stand-ins: an unrecognized pool type is refused before
+    any tensor is touched, which is the branch that keeps an unfamiliar layout
+    from reaching the kernel.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _ensure_dist_initialized()
+        from sglang.srt.runtime_context import get_context
+
+        cls._server_args_override = get_context().override_server_args(
+            model_path="dummy"
+        )
+        cls._server_args_override.install()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._server_args_override.restore()
+
+    def _attention(self, layer_id=0):
+        from sglang.srt.models.zaya import ZayaAttention
+
+        config = _make_swa_config(num_hidden_layers=4, swa_layers=[4096, 0, 0, 0])
+        return ZayaAttention(config=config, layer_id=layer_id)
+
+    def test_unknown_pool_types_decline(self):
+        import sglang.srt.models.zaya as zaya_mod
+
+        attn = self._attention()
+        fb = SimpleNamespace(out_cache_loc=torch.zeros(2, dtype=torch.int64))
+
+        class _SomeOtherPool:
+            pass
+
+        with unittest.mock.patch.object(
+            zaya_mod, "get_token_to_kv_pool", lambda: _SomeOtherPool()
+        ):
+            self.assertIsNone(attn._kv_store(fb))
+
+    def test_missing_out_cache_loc_declines(self):
+        attn = self._attention()
+        self.assertIsNone(attn._kv_store(SimpleNamespace(out_cache_loc=None)))
+
+    def test_a_scaled_attention_layer_declines(self):
+        import sglang.srt.models.zaya as zaya_mod
+
+        attn = self._attention()
+        attn.attn.k_scale = torch.tensor(1.0)
+        fb = SimpleNamespace(out_cache_loc=torch.zeros(2, dtype=torch.int64))
+
+        called = []
+
+        def _boom():
+            called.append(1)
+            raise AssertionError("must not reach the pool")
+
+        with unittest.mock.patch.object(zaya_mod, "get_token_to_kv_pool", _boom):
+            self.assertIsNone(attn._kv_store(fb))
+        self.assertEqual(called, [])
+
+    def test_a_dcp_masked_batch_declines(self):
+        import sglang.srt.models.zaya as zaya_mod
+
+        attn = self._attention()
+        fb = SimpleNamespace(
+            out_cache_loc=torch.zeros(2, dtype=torch.int64),
+            dcp_kv_mask=torch.ones(2, dtype=torch.bool),
+        )
+        with unittest.mock.patch.object(zaya_mod, "get_token_to_kv_pool", lambda: None):
+            self.assertIsNone(attn._kv_store(fb))
+
+
 class TestCCADecodeConvFold(CustomTestCase):
     """``CCA.fold_decode_conv`` must reproduce the two-stage conv exactly.
 

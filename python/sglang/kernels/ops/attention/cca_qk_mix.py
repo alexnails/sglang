@@ -59,6 +59,23 @@ normalized head in fp32 across the rotation and rounds once, at the store, so
 its result is *closer* to the fp64 reference than the chain it replaces -- but
 it differs from it in the last bf16 bits.
 
+KV store
+--------
+``HAS_STORE`` additionally scatters the post-rope ``k`` and the matching ``v``
+into the paged KV buffers at ``out_cache_loc[t]``, so ``RadixAttention`` can be
+called with ``save_kv_cache=False`` (the pattern ``qwen3_moe`` uses) and the
+per-layer ``set_kv_buffer`` launch -- another 60 per decode step -- disappears.
+``k`` is already in registers post-rotation, so the only new traffic is reading
+``v``, which the store kernel had to read anyway.
+
+The slot resolution mirrors ``rope_cache``'s: ``slot = out_cache_loc[t]``, then
+``slot = full_to_swa[slot]`` on a sliding-window layer of a hybrid pool, then
+skip when ``slot < 0`` (the sentinel row batch padding maps to). The caller does
+the layout gating; :func:`store_covered` only accepts a 3-D ``[rows, H, D]`` NHD
+buffer, which by construction excludes the 5-D SHUFFLE layout, the 4-D HND
+layout and the page-major strided views. A wrong write here corrupts KV
+silently, so both gates are deliberately narrower than the kernel could serve.
+
 Follows the structure of ``kda_fused_decode`` (a ``covered()`` predicate gates
 supported inputs, everything else falls back to the unfused chain), but is
 written in Triton rather than CUDA-JIT so it runs on ROCm as well -- ZAYA1's
@@ -107,6 +124,32 @@ def _blend(conv_row, pre_row, half_base_k, off, mask):
 
 
 @triton.jit
+def _kv_slot(loc_ptr, swa_map_ptr, t, HAS_SWA: tl.constexpr):
+    """The physical KV slot for token ``t``, or a negative sentinel to skip it.
+
+    Mirrors ``rope_cache._fused_qk_rope_reshape_and_cache_kernel``: the allocated
+    (full-pool) slot, then one indirection through ``full_to_swa`` on a
+    sliding-window layer of a hybrid pool. That mapping's trailing ``-1`` entry
+    is what makes a padding row map to a skip rather than to slot 0.
+    """
+    slot = tl.load(loc_ptr + t).to(tl.int64)
+    if HAS_SWA:
+        # Guard the gather itself: a negative source slot would index before the
+        # mapping's base. The shared rope+store kernel reads it unguarded because
+        # out_cache_loc is non-negative in practice; guarding costs one select.
+        mapped = tl.load(swa_map_ptr + tl.maximum(slot, 0)).to(tl.int64)
+        slot = tl.where(slot >= 0, mapped, -1)
+    return slot
+
+
+@triton.jit
+def _store_v(value_ptr, v_cache_ptr, t, g, slot, s_v_t, s_v_h, s_vc_t, s_vc_h, off, m):
+    """Copy this ``(token, k head)``'s V row into the paged V buffer."""
+    v = tl.load(value_ptr + t * s_v_t + g * s_v_h + off, mask=m, other=0.0)
+    tl.store(v_cache_ptr + slot * s_vc_t + g * s_vc_h + off, v, mask=m)
+
+
+@triton.jit
 def _cca_qk_mix_kernel(
     conv_qk_ptr,  # [T, latent_q + latent_k] conv output (q segment then k)
     pre_q_ptr,  # [T, latent_q]  raw W_q hidden_states
@@ -114,6 +157,11 @@ def _cca_qk_mix_kernel(
     k_scale_ptr,  # [NK] sqrt(head_dim) * per-k-head temperature
     positions_ptr,  # [T] int, or None when ROT_D == 0
     cos_sin_ptr,  # [max_pos, ROT_D] cos half then sin half, or None
+    value_ptr,  # [T, NK, HD] V heads, or None when not storing
+    k_cache_ptr,  # [rows, NK, HD] NHD paged K buffer, or None
+    v_cache_ptr,  # [rows, NK, HD] NHD paged V buffer, or None
+    loc_ptr,  # [T] out_cache_loc, or None
+    swa_map_ptr,  # [rows+1] full->SWA slot mapping, or None
     q_out_ptr,  # [T, NQ, HD] fp32
     k_out_ptr,  # [T, NK, HD] fp32
     s_conv_t,
@@ -122,6 +170,12 @@ def _cca_qk_mix_kernel(
     s_qout_t,
     s_kout_t,
     s_cos_t,
+    s_v_t,
+    s_v_h,
+    s_kc_t,
+    s_kc_h,
+    s_vc_t,
+    s_vc_h,
     latent_q,
     q_scale,  # sqrt(head_dim)
     eps,
@@ -134,6 +188,8 @@ def _cca_qk_mix_kernel(
     ROT_HALF: tl.constexpr,  # ROT_D // 2
     BLOCK_H: tl.constexpr,  # next_power_of_2(ROT_HALF), 1 when ROT_D == 0
     BLOCK_P: tl.constexpr,  # next_power_of_2(HD - ROT_D), 1 when ROT_D == 0
+    HAS_STORE: tl.constexpr = False,
+    HAS_SWA: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     t = pid // NK
@@ -172,7 +228,26 @@ def _cca_qk_mix_kernel(
         conv_k = tl.load(conv_k_row + d, mask=dmask, other=0.0).to(tl.float32)
         k = conv_k + inv_g_half * tl.sum(pre_q, axis=0) + half_base_k
         inv_k = tl.rsqrt(tl.sum(k * k, axis=0) + eps) * k_scale
-        tl.store(k_out_ptr + t * s_kout_t + g * HD + d, k * inv_k, mask=dmask)
+        k = k * inv_k
+        tl.store(k_out_ptr + t * s_kout_t + g * HD + d, k, mask=dmask)
+
+        if HAS_STORE:
+            slot = _kv_slot(loc_ptr, swa_map_ptr, t, HAS_SWA)
+            if slot >= 0:
+                tl.store(k_cache_ptr + slot * s_kc_t + g * s_kc_h + d, k, mask=dmask)
+                _store_v(
+                    value_ptr,
+                    v_cache_ptr,
+                    t,
+                    g,
+                    slot,
+                    s_v_t,
+                    s_v_h,
+                    s_vc_t,
+                    s_vc_h,
+                    d,
+                    dmask,
+                )
     else:
         # Three tiles: the two rotated halves and the pass-through tail. lo and
         # hi share a lane index, which is what keeps the rotation shuffle-free.
@@ -240,11 +315,38 @@ def _cca_qk_mix_kernel(
         k_lo = k_lo * inv_k
         k_hi = k_hi * inv_k
         k_pa = k_pa * inv_k
+        k_lo_r = k_lo * cos - k_hi * sin
+        k_hi_r = k_hi * cos + k_lo * sin
 
         k_out_row = k_out_ptr + t * s_kout_t + g * HD
-        tl.store(k_out_row + i, k_lo * cos - k_hi * sin, mask=imask)
-        tl.store(k_out_row + ROT_HALF + i, k_hi * cos + k_lo * sin, mask=imask)
+        tl.store(k_out_row + i, k_lo_r, mask=imask)
+        tl.store(k_out_row + ROT_HALF + i, k_hi_r, mask=imask)
         tl.store(k_out_row + ROT_D + p, k_pa, mask=pmask)
+
+        if HAS_STORE:
+            slot = _kv_slot(loc_ptr, swa_map_ptr, t, HAS_SWA)
+            if slot >= 0:
+                # The SAME fp32 expression that went to k_out is rounded into the
+                # pool, so the fused store is bit-identical to the set_kv_buffer
+                # copy it replaces (both round the fp32 result once).
+                kc_row = k_cache_ptr + slot * s_kc_t + g * s_kc_h
+                tl.store(kc_row + i, k_lo_r, mask=imask)
+                tl.store(kc_row + ROT_HALF + i, k_hi_r, mask=imask)
+                tl.store(kc_row + ROT_D + p, k_pa, mask=pmask)
+                dv = tl.arange(0, BLOCK)
+                _store_v(
+                    value_ptr,
+                    v_cache_ptr,
+                    t,
+                    g,
+                    slot,
+                    s_v_t,
+                    s_v_h,
+                    s_vc_t,
+                    s_vc_h,
+                    dv,
+                    dv < HD,
+                )
 
 
 def covered(
@@ -363,6 +465,81 @@ def rope_covered(
     return True
 
 
+def store_covered(
+    value: Optional[torch.Tensor],
+    k_cache: Optional[torch.Tensor],
+    v_cache: Optional[torch.Tensor],
+    out_cache_loc: Optional[torch.Tensor],
+    full_to_swa: Optional[torch.Tensor],
+    *,
+    num_k_heads: int,
+    head_dim: int,
+    num_tokens: int,
+    out_dtype: torch.dtype,
+    device: torch.device,
+) -> bool:
+    """Whether the KV scatter can be folded into the mix kernel.
+
+    A wrong write here does not crash -- it corrupts KV and shows up as degraded
+    output quality -- so this gate is deliberately narrower than the kernel could
+    serve, and every check below is a hard reject rather than a fixup:
+
+    * **3-D ``[rows, heads, dim]`` K/V buffers only.** That is the plain NHD pool
+      layout, where the write target is a flat slot row and needs no page
+      arithmetic at all. It is exactly the shape ``_set_kv_buffer_impl`` writes.
+      Requiring 3-D is what rules out the other layouts by construction: the 5-D
+      SHUFFLE (vectorized_5d) buffers, the 4-D HND ``(page, head, off, dim)``
+      buffers and the page-major strided views are all rejected without this
+      needing to know which one it is looking at. The caller pins the page-size
+      side of that invariant by checking ``rows == pool.size + pool.page_size``,
+      which is what makes the flat slot index correct for ANY page size and also
+      rejects the placeholder buffers of a no-op pool.
+    * **matching dtypes.** ``k_cache.dtype == v_cache.dtype == out_dtype`` is the
+      bf16 gate: an fp8 or fp4 pool stores under a different ``store_dtype`` (and
+      needs per-tensor scales the kernel does not apply), so it falls back.
+    * unit innermost strides on both buffers and on ``value`` -- the head axis
+      may be strided (a per-rank slice of the replicated V projection is), which
+      is why ``s_v_h`` is passed rather than assumed.
+    * a 1-D integer ``out_cache_loc`` of exactly ``num_tokens`` entries, and an
+      int64 ``full_to_swa`` when one is supplied. ``full_to_swa`` is indexed by
+      FULL-pool slot id, not by a row of ``k_cache`` (which is the SWA sub-pool
+      here), so its length is the caller's invariant to check, not this one's.
+    """
+    if value is None or k_cache is None or v_cache is None:
+        return False
+    if out_cache_loc is None:
+        return False
+    if k_cache.ndim != 3 or v_cache.ndim != 3:
+        return False
+    for buf in (k_cache, v_cache):
+        if buf.shape[1] != num_k_heads or buf.shape[2] != head_dim:
+            return False
+        if buf.dtype != out_dtype or buf.stride(-1) != 1:
+            return False
+    if value.ndim != 3 or tuple(value.shape) != (num_tokens, num_k_heads, head_dim):
+        return False
+    if value.dtype != out_dtype or value.stride(-1) != 1:
+        return False
+    if out_cache_loc.ndim != 1 or out_cache_loc.numel() != num_tokens:
+        return False
+    if out_cache_loc.dtype not in _INT_DTYPES:
+        return False
+    if not out_cache_loc.is_contiguous():
+        return False
+    if full_to_swa is not None:
+        if full_to_swa.ndim != 1 or full_to_swa.dtype != torch.int64:
+            return False
+        if not full_to_swa.is_contiguous() or full_to_swa.numel() == 0:
+            return False
+        if full_to_swa.device != device:
+            return False
+    # ``device`` is required rather than inferred: the accelerator check already
+    # happened in ``covered()`` (which gates this one), so what is left to catch
+    # is a buffer that belongs to a *different* device than the inputs -- and
+    # making it explicit is also what lets these branches be tested on CPU.
+    return all(t.device == device for t in (value, k_cache, v_cache, out_cache_loc))
+
+
 def cca_qk_mix(
     conv_qk: torch.Tensor,
     pre_q: torch.Tensor,
@@ -378,6 +555,11 @@ def cca_qk_mix(
     positions: Optional[torch.Tensor] = None,
     cos_sin_cache: Optional[torch.Tensor] = None,
     rotary_dim: int = 0,
+    value: Optional[torch.Tensor] = None,
+    k_cache: Optional[torch.Tensor] = None,
+    v_cache: Optional[torch.Tensor] = None,
+    out_cache_loc: Optional[torch.Tensor] = None,
+    full_to_swa: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return ``(q, k)`` as ``[T, heads, head_dim]`` in ``out_dtype``.
 
@@ -388,8 +570,12 @@ def cca_qk_mix(
 
     Passing ``positions`` / ``cos_sin_cache`` / ``rotary_dim`` also applies the
     neox partial rotary to both outputs, removing the separate rotary launch.
-    Caller must have checked :func:`covered`, and :func:`rope_covered` too when
-    it passes the rotary arguments.
+    Passing ``value`` / ``k_cache`` / ``v_cache`` / ``out_cache_loc`` also
+    scatters k and v into the paged buffers, removing the ``set_kv_buffer``
+    launch; ``full_to_swa`` adds the hybrid-pool slot indirection.
+
+    Caller must have checked :func:`covered`, plus :func:`rope_covered` and
+    :func:`store_covered` for whichever extra arguments it passes.
     """
     num_tokens = conv_qk.shape[0]
     q_out = torch.empty(
@@ -410,6 +596,14 @@ def cca_qk_mix(
     else:
         rot_half, block_h, block_p, s_cos_t = 0, 1, 1, 0
 
+    has_store = k_cache is not None
+    if has_store:
+        s_v_t, s_v_h = value.stride(0), value.stride(1)
+        s_kc_t, s_kc_h = k_cache.stride(0), k_cache.stride(1)
+        s_vc_t, s_vc_h = v_cache.stride(0), v_cache.stride(1)
+    else:
+        s_v_t = s_v_h = s_kc_t = s_kc_h = s_vc_t = s_vc_h = 0
+
     _cca_qk_mix_kernel[(num_tokens * num_k_heads,)](
         conv_qk,
         pre_q,
@@ -417,6 +611,11 @@ def cca_qk_mix(
         k_scale,
         positions if rot_d else None,
         cos_sin_cache if rot_d else None,
+        value if has_store else None,
+        k_cache,
+        v_cache,
+        out_cache_loc if has_store else None,
+        full_to_swa if has_store else None,
         q_out,
         k_out,
         conv_qk.stride(0),
@@ -425,6 +624,12 @@ def cca_qk_mix(
         q_out.stride(0),
         k_out.stride(0),
         s_cos_t,
+        s_v_t,
+        s_v_h,
+        s_kc_t,
+        s_kc_h,
+        s_vc_t,
+        s_vc_h,
         num_q_heads * head_dim,
         float(q_scale),
         float(eps),
@@ -437,6 +642,8 @@ def cca_qk_mix(
         ROT_HALF=rot_half,
         BLOCK_H=block_h,
         BLOCK_P=block_p,
+        HAS_STORE=has_store,
+        HAS_SWA=(has_store and full_to_swa is not None),
         # One warp, not four. The reductions are over the head dim (ZAYA1: 128
         # elements), so 4 warps is 256 ROCm lanes per 128-element row: half of
         # them idle, and each ``tl.sum`` becomes a cross-wavefront LDS reduction
