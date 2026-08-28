@@ -946,7 +946,7 @@ class CCA(nn.Module):
         # Likewise for the fused KV scatter: True when the kernel already wrote
         # k/v into the pool, so ``ZayaAttention`` passes save_kv_cache=False.
         self.kv_store_fused = False
-        # Last logged (mix, rope, kv_store) decision -- see ``_note_fusion``.
+        # Last logged (mix_fused, rope_reason, store_reason) -- ``_note_fusion``.
         self._last_fusion_state: Optional[tuple] = None
 
         # Attach TP-aware weight loaders to conv_qk weights/biases and ``temp``
@@ -1160,25 +1160,38 @@ class CCA(nn.Module):
         ):
             mix_fused = True
             extra = {}
-            if rope is not None and _cca_qk_mix.rope_covered(
-                rope.positions,
-                rope.cos_sin_cache,
-                rope.rotary_dim,
-                head_dim=self.head_dim,
-                num_tokens=qk_out.shape[0],
-                is_neox_style=rope.is_neox_style,
-                device=qk_out.device,
-            ):
+            # ``*_decline_reason`` rather than ``*_covered``: same checks, but a
+            # decline arrives with the reason attached so ``_note_fusion`` can
+            # say WHY the fusion is off instead of just that it is. The string is
+            # built only when a gate rejects, and a rejecting gate has already
+            # cost a whole extra kernel launch.
+            rope_reason = "no rotary offered"
+            if rope is not None:
+                rope_reason = _cca_qk_mix.rope_decline_reason(
+                    rope.positions,
+                    rope.cos_sin_cache,
+                    rope.rotary_dim,
+                    head_dim=self.head_dim,
+                    num_tokens=qk_out.shape[0],
+                    is_neox_style=rope.is_neox_style,
+                    device=qk_out.device,
+                )
+            if rope_reason is None:
                 extra = {
                     "positions": rope.positions,
                     "cos_sin_cache": rope.cos_sin_cache,
                     "rotary_dim": rope.rotary_dim,
                 }
                 self.rope_fused = True
-            if (
-                self.rope_fused
-                and kv_store is not None
-                and _cca_qk_mix.store_covered(
+
+            if not self.rope_fused:
+                # Storing an un-rotated k would be silent KV corruption, and the
+                # rotation happens inside this same kernel.
+                store_reason = "rope not fused"
+            elif kv_store is None:
+                store_reason = "no kv store offered"
+            else:
+                store_reason = _cca_qk_mix.store_decline_reason(
                     value,
                     kv_store.k_cache,
                     kv_store.v_cache,
@@ -1190,14 +1203,15 @@ class CCA(nn.Module):
                     out_dtype=out_dtype,
                     device=qk_out.device,
                 )
-            ):
+            if store_reason is None:
                 extra["value"] = value
                 extra["k_cache"] = kv_store.k_cache
                 extra["v_cache"] = kv_store.v_cache
                 extra["out_cache_loc"] = kv_store.out_cache_loc
                 extra["full_to_swa"] = kv_store.full_to_swa
                 self.kv_store_fused = True
-            self._note_fusion(mix_fused)
+
+            self._note_fusion(mix_fused, rope_reason, store_reason)
             return _cca_qk_mix.cca_qk_mix(
                 qk_out,
                 query_pre_flat,
@@ -1211,33 +1225,46 @@ class CCA(nn.Module):
                 **extra,
             )
 
-        self._note_fusion(mix_fused)
+        self._note_fusion(mix_fused, "mix not fused", "mix not fused")
         query, key = self._add_grouped_qk_means(
             query_conv, key_conv, query_pre, key_base
         )
         query, key = self._normalize_qk(query, key)
         return query.to(out_dtype), key.to(out_dtype)
 
-    def _note_fusion(self, mix_fused: bool) -> None:
-        """Log which of the three fusions took, once per distinct outcome.
+    def _note_fusion(
+        self,
+        mix_fused: bool,
+        rope_reason: Optional[str],
+        store_reason: Optional[str],
+    ) -> None:
+        """Log which of the three fusions took -- and why not -- once per outcome.
 
         Every gate here declines by *falling back*, so a precondition that stops
         matching costs launches and nothing else -- which is exactly how an
         earlier step of this campaign produced baseline-identical numbers that
-        read as a clean null result. Saying so in the log turns that into an
-        observation instead of a mystery.
+        read as a clean null result. Naming the gate that said no turns that into
+        an observation instead of a mystery. Grep a run for
+        ``mix=True rope=True kv_store=True`` before trusting an A/B.
 
-        Cost is a three-bool tuple compare per forward; the message is built only
-        when the outcome changes, and ``_log_dataflow_decision`` dedupes across
-        layers so a uniform model logs one line, not sixty.
+        Cost on the hot path is a tuple compare per forward: the reasons are
+        ``None`` when everything fused, and a rejecting gate has already cost an
+        extra launch. The message is built only when the outcome changes, and
+        ``_log_dataflow_decision`` dedupes across layers, so a uniform model logs
+        one line rather than sixty.
         """
-        state = (mix_fused, self.rope_fused, self.kv_store_fused)
+        state = (mix_fused, rope_reason, store_reason)
         if state == self._last_fusion_state:
             return
         self._last_fusion_state = state
+        detail = ""
+        if rope_reason is not None:
+            detail += f" (rope declined: {rope_reason})"
+        if store_reason is not None:
+            detail += f" (kv_store declined: {store_reason})"
         _log_dataflow_decision(
             f"zaya cca qk fusion: mix={mix_fused} rope={self.rope_fused} "
-            f"kv_store={self.kv_store_fused}"
+            f"kv_store={self.kv_store_fused}{detail}"
         )
 
     @torch.no_grad()

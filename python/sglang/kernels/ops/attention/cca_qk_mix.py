@@ -396,11 +396,26 @@ def covered(
     return all(t.dtype in _FLOAT_DTYPES for t in (conv_qk, pre_q, base_k))
 
 
-def rope_geometry_covered(
+def _same_device(tensor: torch.Tensor, device: torch.device) -> bool:
+    """Device equality that tolerates an un-indexed reference device.
+
+    ``torch.device("cuda") != torch.device("cuda:0")`` -- the index is part of
+    the identity -- while every tensor reports an indexed device. A caller that
+    writes the reference device by hand rather than reading it off a tensor would
+    otherwise see every check fail, and because these predicates decline by
+    *falling back*, that reads as "the fusion is off" with no error anywhere. An
+    un-indexed reference means "any device of this type", so honor that.
+    """
+    got = tensor.device
+    if got.type != device.type:
+        return False
+    return device.index is None or got.index == device.index
+
+
+def rope_geometry_decline_reason(
     rotary_dim: int, head_dim: int, is_neox_style: bool = True
-) -> bool:
-    """The device-independent half of :func:`rope_covered`: is this head shape one
-    the three-tile split can express?
+) -> Optional[str]:
+    """Why the head shape is not one the three-tile split can express, or ``None``.
 
     * ``rotary_dim == head_dim // 2`` -- ZAYA1's ``partial_rotary_factor=0.5``.
       Any other split changes the tile geometry (the pass-through tail stops
@@ -413,15 +428,76 @@ def rope_geometry_covered(
     * neox layout. GPT-J interleaves the rotated pair *within* a lane, which is
       exactly the cross-lane case this kernel avoids by splitting on load.
 
-    Split out from ``rope_covered`` so the geometry can be pinned without a GPU.
+    Split out from ``rope_decline_reason`` so the geometry can be pinned without
+    a GPU.
     """
     if not is_neox_style:
-        return False
+        return "gptj layout (the rotated pair is intra-lane)"
     if rotary_dim <= 0 or head_dim <= 0:
-        return False
+        return f"degenerate dims rotary_dim={rotary_dim} head_dim={head_dim}"
     if rotary_dim != head_dim // 2:
-        return False
-    return (rotary_dim // 2) % 2 == 0
+        return f"rotary_dim {rotary_dim} != head_dim//2 {head_dim // 2}"
+    if (rotary_dim // 2) % 2 != 0:
+        return f"odd rotary half {rotary_dim // 2}"
+    return None
+
+
+def rope_geometry_covered(
+    rotary_dim: int, head_dim: int, is_neox_style: bool = True
+) -> bool:
+    """Whether the head shape fits the three-tile split. See the reason variant."""
+    return rope_geometry_decline_reason(rotary_dim, head_dim, is_neox_style) is None
+
+
+def rope_decline_reason(
+    positions: Optional[torch.Tensor],
+    cos_sin_cache: Optional[torch.Tensor],
+    rotary_dim: int,
+    *,
+    head_dim: int,
+    num_tokens: int,
+    is_neox_style: bool = True,
+    device: Optional[torch.device] = None,
+) -> Optional[str]:
+    """Why the neox partial rotary cannot fold into the mix kernel, or ``None``.
+
+    Deliberately narrow: :func:`rope_geometry_decline_reason` for the head shape,
+    plus a ``[max_pos, rotary_dim]`` cache (cos half then sin half) with a unit
+    innermost stride and a 1-D integer ``positions``, both on the inputs' device.
+
+    Everything it rejects still gets the fused mix plus a separate rotary launch,
+    i.e. today's behavior. Returning the *reason* rather than a bare bool is what
+    keeps such a decline visible: it feeds both the once-per-outcome fusion log
+    and the tests' assertion messages. The string is built only on decline, so
+    the accepted path pays nothing for it.
+    """
+    if positions is None or cos_sin_cache is None:
+        return "no rotary offered"
+    geometry = rope_geometry_decline_reason(rotary_dim, head_dim, is_neox_style)
+    if geometry is not None:
+        return geometry
+    if cos_sin_cache.ndim != 2 or cos_sin_cache.shape[-1] != rotary_dim:
+        return (
+            f"cos_sin_cache {tuple(cos_sin_cache.shape)} is not "
+            f"[max_pos, {rotary_dim}]"
+        )
+    if cos_sin_cache.stride(-1) != 1:
+        return "cos_sin_cache innermost stride != 1"
+    if cos_sin_cache.dtype not in _FLOAT_DTYPES:
+        return f"cos_sin_cache dtype {cos_sin_cache.dtype}"
+    if positions.ndim != 1 or positions.numel() != num_tokens:
+        return f"positions {tuple(positions.shape)} is not 1-D of {num_tokens}"
+    if positions.dtype not in _INT_DTYPES:
+        return f"positions dtype {positions.dtype}"
+    if not positions.is_contiguous():
+        return "positions not contiguous"
+    if not (positions.is_cuda and cos_sin_cache.is_cuda):
+        return "positions / cos_sin_cache not on an accelerator"
+    if device is not None:
+        for name, t in (("positions", positions), ("cos_sin_cache", cos_sin_cache)):
+            if not _same_device(t, device):
+                return f"{name} on {t.device}, inputs on {device}"
+    return None
 
 
 def rope_covered(
@@ -434,38 +510,22 @@ def rope_covered(
     is_neox_style: bool = True,
     device: Optional[torch.device] = None,
 ) -> bool:
-    """Whether the neox partial rotary can be folded into the mix kernel.
-
-    Deliberately narrow: :func:`rope_geometry_covered` for the head shape, plus a
-    ``[max_pos, rotary_dim]`` cache (cos half then sin half) with a unit
-    innermost stride and a 1-D integer ``positions``, both on the inputs' device.
-
-    Everything it rejects still gets the fused mix plus a separate rotary
-    launch, i.e. today's behavior.
-    """
-    if positions is None or cos_sin_cache is None:
-        return False
-    if not rope_geometry_covered(rotary_dim, head_dim, is_neox_style):
-        return False
-    if cos_sin_cache.ndim != 2 or cos_sin_cache.shape[-1] != rotary_dim:
-        return False
-    if cos_sin_cache.stride(-1) != 1:
-        return False
-    if cos_sin_cache.dtype not in _FLOAT_DTYPES:
-        return False
-    if positions.ndim != 1 or positions.numel() != num_tokens:
-        return False
-    if positions.dtype not in _INT_DTYPES or not positions.is_contiguous():
-        return False
-    if not (positions.is_cuda and cos_sin_cache.is_cuda):
-        return False
-    if device is not None:
-        if positions.device != device or cos_sin_cache.device != device:
-            return False
-    return True
+    """Whether the neox partial rotary can fold in. See the reason variant."""
+    return (
+        rope_decline_reason(
+            positions,
+            cos_sin_cache,
+            rotary_dim,
+            head_dim=head_dim,
+            num_tokens=num_tokens,
+            is_neox_style=is_neox_style,
+            device=device,
+        )
+        is None
+    )
 
 
-def store_covered(
+def store_decline_reason(
     value: Optional[torch.Tensor],
     k_cache: Optional[torch.Tensor],
     v_cache: Optional[torch.Tensor],
@@ -477,8 +537,8 @@ def store_covered(
     num_tokens: int,
     out_dtype: torch.dtype,
     device: torch.device,
-) -> bool:
-    """Whether the KV scatter can be folded into the mix kernel.
+) -> Optional[str]:
+    """Why the KV scatter cannot fold into the mix kernel, or ``None``.
 
     A wrong write here does not crash -- it corrupts KV and shows up as degraded
     output quality -- so this gate is deliberately narrower than the kernel could
@@ -504,40 +564,99 @@ def store_covered(
       int64 ``full_to_swa`` when one is supplied. ``full_to_swa`` is indexed by
       FULL-pool slot id, not by a row of ``k_cache`` (which is the SWA sub-pool
       here), so its length is the caller's invariant to check, not this one's.
+
+    Like the rope gate, it answers with the reason so a decline is legible rather
+    than a bare False.
     """
-    if value is None or k_cache is None or v_cache is None:
-        return False
-    if out_cache_loc is None:
-        return False
+    for name, t in (
+        ("value", value),
+        ("k_cache", k_cache),
+        ("v_cache", v_cache),
+        ("out_cache_loc", out_cache_loc),
+    ):
+        if t is None:
+            return f"{name} not supplied"
     if k_cache.ndim != 3 or v_cache.ndim != 3:
-        return False
-    for buf in (k_cache, v_cache):
+        return (
+            f"kv buffers are not 3-D NHD (k={tuple(k_cache.shape)}, "
+            f"v={tuple(v_cache.shape)}); the 5-D SHUFFLE, 4-D HND and "
+            "page-major layouts are not served"
+        )
+    for name, buf in (("k_cache", k_cache), ("v_cache", v_cache)):
         if buf.shape[1] != num_k_heads or buf.shape[2] != head_dim:
-            return False
-        if buf.dtype != out_dtype or buf.stride(-1) != 1:
-            return False
+            return f"{name} {tuple(buf.shape)} is not [rows, {num_k_heads}, {head_dim}]"
+        if buf.dtype != out_dtype:
+            return f"{name} dtype {buf.dtype} != out_dtype {out_dtype}"
+        if buf.stride(-1) != 1:
+            return f"{name} innermost stride != 1"
     if value.ndim != 3 or tuple(value.shape) != (num_tokens, num_k_heads, head_dim):
-        return False
-    if value.dtype != out_dtype or value.stride(-1) != 1:
-        return False
+        return (
+            f"value {tuple(value.shape)} is not "
+            f"[{num_tokens}, {num_k_heads}, {head_dim}]"
+        )
+    if value.dtype != out_dtype:
+        return f"value dtype {value.dtype} != out_dtype {out_dtype}"
+    if value.stride(-1) != 1:
+        return "value innermost stride != 1"
     if out_cache_loc.ndim != 1 or out_cache_loc.numel() != num_tokens:
-        return False
+        return f"out_cache_loc {tuple(out_cache_loc.shape)} is not 1-D of {num_tokens}"
     if out_cache_loc.dtype not in _INT_DTYPES:
-        return False
+        return f"out_cache_loc dtype {out_cache_loc.dtype}"
     if not out_cache_loc.is_contiguous():
-        return False
+        return "out_cache_loc not contiguous"
     if full_to_swa is not None:
         if full_to_swa.ndim != 1 or full_to_swa.dtype != torch.int64:
-            return False
+            return (
+                f"full_to_swa {tuple(full_to_swa.shape)}/{full_to_swa.dtype} is "
+                "not a 1-D int64 mapping"
+            )
         if not full_to_swa.is_contiguous() or full_to_swa.numel() == 0:
-            return False
-        if full_to_swa.device != device:
-            return False
+            return "full_to_swa empty or not contiguous"
     # ``device`` is required rather than inferred: the accelerator check already
     # happened in ``covered()`` (which gates this one), so what is left to catch
     # is a buffer that belongs to a *different* device than the inputs -- and
     # making it explicit is also what lets these branches be tested on CPU.
-    return all(t.device == device for t in (value, k_cache, v_cache, out_cache_loc))
+    for name, t in (
+        ("value", value),
+        ("k_cache", k_cache),
+        ("v_cache", v_cache),
+        ("out_cache_loc", out_cache_loc),
+        ("full_to_swa", full_to_swa),
+    ):
+        if t is not None and not _same_device(t, device):
+            return f"{name} on {t.device}, inputs on {device}"
+    return None
+
+
+def store_covered(
+    value: Optional[torch.Tensor],
+    k_cache: Optional[torch.Tensor],
+    v_cache: Optional[torch.Tensor],
+    out_cache_loc: Optional[torch.Tensor],
+    full_to_swa: Optional[torch.Tensor],
+    *,
+    num_k_heads: int,
+    head_dim: int,
+    num_tokens: int,
+    out_dtype: torch.dtype,
+    device: torch.device,
+) -> bool:
+    """Whether the KV scatter can fold in. See the reason variant."""
+    return (
+        store_decline_reason(
+            value,
+            k_cache,
+            v_cache,
+            out_cache_loc,
+            full_to_swa,
+            num_k_heads=num_k_heads,
+            head_dim=head_dim,
+            num_tokens=num_tokens,
+            out_dtype=out_dtype,
+            device=device,
+        )
+        is None
+    )
 
 
 def cca_qk_mix(
