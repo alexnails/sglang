@@ -334,6 +334,8 @@ def covered(
         return False
     if conv_qk.ndim != 2 or pre_q.ndim != 2 or base_k.ndim != 2:
         return False
+    if not (pre_q.shape[0] == base_k.shape[0] == conv_qk.shape[0]):
+        return False
     if conv_qk.shape[-1] != (num_q_heads + num_k_heads) * head_dim:
         return False
     if pre_q.shape[-1] != num_q_heads * head_dim:

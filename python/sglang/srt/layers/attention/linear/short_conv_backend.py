@@ -50,7 +50,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     MambaAttnBackendBase,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_server_args
+from sglang.srt.runtime_context import mamba_cache_chunk_size
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -317,7 +317,7 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
         lens_to_track = (
             forward_batch.mamba_track_seqlens - forward_batch.extend_prefix_lens
         )
-        chunk = get_server_args().mamba_cache_chunk_size
+        chunk = mamba_cache_chunk_size()
         aligned_len = (lens_to_track // chunk) * chunk
         # One past the last token whose input belongs in the snapshot.
         end = (query_start_loc[:-1] + aligned_len)[forward_batch.mamba_track_mask]

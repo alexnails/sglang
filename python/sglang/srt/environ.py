@@ -829,11 +829,6 @@ class Envs:
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
-    # Override the ROCm <= 7.2.0 guard that forces the capture-safe pynccl path
-    # for custom / quick all-reduce inside CUDA graph capture (see
-    # distributed/parallel_state._rocm_cuda_graph_custom_ar_unsafe). Unset means
-    # "use the HIP-version check"; 0 re-enables custom AR during capture.
-    SGLANG_ROCM_CUDA_GRAPH_FORCE_PYNCCL = EnvBool(None)
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("tilelang")
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
 

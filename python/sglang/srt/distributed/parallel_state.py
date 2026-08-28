@@ -25,7 +25,6 @@ If you only need to use the distributed environment without model/pipeline
 """
 
 import contextlib
-import functools
 import gc
 import logging
 import os
@@ -233,31 +232,6 @@ def reg_all_to_all_single(
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
     group._all_to_all_single(output, input)
-
-
-@functools.lru_cache(maxsize=1)
-def _rocm_cuda_graph_custom_ar_unsafe() -> bool:
-    """Whether custom/quick all-reduce must be avoided during CUDA graph capture.
-
-    ROCm <= 7.2.0 ships a HIP runtime bug (pytorch#177309, ROCm/aiter#2857,
-    sglang#24011): the RCCL watchdog polls with ``hipEventQuery`` from a side
-    thread, ignoring the THREAD_LOCAL capture mode, and either aborts the
-    in-flight capture or silently corrupts it so a later replay raises
-    ``HSA_STATUS_ERROR_EXCEPTION`` 0x1016. Custom and quick all-reduce launch
-    helper kernels while a capture is active, which is what trips it. Drop this
-    guard once ROCm < 7.2.1 is no longer supported.
-
-    DEFAULT OFF: measured on ROCm 7.0.2 / gfx950 at tp=8/dp=4, forcing pynccl
-    costs 5.3-6.5% TPOT because it pushes every collective in the captured region
-    off custom/quick AR, and the ZAYA1 crashes originally attributed to this were
-    root-caused elsewhere. The failure it guards against is *silent* capture
-    corruption, so set ``SGLANG_ROCM_CUDA_GRAPH_FORCE_PYNCCL=1`` to restore the
-    conservative path on a build that does exhibit it.
-    """
-    override = envs.SGLANG_ROCM_CUDA_GRAPH_FORCE_PYNCCL.get()
-    if override is not None:
-        return bool(override)
-    return False
 
 
 class GroupCoordinator:
@@ -623,14 +597,7 @@ class GroupCoordinator:
         # We don't need the context of custom quick allreduce because the ipc access
         # is already collected in init() and we can capture the quick allreduce directly.
         ca_comm = self.ca_comm
-        # ROCm <= 7.2.0 corrupts captures that launch custom/quick all-reduce
-        # helper kernels (see ``_rocm_cuda_graph_custom_ar_unsafe``); skip the
-        # custom-AR capture context there so the captured all-reduces fall
-        # through to pynccl. Eager is unaffected.
-        rocm_force_pynccl = _rocm_cuda_graph_custom_ar_unsafe()
-        maybe_ca_context = (
-            nullcontext() if ca_comm is None or rocm_force_pynccl else ca_comm.capture()
-        )
+        maybe_ca_context = nullcontext() if ca_comm is None else ca_comm.capture()
 
         # ensure all initialization operations complete before attempting to
         # capture the graph on another stream
@@ -675,23 +642,8 @@ class GroupCoordinator:
                 maybe_pymscclpp_context = nullcontext()
             else:
                 maybe_pymscclpp_context = pymscclpp_comm.change_state(enable=True)
-            if not rocm_force_pynccl:
-                # NVIDIA and ROCm 7.2.1+: custom/quick AR stay enabled.
-                with maybe_pynccl_context, maybe_pymscclpp_context:
-                    yield graph_capture_context
-            else:
-                # ROCm <= 7.2.0 only: disable custom & quick AR for the
-                # captured region, restored on exit so eager keeps custom AR.
-                with contextlib.ExitStack() as comm_stack:
-                    for comm in (self.ca_comm, self.qr_comm):
-                        if comm is not None:
-                            prev_disabled = comm.disabled
-                            comm.disabled = True
-                            comm_stack.callback(
-                                setattr, comm, "disabled", prev_disabled
-                            )
-                    with maybe_pynccl_context, maybe_pymscclpp_context:
-                        yield graph_capture_context
+            with maybe_pynccl_context, maybe_pymscclpp_context:
+                yield graph_capture_context
 
     def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
         """

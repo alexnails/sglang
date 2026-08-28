@@ -1391,9 +1391,10 @@ def _zaya_overrides(server_args: Any, hf_config: Any) -> dict:
     """
     from sglang.srt.server_args import ServerArgs
 
+    cfg = resolving_view(server_args)
     overrides: Dict[str, Any] = {}
 
-    if server_args.mamba_full_memory_ratio == ServerArgs.mamba_full_memory_ratio:
+    if cfg.mamba_full_memory_ratio == ServerArgs.mamba_full_memory_ratio:
         overrides["mamba_full_memory_ratio"] = 0.05
 
     # ``swa_full_tokens_ratio`` sizes the sliding-window sub-pool as a fraction
@@ -1402,14 +1403,10 @@ def _zaya_overrides(server_args: Any, hf_config: Any) -> dict:
     # tp=8/dp=4, 0.8 gave the SWA pool 91 GiB to hold what ~4096/request needs.
     # Matches the value Inkling pins. Yields to an explicit
     # --swa-full-tokens-ratio.
-    if server_args.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
+    if cfg.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
         overrides["swa_full_tokens_ratio"] = 0.1
 
-    if (
-        server_args.enable_dp_attention
-        and server_args.dp_size > 1
-        and hf_config.tie_word_embeddings
-    ):
+    if cfg.enable_dp_attention and cfg.dp_size > 1 and hf_config.tie_word_embeddings:
         overrides["enable_dp_lm_head"] = True
 
     return overrides

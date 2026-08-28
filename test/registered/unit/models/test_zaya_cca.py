@@ -2428,8 +2428,8 @@ class TestShortConvTrackIndices(CustomTestCase):
 
         with unittest.mock.patch.object(
             short_conv_backend,
-            "get_server_args",
-            lambda: harness.server_args,
+            "mamba_cache_chunk_size",
+            lambda: harness.server_args.mamba_cache_chunk_size,
         ):
             return harness.backend._init_track_conv_indices(
                 _query_start_loc(extend_seq_lens), forward_batch
@@ -2503,12 +2503,12 @@ class TestShortConvTrackIndices(CustomTestCase):
         )
         qsl = _query_start_loc(extend)
         with unittest.mock.patch.object(
-            short_conv_backend, "get_server_args", lambda: harness.server_args
+            short_conv_backend,
+            "mamba_cache_chunk_size",
+            lambda: harness.server_args.mamba_cache_chunk_size,
         ):
             mine = harness.backend._init_track_conv_indices(qsl, fb)[0]
-        # The base reads the derived accessor, not the record:
-        # hybrid_linear_attn_backend imports mamba_cache_chunk_size, whereas
-        # short_conv_backend imports get_server_args. Patch what each one binds.
+        # Both modules bind the derived accessor by name, so patch it in each.
         with unittest.mock.patch.object(
             hb,
             "mamba_cache_chunk_size",
@@ -2534,7 +2534,9 @@ class TestShortConvTrackExtendSnapshot(CustomTestCase):
         from sglang.srt.layers.attention.linear import short_conv_backend
 
         with unittest.mock.patch.object(
-            short_conv_backend, "get_server_args", lambda: harness.server_args
+            short_conv_backend,
+            "mamba_cache_chunk_size",
+            lambda: harness.server_args.mamba_cache_chunk_size,
         ):
             indices = harness.backend._init_track_conv_indices(
                 _query_start_loc(extend), fb
@@ -2958,7 +2960,9 @@ class TestShortConvTrackWidthContract(CustomTestCase):
         from sglang.srt.layers.attention.linear import short_conv_backend
 
         with unittest.mock.patch.object(
-            short_conv_backend, "get_server_args", lambda: harness.server_args
+            short_conv_backend,
+            "mamba_cache_chunk_size",
+            lambda: harness.server_args.mamba_cache_chunk_size,
         ):
             harness.backend._track_conv_indices = (
                 harness.backend._init_track_conv_indices(_query_start_loc([20]), fb)
@@ -2991,7 +2995,9 @@ class TestShortConvTrackWidthContract(CustomTestCase):
         from sglang.srt.layers.attention.linear import short_conv_backend
 
         with unittest.mock.patch.object(
-            short_conv_backend, "get_server_args", lambda: harness.server_args
+            short_conv_backend,
+            "mamba_cache_chunk_size",
+            lambda: harness.server_args.mamba_cache_chunk_size,
         ):
             harness.backend._track_conv_indices = (
                 harness.backend._init_track_conv_indices(_query_start_loc([20]), fb)
@@ -3019,7 +3025,9 @@ class TestShortConvTrackWidthContract(CustomTestCase):
         from sglang.srt.layers.attention.linear import short_conv_backend
 
         with unittest.mock.patch.object(
-            short_conv_backend, "get_server_args", lambda: harness.server_args
+            short_conv_backend,
+            "mamba_cache_chunk_size",
+            lambda: harness.server_args.mamba_cache_chunk_size,
         ):
             harness.backend._track_conv_indices = (
                 harness.backend._init_track_conv_indices(_query_start_loc([20]), fb)

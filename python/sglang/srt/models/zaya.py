@@ -97,7 +97,7 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
 
 logger = logging.getLogger(__name__)
@@ -427,13 +427,6 @@ def cca_decode(
 # Fused kernel seam: Triton replacements for the v1 torch paths above, with the
 # same ``(qk_out, lag_prev)`` contract. The stock depthwise ``causal_conv1d``
 # cannot express CCA's two-stage grouped conv, hence the dedicated kernels.
-
-
-def cca_conv1d_fn(*args, **kwargs):
-    """Fused varlen prefill conv-with-state; see the kernel module for the contract."""
-    from sglang.kernels.ops.attention.cca_conv1d import cca_conv1d_fn as _fused
-
-    return _fused(*args, **kwargs)
 
 
 def _cca_decode_conv(
@@ -2777,7 +2770,7 @@ class ZayaForCausalLM(nn.Module):
                 org_num_embeddings=config.vocab_size,
                 bias=bool(getattr(config, "lm_head_bias", False)),
                 quant_config=None,
-                use_attn_tp_group=get_server_args().enable_dp_lm_head,
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
                 prefix=add_prefix("lm_head", prefix),
             )
             if config.tie_word_embeddings:

@@ -48,36 +48,13 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
-from sglang.srt.utils import get_available_gpu_memory, log_info_on_rank0
+from sglang.srt.utils import get_available_gpu_memory
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.model_executor.runner.base_runner import BaseRunner
 
 logger = logging.getLogger(__name__)
-
-
-def _align_pipeline_layers(layers: list, layer_model) -> list:
-    has_start_layer = hasattr(layer_model, "start_layer")
-    has_end_layer = hasattr(layer_model, "end_layer")
-    assert (
-        has_start_layer == has_end_layer
-    ), "pipeline layer ranges must define start_layer and end_layer together"
-    start_layer = layer_model.start_layer if has_start_layer else 0
-    end_layer = layer_model.end_layer if has_end_layer else len(layer_model.layers)
-    assert isinstance(start_layer, int) and isinstance(
-        end_layer, int
-    ), "pipeline layer ranges must define integer start_layer and end_layer"
-    assert 0 <= start_layer <= end_layer <= len(layer_model.layers), (
-        f"invalid pipeline layer range [{start_layer}, {end_layer}) for "
-        f"{len(layer_model.layers)} layers"
-    )
-    assert (
-        len(layers) <= end_layer - start_layer
-    ), f"found {len(layers)} layers in PP range [{start_layer}, {end_layer})"
-    return (
-        [None] * start_layer + layers + [None] * (len(layer_model.layers) - end_layer)
-    )
 
 
 class GraphCapture(msgspec.Struct, frozen=True, kw_only=True):
@@ -392,25 +369,6 @@ def capture_prefill_graph(
         model_runner.dsa_indexers,
         model_runner.mha_companion_layers,
     ) = compute_attention_and_moe_layers(layer_model)
-
-    model_runner.attention_layers = _align_pipeline_layers(
-        model_runner.attention_layers, layer_model
-    )
-    if len(model_runner.attention_layers) != len(layer_model.layers):
-        # The list is read as ``attention_layers[layer_id]``, so it has to cover
-        # every layer; a short one means the entries past the first unrecognized
-        # layer are shifted. A None entry is fine -- a layer holding no attention
-        # never indexes it.
-        log_info_on_rank0(
-            logger,
-            "Disable prefill CUDA graph because the attention layers could not be "
-            f"mapped one-to-one onto the {len(layer_model.layers)} decoder layers",
-        )
-        return result(None)
-
-    model_runner.mha_companion_layers = _align_pipeline_layers(
-        model_runner.mha_companion_layers, layer_model
-    )
 
     tic = time.perf_counter()
     before_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)

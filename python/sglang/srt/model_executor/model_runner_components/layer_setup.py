@@ -54,6 +54,11 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
         elif hasattr(layer, "attention"):
             if hasattr(layer.attention, "attn"):
                 attn_layer = layer.attention.attn
+            elif hasattr(layer.attention, "attn_mqa"):
+                # Bailing-MoE linear / v3 hold an MLA module here.
+                attn_layer = layer.attention.attn_mqa
+                if hasattr(layer.attention, "attn_mha"):
+                    mha_companion_layer = layer.attention.attn_mha
         # For NemotronH and similar hybrid models using 'mixer' attribute
         elif hasattr(layer, "mixer"):
             if hasattr(layer.mixer, "attn"):
