@@ -1313,7 +1313,15 @@ class TestCCAQKMixRope(CustomTestCase):
         cca.head_dim = head_dim
         cca.sqrt_head_dim = head_dim**0.5
         cca.clamp_temp = False
-        cca.temp = torch.nn.Parameter(torch.rand(num_k_heads) + 0.5)
+        # ON THE DEVICE, not on the host. ``_normalize_qk`` and the fp64
+        # reference read ``self.temp`` and multiply it into CUDA activations, so
+        # a host parameter is a device mismatch. Note which way this is fixed:
+        # the tensors go to CUDA, never the other way round. Only the two pure
+        # torch expression trees (``_add_grouped_qk_means`` / ``_normalize_qk``)
+        # are borrowed off this CPU-built module -- the module is never *called*,
+        # so no sglang fused op gets to resolve an aiter device kernel from the
+        # platform and run it over host pointers.
+        cca.temp = torch.nn.Parameter((torch.rand(num_k_heads) + 0.5).to(dev))
 
         rotary_emb = get_rope(
             head_size=head_dim,
@@ -1328,53 +1336,58 @@ class TestCCAQKMixRope(CustomTestCase):
         self.assertEqual(rotary_emb.rotary_dim, head_dim // 2)
         self.assertEqual(rotary_emb.cos_sin_cache.shape[-1], head_dim // 2)
 
-        conv_qk = (
-            torch.randn(num_tokens, (num_q_heads + num_k_heads) * head_dim, dtype=dtype)
+        # Built on the device up front rather than moved at each use: one
+        # forgotten ``.to(dev)`` is a device mismatch, and there is no reason for
+        # a host copy to exist at all.
+        shape = (num_tokens, (num_q_heads + num_k_heads) * head_dim)
+        conv_qk = torch.randn(*shape, dtype=dtype, device=dev) * 0.3
+        pre_q = (
+            torch.randn(num_tokens, num_q_heads * head_dim, dtype=dtype, device=dev)
             * 0.3
         )
-        pre_q = torch.randn(num_tokens, num_q_heads * head_dim, dtype=dtype) * 0.3
-        base_k = torch.randn(num_tokens, num_k_heads * head_dim, dtype=dtype) * 0.3
-        positions = torch.arange(num_tokens, dtype=torch.int64)
+        base_k = (
+            torch.randn(num_tokens, num_k_heads * head_dim, dtype=dtype, device=dev)
+            * 0.3
+        )
+        positions = torch.arange(num_tokens, dtype=torch.int64, device=dev)
 
+        # ``get_rope`` caches process-wide and builds the cache on whatever
+        # device was current, so pull the shared module onto the activations'
+        # device before anything reads its buffer.
         rotary_dev = rotary_emb.to(dev)
         cache = rotary_dev.cos_sin_cache
+        self.assertEqual(cache.device.type, conv_qk.device.type)
         q_ref, k_ref = self._reference_chain(
-            cca,
-            conv_qk.to(dev),
-            pre_q.to(dev),
-            base_k.to(dev),
-            rotary_dev,
-            positions.to(dev),
-            dtype,
+            cca, conv_qk, pre_q, base_k, rotary_dev, positions, dtype
         )
         q_f64, k_f64 = self._reference_fp64(
-            cca,
-            conv_qk.to(dev).float(),
-            pre_q.to(dev).float(),
-            base_k.to(dev).float(),
-            cache,
-            positions.to(dev),
+            cca, conv_qk.float(), pre_q.float(), base_k.float(), cache, positions
         )
 
-        rope = CCARope.of(rotary_dev, positions.to(dev))
+        rope = CCARope.of(rotary_dev, positions)
         self.assertIsNotNone(rope, "the plain RotaryEmbedding must be fusable")
-        self.assertTrue(
-            kernel.rope_covered(
-                rope.positions,
-                rope.cos_sin_cache,
-                rope.rotary_dim,
-                head_dim=head_dim,
-                num_tokens=num_tokens,
-                is_neox_style=rope.is_neox_style,
-                device=torch.device(dev),
-            )
+        # ``conv_qk.device`` (cuda:0), NOT ``torch.device("cuda")``: the index is
+        # part of a device's identity, so an un-indexed literal compares unequal
+        # to every real tensor's device. Production passes ``qk_out.device``, so
+        # this mirrors it -- and the assertion reports the gate that declined,
+        # because a bare False here would mean the test silently never exercised
+        # the fused path.
+        reason = kernel.rope_decline_reason(
+            rope.positions,
+            rope.cos_sin_cache,
+            rope.rotary_dim,
+            head_dim=head_dim,
+            num_tokens=num_tokens,
+            is_neox_style=rope.is_neox_style,
+            device=conv_qk.device,
         )
+        self.assertIsNone(reason, f"rope fusion declined: {reason}")
 
-        k_scale = (cca.temp.detach().float() * cca.sqrt_head_dim).to(dev)
+        k_scale = cca.temp.detach().float() * cca.sqrt_head_dim
         q_got, k_got = kernel.cca_qk_mix(
-            conv_qk.to(dev),
-            pre_q.to(dev),
-            base_k.to(dev),
+            conv_qk,
+            pre_q,
+            base_k,
             k_scale,
             num_q_heads=num_q_heads,
             num_k_heads=num_k_heads,
@@ -1390,13 +1403,30 @@ class TestCCAQKMixRope(CustomTestCase):
         # then scaled by sqrt(head_dim), so the per-element RMS is 1), and the
         # chain rounds twice more than the fused path does, so the gap is a
         # couple of bf16 ulps: 2 * 2^-8 ~= 8e-3 absolute.
-        tol = 8e-3 if dtype is torch.bfloat16 else 1e-5
+        # fp32 budget, derived rather than guessed: the RMS reduction splits into
+        # three partial sums instead of one tree (~sqrt(128)*2^-24 ~= 7e-7
+        # relative), Triton's ``tl.rsqrt`` may be the hardware approximate
+        # instruction (~2^-22 ~= 2.4e-7), and the rotation is three more fp32 ops
+        # whose absolute error is bounded by ~(|lo|+|hi|)*2^-24 on O(1) elements.
+        # That is ~2e-6; 1e-4 leaves two decades of headroom for whatever
+        # ``sgl_kernel.rotary_embedding`` does internally, and still shows the
+        # ~80x collapse from the bf16 case, which is the point of the fp32 run.
+        tol = 8e-3 if dtype is torch.bfloat16 else 1e-4
         torch.testing.assert_close(q_got, q_ref, rtol=tol, atol=tol)
         torch.testing.assert_close(k_got, k_ref, rtol=tol, atol=tol)
 
         # Direction of the error: the fused path must be at least as close to the
         # fp64 evaluation as the chain it replaces, because it carries the
         # rotation in fp32 and rounds once instead of three times.
+        #
+        # bf16 only. That advantage exists precisely because the chain rounds to
+        # bf16 mid-rotation; at fp32 both paths carry full precision throughout
+        # and the residual difference is just rounding order (measured at ~4e-7
+        # between the two references), so "which is closer" is noise and
+        # asserting on it would be a flake. The fp32 run's claim is the tolerance
+        # check above.
+        if dtype is not torch.bfloat16:
+            return
         for got, ref, exact, name in (
             (q_got, q_ref, q_f64, "q"),
             (k_got, k_ref, k_f64, "k"),
@@ -1425,7 +1455,7 @@ class TestCCAQKMixRope(CustomTestCase):
     def test_fp32_output_matches_the_chain_tightly(self):
         # With an fp32 store the only remaining difference from the chain is the
         # intermediate rounding it does and this path does not, so the gap
-        # collapses by three orders of magnitude.
+        # collapses by ~80x (8e-3 -> 1e-4; see the tolerance derivation in _run).
         self._run(rope_base=10_000_000, num_tokens=17, dtype=torch.float32)
 
     @unittest.skipUnless(torch.cuda.is_available(), "fused kernel requires a GPU")
@@ -1725,20 +1755,25 @@ class TestCCAQKMixKVStore(CustomTestCase):
                 full_to_swa = mapping if is_sliding else None
                 k_cache = fused_pool.get_key_buffer(layer_id)
                 v_cache = fused_pool.get_value_buffer(layer_id)
-                self.assertTrue(
-                    kernel.store_covered(
-                        value,
-                        k_cache,
-                        v_cache,
-                        out_cache_loc,
-                        full_to_swa,
-                        num_k_heads=nk,
-                        head_dim=hd,
-                        num_tokens=T,
-                        out_dtype=torch.bfloat16,
-                        device=torch.device(dev),
-                    )
+                # ``conv_qk.device`` (cuda:0), NOT ``torch.device("cuda")``: the
+                # index is part of a device's identity, so an un-indexed literal
+                # compares unequal to every real tensor's device and the gate
+                # declines. Production passes ``qk_out.device``. Assert on the
+                # reason, not a bare bool -- a silent decline here would mean the
+                # pool comparison below never saw the fused write at all.
+                reason = kernel.store_decline_reason(
+                    value,
+                    k_cache,
+                    v_cache,
+                    out_cache_loc,
+                    full_to_swa,
+                    num_k_heads=nk,
+                    head_dim=hd,
+                    num_tokens=T,
+                    out_dtype=torch.bfloat16,
+                    device=conv_qk.device,
                 )
+                self.assertIsNone(reason, f"kv store fusion declined: {reason}")
 
                 q_got, k_got = kernel.cca_qk_mix(
                     conv_qk,
@@ -1966,6 +2001,89 @@ class TestCCAQKMixStoreCoverage(CustomTestCase):
                 out_dtype=torch.bfloat16,
                 device=torch.device("cpu"),
             )
+        )
+
+    def test_an_unindexed_reference_device_still_matches(self):
+        # Regression. ``torch.device("cuda") != torch.device("cuda:0")`` -- the
+        # index is part of the identity -- while every tensor reports an indexed
+        # device. A caller that writes the reference device by hand instead of
+        # reading it off a tensor used to fail every check, and because this gate
+        # declines by FALLING BACK, that showed up as "the fusion is silently
+        # off", not as an error. An un-indexed reference means "any device of
+        # this type", so it must match. Pinned on CPU, where the same asymmetry
+        # does not exist (cpu has no index), by driving the helper directly.
+        from sglang.kernels.ops.attention import cca_qk_mix as kernel
+
+        t = torch.zeros(2)
+        self.assertTrue(kernel._same_device(t, torch.device("cpu")))
+        self.assertFalse(kernel._same_device(t, torch.device("cuda")))
+        self.assertFalse(kernel._same_device(t, torch.device("cuda:0")))
+        self.assertFalse(kernel._same_device(t, torch.device("meta")))
+        # An indexed reference still pins the index.
+        meta = t.to("meta")
+        self.assertTrue(kernel._same_device(meta, torch.device("meta")))
+
+    def test_the_decline_reason_names_the_gate(self):
+        # The reason strings are what ``_note_fusion`` logs and what the GPU
+        # tests assert on, so a bare "False" can never again hide which gate
+        # said no. Each case must name its own gate, not a neighbour's.
+        from sglang.kernels.ops.attention import cca_qk_mix as kernel
+
+        args = self._ok_args()
+
+        def _reason(**over):
+            a = dict(args)
+            a.update(over)
+            return kernel.store_decline_reason(
+                a["value"],
+                a["k_cache"],
+                a["v_cache"],
+                a["out_cache_loc"],
+                a["full_to_swa"],
+                num_k_heads=2,
+                head_dim=8,
+                num_tokens=3,
+                out_dtype=torch.bfloat16,
+                device=torch.device("cpu"),
+            )
+
+        self.assertIsNone(_reason())
+        self.assertIn("not supplied", _reason(value=None))
+        self.assertIn("3-D NHD", _reason(k_cache=torch.zeros(4, 2, 4, 1, 2)))
+        self.assertIn("dtype", _reason(v_cache=torch.zeros(17, 2, 8).float()))
+        self.assertIn(
+            "out_cache_loc", _reason(out_cache_loc=torch.zeros(4, dtype=torch.int64))
+        )
+        self.assertIn(
+            "full_to_swa", _reason(full_to_swa=torch.zeros(18, dtype=torch.int32))
+        )
+        self.assertIn("k_cache on meta", _reason(k_cache=args["k_cache"].to("meta")))
+
+    def test_the_rope_decline_reason_names_the_gate(self):
+        from sglang.kernels.ops.attention import cca_qk_mix as kernel
+
+        hd, rot, T = 128, 64, 4
+        pos = torch.arange(T, dtype=torch.int64)
+        cache = torch.randn(256, rot)
+        common = dict(head_dim=hd, num_tokens=T)
+
+        self.assertIn(
+            "no rotary offered", kernel.rope_decline_reason(None, cache, rot, **common)
+        )
+        self.assertIn(
+            "rotary_dim", kernel.rope_decline_reason(pos, cache, 128, **common)
+        )
+        self.assertIn(
+            "gptj",
+            kernel.rope_decline_reason(pos, cache, rot, is_neox_style=False, **common),
+        )
+        self.assertIn(
+            "positions", kernel.rope_decline_reason(pos[:2], cache, rot, **common)
+        )
+        # On CPU the accelerator check is the last one standing, and it must say
+        # so rather than blaming a shape.
+        self.assertIn(
+            "accelerator", kernel.rope_decline_reason(pos, cache, rot, **common)
         )
 
     def test_store_is_only_offered_when_the_rope_fused(self):
