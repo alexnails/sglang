@@ -1339,10 +1339,10 @@ class ShortConvHybridAttnBackend(HybridLinearAttnBackend):
     def conv_state_metadata(self, layer_id: int, forward_batch: ForwardBatch):
         return self.short_conv_backend.conv_state_metadata(layer_id, forward_batch)
 
-    def track_conv_states_extend(self, layer_cache, conv_inputs):
+    def track_conv_states_extend(self, conv_states, conv_inputs):
         """Radix mamba-cache checkpoint, extend side (per conv layer)."""
         return self.short_conv_backend.track_conv_states_extend(
-            layer_cache, conv_inputs
+            conv_states, conv_inputs
         )
 
     def track_conv_states_decode(self, forward_batch: ForwardBatch):

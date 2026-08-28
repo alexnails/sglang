@@ -1497,12 +1497,19 @@ class CCA(nn.Module):
                 lag_state,
                 forward_batch.extend_seq_lens_cpu,
             )
-            # Radix mamba-cache checkpoint (extra_buffer strategy only): both
-            # conv entries are windows of these two inputs -- conv[0] is the
-            # last ``total_padding`` rows of ``qk``, conv[1] the last row of
-            # ``hidden_states`` -- so the snapshot at the chunk-aligned track
-            # position is a gather over them. No-op under ``no_buffer``.
-            backend.track_conv_states_extend(meta.layer_cache, (qk, hidden_states))
+            # Radix mamba-cache checkpoint (extra_buffer strategy only). Both
+            # conv entries are trailing windows of the streams the conv just
+            # consumed -- conv[0] is the last ``total_padding`` rows of ``qk``,
+            # the lag entry is the last row of ``lag_now`` -- so the snapshot at
+            # the chunk-aligned track position is a gather over them. Hand the
+            # state VIEWS the conv wrote through, not ``meta.layer_cache.conv``:
+            # ``lag_state`` may be a narrowed sub-slice of the rank-uniform pool
+            # entry, and is ``None`` on a rank with no lag stream at all (at
+            # attn_tp=2 rank 0 reads only ``val_proj1``). Passing ``lag_now``
+            # rather than ``hidden_states`` is load-bearing: the pool caches the
+            # PROJECTED value ``W_v2 . hs``, which is 32x narrower and a
+            # different quantity. No-op under ``no_buffer``.
+            backend.track_conv_states_extend((conv_state, lag_state), (qk, lag_now))
 
         query_conv = qk_out[:, : self.latent_q_dim].view(
             T, self.num_q_heads, self.head_dim

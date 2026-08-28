@@ -437,24 +437,54 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
     # never-written slot -- a prefix hit that restores garbage conv state.
 
     def track_conv_states_extend(
-        self, layer_cache: Any, conv_inputs: Sequence[torch.Tensor]
+        self,
+        conv_states: Sequence[Optional[torch.Tensor]],
+        conv_inputs: Sequence[Optional[torch.Tensor]],
     ) -> None:
         """Snapshot this layer's conv entries at the chunk-aligned track point.
 
+        ``conv_states[j]`` must be the EXACT tensor view the conv wrote its
+        state through -- not ``layer_cache.conv[j]`` re-derived here. A rank may
+        own only a leading sub-slice of a pool entry (ZAYA1's lag entry is
+        rank-uniform in the pool but each rank narrows it to its own
+        ``val_proj2`` output width), and the snapshot has to land in the same
+        slice or a prefix restore reloads a row the decode path never wrote.
+        Taking the view from the caller is what keeps the two in lockstep.
+
         ``conv_inputs[j]`` is the ``[T, C_j]`` tensor whose last ``window_j``
-        rows ARE ``layer_cache.conv[j]`` after the conv runs, in the flattened
-        token layout. Call once per conv layer on the extend path; the state
-        slot the conv itself writes is a different row, so before-or-after the
-        conv is equivalent. A no-op unless this step tracks something.
+        rows ARE that state after the conv runs, in the flattened token layout.
+        A pair is skipped when either side is ``None`` -- at ZAYA1's attn_tp=2
+        rank 0 owns no lag stream at all, so it neither computes nor stores
+        that entry and there is nothing to snapshot.
+
+        Call once per conv layer on the extend path; the state slot the conv
+        itself writes is a different row, so before-or-after the conv is
+        equivalent. A no-op unless this step tracks something.
         """
         index_list = self._track_conv_indices
         if index_list is None:
             return
         dst = self._track_dst
-        assert (
-            len(conv_inputs) == len(index_list) == len(layer_cache.conv)
-        ), f"expected {len(index_list)} conv inputs, got {len(conv_inputs)}"
-        for conv_state, x, indices in zip(layer_cache.conv, conv_inputs, index_list):
+        assert len(conv_states) == len(conv_inputs) == len(index_list), (
+            f"expected {len(index_list)} (state, input) pairs, got "
+            f"{len(conv_states)} states and {len(conv_inputs)} inputs"
+        )
+        for conv_state, x, indices in zip(conv_states, conv_inputs, index_list):
+            if conv_state is None or x is None:
+                continue
+            # Width contract, checked against the state the conv actually wrote
+            # rather than trusted from the caller: a channel mismatch here means
+            # the snapshot and the live state are different quantities, and the
+            # scatter below would either raise or silently write the wrong rows.
+            assert conv_state.shape[-2] == x.shape[-1], (
+                f"conv state has {conv_state.shape[-2]} channels but its input "
+                f"tensor has {x.shape[-1]}; the snapshot must cache exactly "
+                "what the conv state holds"
+            )
+            assert conv_state.shape[-1] == indices.shape[-1], (
+                f"conv state window is {conv_state.shape[-1]} but the track "
+                f"index build used {indices.shape[-1]}"
+            )
             # [C, T] -> [C, n_tracked, window] -> [n_tracked, C, window]
             window = x.transpose(0, 1)[:, indices].transpose(0, 1)
             conv_state[dst] = window.to(conv_state.dtype)
