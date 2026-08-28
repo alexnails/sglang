@@ -58,6 +58,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.moe.zaya_router_tail import debug_asserts_enabled
+
 # The K split is two halves, so a stage's dot operand is [D/2, D/2]. Capping D at
 # 256 caps that at [128, 128] -- 32 KiB in bf16, which stages comfortably in LDS
 # on every gfx9 part. ZAYA1 uses D = 256 exactly.
@@ -92,6 +94,12 @@ def _dense_bias_gelu(
     k = tl.arange(0, HALF)
     n = N_OFF + tl.arange(0, HALF)
 
+    # These loads carry no mask, and do not need one: N_OFF is 0 or HALF, so
+    # n < 2*HALF == D, and both k and k + HALF are < D. W is exactly [D, D] and
+    # the bias exactly [D] (covered() checks both), so every lane is in bounds
+    # by construction rather than by masking. There is deliberately no padding
+    # on this axis -- HALF is a power of two because D is.
+    #
     # Loaded and consumed one tile at a time so the two halves share one LDS
     # scratch buffer instead of needing two live at once.
     w = tl.load(w_ptr + n[None, :] * s_w_out + k[:, None] * s_w_in)
@@ -135,17 +143,27 @@ def _router_mlp_kernel(
     HALF: tl.constexpr,  # D // 2
     NPAD: tl.constexpr,  # NUM_EXPERTS padded up to a dot-legal power of 2
     BLOCK_M: tl.constexpr,
+    DEBUG_ASSERT: tl.constexpr,
 ):
     pid = tl.program_id(0)
     rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
     row_mask = rows < num_tokens
     k = tl.arange(0, HALF)
 
+    # Address with a CLAMPED row so the last tile's padding lanes -- up to
+    # BLOCK_M - 1 of them, and T is 1 at bs=1 decode -- point at a real row
+    # instead of up to 31 rows past the end. row_mask still decides which values
+    # are used and which rows are written, so this only changes what an unmasked
+    # lane would have touched.
+    safe_rows = tl.minimum(rows, num_tokens - 1)
+
     x_lo = tl.load(
-        x_ptr + rows[:, None] * s_x_m + k[None, :], mask=row_mask[:, None], other=0.0
+        x_ptr + safe_rows[:, None] * s_x_m + k[None, :],
+        mask=row_mask[:, None],
+        other=0.0,
     )
     x_hi = tl.load(
-        x_ptr + rows[:, None] * s_x_m + (k[None, :] + HALF),
+        x_ptr + safe_rows[:, None] * s_x_m + (k[None, :] + HALF),
         mask=row_mask[:, None],
         other=0.0,
     )
@@ -160,21 +178,31 @@ def _router_mlp_kernel(
     # neither a power of two nor dot-legal, so pad the output axis and mask.
     n = tl.arange(0, NPAD)
     col_mask = n < NUM_EXPERTS
+    # NPAD is NUM_EXPERTS padded up to a dot-legal power of two: 32 for the 74B's
+    # 25, so 7 of 32 columns are padding. Clamp the addressing index for the same
+    # reason as the rows -- w3 has exactly NUM_EXPERTS rows, and a padded column
+    # lane that escaped the mask would read past the smallest of the three weight
+    # tensors. col_mask still zeroes their contribution to the dot.
+    safe_n = tl.minimum(n, NUM_EXPERTS - 1)
     w = tl.load(
-        w3_ptr + n[None, :] * s_w3_out + k[:, None] * s_w3_in,
+        w3_ptr + safe_n[None, :] * s_w3_out + k[:, None] * s_w3_in,
         mask=col_mask[None, :],
         other=0.0,
     )
     logits = tl.dot(g_lo, w)
     w = tl.load(
-        w3_ptr + n[None, :] * s_w3_out + (k[:, None] + HALF) * s_w3_in,
+        w3_ptr + safe_n[None, :] * s_w3_out + (k[:, None] + HALF) * s_w3_in,
         mask=col_mask[None, :],
         other=0.0,
     )
     logits = tl.dot(g_hi, w, logits)
 
+    if DEBUG_ASSERT:
+        tl.device_assert(safe_n < NUM_EXPERTS, "zaya_router_mlp: expert col OOB")
+        tl.device_assert(safe_rows < num_tokens, "zaya_router_mlp: row OOB")
+
     tl.store(
-        out_ptr + rows[:, None] * s_out_m + n[None, :],
+        out_ptr + safe_rows[:, None] * s_out_m + safe_n[None, :],
         logits.to(out_ptr.dtype.element_ty),
         mask=row_mask[:, None] & col_mask[None, :],
     )
@@ -273,6 +301,7 @@ def router_mlp(
         HALF=expansion // 2,
         NPAD=triton.next_power_of_2(max(num_experts, _MIN_DOT_DIM)),
         BLOCK_M=block_m,
+        DEBUG_ASSERT=debug_asserts_enabled(),
         num_warps=4,
     )
     return out

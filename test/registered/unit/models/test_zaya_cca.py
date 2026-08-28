@@ -2444,12 +2444,292 @@ def _make_tiny_router(
     return router, config
 
 
-@unittest.skip(
-    "zaya_router_tail takes a device-side fault on gfx950 (SIGABRT at the next "
-    "sync, no Python error). The kernel is default-off behind "
-    "SGLANG_OPT_ZAYA_FUSED_ROUTER; re-enable these once the out-of-bounds "
-    "index is fixed."
-)
+class TestZayaRouterTailKernel(CustomTestCase):
+    """``zaya_router_tail`` on its own, with no sglang module anywhere near it.
+
+    Deliberately first in the file and deliberately module-free: every tensor
+    here is a raw ``torch.empty`` / ``torch.randn``. Nothing constructs a
+    ``ZayaRouter``, so nothing runs ``ReplicatedLinear`` or sglang's ``RMSNorm``.
+
+    That separation is the point. The gfx950 fault this class was written for
+    surfaced as a SIGABRT at an unrelated synchronisation point several tests
+    after the offending launch, which makes "the suite aborts" useless as
+    evidence about *which* kernel is at fault. If this class passes and a later
+    one aborts, the tail kernel is exonerated and the fault belongs to something
+    the model path pulls in; if this class aborts, it is the tail kernel. Keep it
+    module-free.
+    """
+
+    def tearDown(self):
+        # Force any asynchronous device fault to surface HERE, attributed to the
+        # test that launched it. Without this a bad launch aborts the process at
+        # some later, unrelated synchronisation point -- which is exactly what
+        # made the first gfx950 report point at ReplicatedLinear.__init__ inside
+        # a CPU-only test several tests downstream of the real culprit.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        super().tearDown()
+
+    # ZAYA1-74B: 24 experts plus the MOD skip slot. BLOCK pads to 32, so 7 of
+    # 32 column lanes are padding -- the configuration a power-of-two-padded
+    # mask bug hides in, and the one the smaller shapes cannot expose.
+    NUM_MOE_EXPERTS = 24
+    NUM_EXPERTS = 25
+
+    def _biases(self, num_experts, mod=True):
+        biases = torch.zeros(num_experts, dtype=torch.float32, device="cuda")
+        if mod:
+            biases[-1] = -1.0  # what ZayaRouter.__init__ writes
+        return biases
+
+    def _reference(self, logits, biases):
+        """The torch chain, in-line, so this class stays module-free.
+
+        The argmax is spelled out as an explicit lowest-index-wins reduction
+        rather than ``torch.argmax``. bf16 carries only 256 values per octave, so
+        25 columns drawn from it collide often, and on an exact tie
+        ``torch.argmax`` may return any of the winners while the kernel promises
+        the lowest. Using torch.argmax here would make this test flaky in the one
+        direction the kernel actually pins.
+        """
+        num_experts = logits.shape[1]
+        prob = torch.softmax(logits.float(), dim=-1)
+        biased = prob + biases
+        best = biased.max(dim=-1, keepdim=True).values
+        cols = torch.arange(num_experts, device=logits.device)
+        choice = (
+            torch.where(biased == best, cols, num_experts)
+            .min(dim=-1, keepdim=True)
+            .values
+        )
+        return prob.gather(1, choice), choice
+
+    def _check(self, logits, biases, max_expert_id, out_dtype=torch.float32):
+        from sglang.kernels.ops.moe import zaya_router_tail as kernel
+
+        num_experts = logits.shape[1]
+        self.assertTrue(
+            kernel.covered(
+                logits,
+                biases,
+                num_experts=num_experts,
+                max_expert_id=max_expert_id,
+                topk=1,
+                out_dtype=out_dtype,
+            )
+        )
+        weight, moe_ids, route_prob, skip_ids = kernel.router_tail(
+            logits,
+            biases,
+            num_experts=num_experts,
+            max_expert_id=max_expert_id,
+            softmax_fp32=True,
+            out_dtype=out_dtype,
+        )
+        ref_weight, ref_choice = self._reference(logits, biases)
+
+        # Bounds first: an id outside the expert range leaves this kernel
+        # silently and faults far away, inside FusedMoE's expert indexing.
+        self.assertGreaterEqual(int(moe_ids.min()), 0)
+        self.assertLessEqual(int(moe_ids.max()), max_expert_id)
+        self.assertGreaterEqual(int(skip_ids.min()), 0)
+        self.assertLessEqual(int(skip_ids.max()), num_experts - 1)
+
+        self.assertTrue(
+            torch.equal(skip_ids.long(), ref_choice),
+            "unclamped choice must be bit-identical to torch",
+        )
+        self.assertTrue(
+            torch.equal(moe_ids.long(), ref_choice.clamp(max=max_expert_id)),
+            "clamped choice must be bit-identical to torch",
+        )
+        torch.testing.assert_close(weight, ref_weight, rtol=1e-5, atol=1e-6)
+        return weight, moe_ids, route_prob, skip_ids
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused tail is a GPU kernel")
+    def test_real_zaya_expert_count_across_token_counts(self):
+        """25 experts -- the shipping shape -- at every interesting T."""
+        biases = self._biases(self.NUM_EXPERTS)
+        for num_tokens in (1, 2, 7, 31, 32, 33, 64, 129, 1024):
+            for dtype in (torch.bfloat16, torch.float32):
+                with self.subTest(tokens=num_tokens, dt=dtype):
+                    torch.manual_seed(num_tokens)
+                    logits = torch.randn(
+                        num_tokens, self.NUM_EXPERTS, device="cuda", dtype=dtype
+                    )
+                    self._check(
+                        logits,
+                        biases,
+                        self.NUM_MOE_EXPERTS - 1,
+                        out_dtype=dtype,
+                    )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused tail is a GPU kernel")
+    def test_padding_columns_cannot_influence_the_result(self):
+        """A padded-mask overread shows up here as a wrong answer, not a crash.
+
+        BLOCK pads 25 up to 32, so 7 column lanes are padding. Hand the kernel a
+        25-column *view* of a 32-column buffer whose tail columns hold a huge
+        sentinel. Every address those padding lanes could form is mapped memory,
+        so a dropped or mis-vectorized mask corrupts the softmax instead of
+        faulting -- which is the only way to probe for it without a device fault
+        taking the whole suite down with it.
+
+        ``covered()`` accepts the view: its innermost stride is 1 and its width
+        is exactly ``num_experts``. Only ``stride(0)`` is wider, which is the
+        general case the kernel already handles.
+        """
+        num_tokens = 8
+        torch.manual_seed(3)
+        wide = torch.empty(num_tokens, 32, device="cuda", dtype=torch.float32)
+        wide[:, : self.NUM_EXPERTS] = torch.randn(
+            num_tokens, self.NUM_EXPERTS, device="cuda"
+        )
+        wide[:, self.NUM_EXPERTS :] = 1e30
+        poisoned = wide[:, : self.NUM_EXPERTS]
+        self.assertEqual(poisoned.stride(0), 32)
+        self.assertEqual(poisoned.stride(1), 1)
+
+        biases = self._biases(self.NUM_EXPERTS)
+        weight_poisoned, ids_poisoned, _, _ = self._check(
+            poisoned, biases, self.NUM_MOE_EXPERTS - 1
+        )
+
+        # And the same values in a tight buffer must give the identical answer.
+        weight_clean, ids_clean, _, _ = self._check(
+            poisoned.contiguous(), biases, self.NUM_MOE_EXPERTS - 1
+        )
+        self.assertTrue(torch.equal(ids_poisoned, ids_clean))
+        torch.testing.assert_close(weight_poisoned, weight_clean, rtol=0, atol=0)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused tail is a GPU kernel")
+    def test_padding_bias_lanes_cannot_influence_the_result(self):
+        """Same probe for the bias vector, which is only 25 floats long.
+
+        This is the load the fault report singled out: 25 elements read through
+        a 32-wide block. Poison elements 25..31 with a value that would win any
+        argmax, and hand the kernel a contiguous 25-element prefix view.
+        """
+        num_tokens = 6
+        torch.manual_seed(4)
+        logits = torch.randn(num_tokens, self.NUM_EXPERTS, device="cuda")
+
+        wide_bias = torch.zeros(32, dtype=torch.float32, device="cuda")
+        wide_bias[-1] = -1.0
+        wide_bias[self.NUM_EXPERTS :] = 1e30
+        biases = wide_bias[: self.NUM_EXPERTS]
+        self.assertTrue(biases.is_contiguous())
+        self.assertEqual(biases.numel(), self.NUM_EXPERTS)
+        # The MOD skip slot's own bias must survive the poisoning above.
+        self.assertEqual(float(biases[-1]), -1.0)
+
+        self._check(logits, biases, self.NUM_MOE_EXPERTS - 1)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused tail is a GPU kernel")
+    def test_outputs_are_exactly_t_rows_and_ids_are_distinct_tensors(self):
+        """Shapes, and that the clamped and raw ids are separate buffers.
+
+        Under MOD they must not alias: the clamp would then overwrite the skip
+        slot it exists to preserve.
+        """
+        from sglang.kernels.ops.moe import zaya_router_tail as kernel
+
+        num_tokens = 5
+        logits = torch.randn(num_tokens, self.NUM_EXPERTS, device="cuda")
+        biases = self._biases(self.NUM_EXPERTS)
+        _, moe_ids, _, skip_ids = kernel.router_tail(
+            logits,
+            biases,
+            num_experts=self.NUM_EXPERTS,
+            max_expert_id=self.NUM_MOE_EXPERTS - 1,
+            softmax_fp32=True,
+            out_dtype=torch.float32,
+        )
+        self.assertEqual(tuple(moe_ids.shape), (num_tokens, 1))
+        self.assertEqual(tuple(skip_ids.shape), (num_tokens, 1))
+        self.assertIsNot(moe_ids, skip_ids)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused tail is a GPU kernel")
+    def test_all_experts_tie_at_the_real_shape(self):
+        """The degenerate tie, at 25 experts with the real MOD bias vector.
+
+        With every logit equal the softmax is exactly uniform, so the 24 real
+        experts all tie and the skip slot loses by its -1 bias. Index 0 must win.
+        """
+        from sglang.kernels.ops.moe import zaya_router_tail as kernel
+
+        logits = torch.zeros(4, self.NUM_EXPERTS, device="cuda")
+        biases = self._biases(self.NUM_EXPERTS)
+        _, moe_ids, _, skip_ids = kernel.router_tail(
+            logits,
+            biases,
+            num_experts=self.NUM_EXPERTS,
+            max_expert_id=self.NUM_MOE_EXPERTS - 1,
+            softmax_fp32=True,
+            out_dtype=torch.float32,
+        )
+        self.assertEqual(moe_ids.flatten().tolist(), [0, 0, 0, 0])
+        self.assertEqual(skip_ids.flatten().tolist(), [0, 0, 0, 0])
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused tail is a GPU kernel")
+    def test_nan_logits_still_produce_an_in_range_id(self):
+        """A NaN logit must not let an out-of-range id escape to FusedMoE.
+
+        With a NaN in the row, no lane compares equal to the max and the
+        tie-break reduction returns its ``NUM_EXPERTS`` sentinel. The value that
+        leaves this kernel is what FusedMoE indexes expert weights with, so the
+        contract is "always in range", not "always the same as torch" -- torch's
+        own argmax is unspecified on NaN. Only the bound is asserted.
+        """
+        from sglang.kernels.ops.moe import zaya_router_tail as kernel
+
+        logits = torch.randn(4, self.NUM_EXPERTS, device="cuda")
+        logits[1, 7] = float("nan")
+        logits[3, :] = float("nan")
+        biases = self._biases(self.NUM_EXPERTS)
+        _, moe_ids, _, skip_ids = kernel.router_tail(
+            logits,
+            biases,
+            num_experts=self.NUM_EXPERTS,
+            max_expert_id=self.NUM_MOE_EXPERTS - 1,
+            softmax_fp32=True,
+            out_dtype=torch.float32,
+        )
+        self.assertGreaterEqual(int(moe_ids.min()), 0)
+        self.assertLessEqual(int(moe_ids.max()), self.NUM_MOE_EXPERTS - 1)
+        self.assertGreaterEqual(int(skip_ids.min()), 0)
+        self.assertLessEqual(int(skip_ids.max()), self.NUM_EXPERTS - 1)
+
+    def test_block_padding_is_never_narrower_than_the_minimum(self):
+        """CPU-checkable: the launch never emits a sub-16-wide column block.
+
+        A 2- or 4-element 1-D tensor on a 64-lane wavefront is a degenerate
+        layout that no other kernel in this tree exercises, and it was one of the
+        two structural oddities in the version of this kernel that faulted. The
+        padding lanes are masked and their addresses clamped, so widening to 16
+        costs nothing and keeps the layout on a well-travelled path.
+        """
+        from sglang.kernels.ops.moe import zaya_router_tail as kernel
+
+        self.assertEqual(kernel.block_size(1), 16)
+        self.assertEqual(kernel.block_size(2), 16)
+        self.assertEqual(kernel.block_size(4), 16)
+        self.assertEqual(kernel.block_size(16), 16)
+        # The shipping shape: 25 experts in a 32-wide block, 7 lanes of padding.
+        self.assertEqual(kernel.block_size(25), 32)
+        self.assertEqual(kernel.block_size(64), 64)
+        self.assertEqual(kernel.block_size(65), 128)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused tail is a GPU kernel")
+    def test_narrow_expert_counts_still_match_torch(self):
+        """The sub-block expert counts, now that they all pad up to 16."""
+        for num_experts in (2, 4, 5, 8):
+            with self.subTest(experts=num_experts):
+                torch.manual_seed(num_experts)
+                logits = torch.randn(3, num_experts, device="cuda")
+                self._check(logits, self._biases(num_experts), num_experts - 2)
+
+
 class TestZayaRouterFusedTail(CustomTestCase):
     """The fused router tail must reproduce the torch chain it replaces.
 
@@ -2468,6 +2748,36 @@ class TestZayaRouterFusedTail(CustomTestCase):
     here does not match torch's tree reduction, so ~1 ULP of drift is expected.
     """
 
+    def tearDown(self):
+        # Force any asynchronous device fault to surface HERE, attributed to the
+        # test that launched it. Without this a bad launch aborts the process at
+        # some later, unrelated synchronisation point -- which is exactly what
+        # made the first gfx950 report point at ReplicatedLinear.__init__ inside
+        # a CPU-only test several tests downstream of the real culprit.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        super().tearDown()
+
+    def _router(self, **kwargs):
+        """A CUDA router whose only fused kernel is the tail under test.
+
+        Two deliberate choices, both learned from the gfx950 fault hunt:
+
+        ``mlp_expansion`` defaults to a realistic 256 rather than the 8 this
+        file's other factories use. At width 8 sglang's RMSNorm runs at a size
+        nothing else in the tree exercises on GPU, which made it a second
+        suspect and muddied the evidence about which kernel was faulting.
+
+        And ``fused_router_mlp_ok`` is switched off, so a failure in this class
+        can only be the tail kernel -- not the MLP kernel that a realistic
+        expansion would otherwise switch on underneath it.
+        """
+        kwargs.setdefault("mlp_expansion", 256)
+        kwargs.setdefault("std", 1.0 / 16.0)
+        router, config = _make_tiny_router(device="cuda", **kwargs)
+        router.fused_router_mlp_ok = False
+        return router, config
+
     def _reference(self, router, hidden):
         """Run the unfused chain over the same logits the fused path sees."""
         hs, _ = router.down_proj(hidden)
@@ -2485,10 +2795,9 @@ class TestZayaRouterFusedTail(CustomTestCase):
             (1, 3, torch.bfloat16),  # one real expert plus the skip slot
         ):
             with self.subTest(experts=num_moe_experts, tokens=num_tokens, dt=dtype):
-                router, config = _make_tiny_router(
+                router, config = self._router(
                     num_moe_experts=num_moe_experts,
                     seed=num_moe_experts,
-                    device="cuda",
                     dtype=dtype,
                 )
                 torch.manual_seed(num_tokens)
@@ -2578,9 +2887,7 @@ class TestZayaRouterFusedTail(CustomTestCase):
         to the last expert and MOD would silently stop skipping.
         """
         num_moe_experts = 6
-        router, config = _make_tiny_router(
-            num_moe_experts=num_moe_experts, seed=5, device="cuda"
-        )
+        router, config = self._router(num_moe_experts=num_moe_experts, seed=5)
         self.assertTrue(router.use_mod)
         self.assertEqual(router.num_experts, num_moe_experts + 1)
         with torch.no_grad():
@@ -2633,6 +2940,30 @@ class TestZayaRouterFusedTail(CustomTestCase):
         )
         for t in outs:
             self.assertEqual(tuple(t.shape), (0, 1))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "control needs a GPU")
+    def test_reference_path_at_the_narrow_norm_width(self):
+        """Control: the same router shapes with NO fused kernel at all.
+
+        The other half of the gfx950 localization. Builds the router at
+        ``mlp_expansion=8`` -- the width this file used everywhere before, and a
+        width nothing else in the tree runs sglang's RMSNorm at on GPU -- and
+        takes the torch reference path end to end, then synchronises. If THIS
+        aborts, the fault was never in either fused kernel and the search should
+        move to the aiter RMSNorm at that width.
+        """
+        router, config = _make_tiny_router(
+            num_moe_experts=24, mlp_expansion=8, seed=9, device="cuda"
+        )
+        router.fused_router_mlp_ok = False
+        hidden = torch.randn(5, config.hidden_size, device="cuda")
+        with torch.no_grad():
+            hs, _ = router.down_proj(hidden)
+            logits = router._router_logits_reference(router.rmsnorm_eda(hs))
+            ref = router._routing_reference(logits, hidden.dtype, hs)
+        torch.cuda.synchronize()
+        self.assertEqual(tuple(ref.moe_ids.shape), (5, 1))
+        self.assertEqual(tuple(logits.shape), (5, 25))
 
     def test_uncovered_inputs_fall_back(self):
         """``covered()`` is the only guard between an unsupported input and a
@@ -2752,12 +3083,6 @@ class TestZayaRouterFusedTail(CustomTestCase):
 # ---------------------------------------------------------------------------
 
 
-@unittest.skip(
-    "zaya_router_tail takes a device-side fault on gfx950 (SIGABRT at the next "
-    "sync, no Python error). The kernel is default-off behind "
-    "SGLANG_OPT_ZAYA_FUSED_ROUTER; re-enable these once the out-of-bounds "
-    "index is fixed."
-)
 class TestZayaRouterFusedMLP(CustomTestCase):
     """The fused router MLP must reproduce the ``nn.Sequential`` it replaces.
 
@@ -2770,6 +3095,16 @@ class TestZayaRouterFusedMLP(CustomTestCase):
     layers of the 74B. So the erf-vs-tanh guard gets tests of its own, on CPU,
     where they run on every commit rather than only on GPU hardware.
     """
+
+    def tearDown(self):
+        # Force any asynchronous device fault to surface HERE, attributed to the
+        # test that launched it. Without this a bad launch aborts the process at
+        # some later, unrelated synchronisation point -- which is exactly what
+        # made the first gfx950 report point at ReplicatedLinear.__init__ inside
+        # a CPU-only test several tests downstream of the real culprit.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        super().tearDown()
 
     def test_structural_guard_accepts_the_real_router(self):
         from sglang.srt.models.zaya import fusable_router_mlp
