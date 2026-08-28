@@ -191,6 +191,12 @@ def cca_qk_mix(
         G=num_q_heads // num_k_heads,
         HD=head_dim,
         BLOCK=triton.next_power_of_2(head_dim),
-        num_warps=4,
+        # One warp, not four. Each program owns a single head-dim vector
+        # (ZAYA1: 128 elements), so 4 warps is 256 ROCm lanes for 128 elements:
+        # half of them idle, and every ``tl.sum`` -- there are ``G + 1`` of them
+        # per program -- becomes a cross-wavefront LDS reduction with the
+        # barriers that implies. At one warp the block is 64 lanes, 2 elements
+        # each, and the reduction stays inside the wavefront.
+        num_warps=1,
     )
     return q_out, k_out

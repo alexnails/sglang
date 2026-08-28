@@ -814,12 +814,17 @@ class TestCCAQKMixKernel(CustomTestCase):
     which ``covered()`` selects when the folded scale vector is absent.
     """
 
-    def _run(self, num_q_heads: int, num_k_heads: int, num_tokens: int):
+    def _run(
+        self,
+        num_q_heads: int,
+        num_k_heads: int,
+        num_tokens: int,
+        head_dim: int = 32,
+    ):
         import torch as _torch
 
         from sglang.kernels.ops.attention import cca_qk_mix as kernel
 
-        head_dim = 32
         dev = "cuda"
         _torch.manual_seed(11)
         cca = _make_tiny_cca(seed=2)[0]
@@ -893,6 +898,21 @@ class TestCCAQKMixKernel(CustomTestCase):
             for num_tokens in (1, 5):
                 with self.subTest(q=num_q_heads, k=num_k_heads, t=num_tokens):
                     self._run(num_q_heads, num_k_heads, num_tokens)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused kernel requires a GPU")
+    def test_matches_torch_chain_at_the_serving_shape(self):
+        """head_dim 128 and a decode-sized batch, i.e. the launch config in prod.
+
+        The other case pins the algebra at head_dim 32, which fits one ROCm
+        wavefront twice over; 128 is what ZAYA1 actually runs and is the shape the
+        block size and warp count are chosen for, so any reduction that only
+        happens to be right at 32 lanes shows up here. 40 tokens puts several
+        programs on every CU instead of one.
+        """
+        _ensure_dist_initialized()
+        for num_tokens in (1, 40):
+            with self.subTest(t=num_tokens):
+                self._run(8, 1, num_tokens, head_dim=128)
 
     def test_uncovered_inputs_fall_back(self):
         # covered() is the only thing standing between an unsupported shape and a
