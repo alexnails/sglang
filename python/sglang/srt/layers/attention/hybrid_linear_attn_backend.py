@@ -43,6 +43,13 @@ logger = logging.getLogger(__name__)
 
 
 class MambaAttnBackendBase(AttentionBackend):
+    # Whether this backend's per-request state has an SSM/temporal component.
+    # Pure short-conv models (ZAYA1 CCA, LFM2) allocate a zero-element
+    # ``temporal`` tensor, so the radix track has nothing to snapshot there and
+    # the SSM track-index build -- five device->host copies per extend step --
+    # is skipped entirely. Every SSM backend leaves this True and is unaffected.
+    has_temporal_state: bool = True
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
         self.pad_slot_id = PAD_SLOT_ID
@@ -256,12 +263,15 @@ class MambaAttnBackendBase(AttentionBackend):
                         query_start_loc, forward_batch
                     )
 
-                    (
-                        track_ssm_h_src,
-                        track_ssm_h_dst,
-                        track_ssm_final_src,
-                        track_ssm_final_dst,
-                    ) = self._init_track_ssm_indices(mamba_cache_indices, forward_batch)
+                    if self.has_temporal_state:
+                        (
+                            track_ssm_h_src,
+                            track_ssm_h_dst,
+                            track_ssm_final_src,
+                            track_ssm_final_dst,
+                        ) = self._init_track_ssm_indices(
+                            mamba_cache_indices, forward_batch
+                        )
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode=}")
 
@@ -1328,3 +1338,13 @@ class ShortConvHybridAttnBackend(HybridLinearAttnBackend):
 
     def conv_state_metadata(self, layer_id: int, forward_batch: ForwardBatch):
         return self.short_conv_backend.conv_state_metadata(layer_id, forward_batch)
+
+    def track_conv_states_extend(self, layer_cache, conv_inputs):
+        """Radix mamba-cache checkpoint, extend side (per conv layer)."""
+        return self.short_conv_backend.track_conv_states_extend(
+            layer_cache, conv_inputs
+        )
+
+    def track_conv_states_decode(self, forward_batch: ForwardBatch):
+        """Radix mamba-cache checkpoint, decode side (once per step)."""
+        return self.short_conv_backend.track_conv_states_decode(forward_batch)
