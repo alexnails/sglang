@@ -1757,7 +1757,7 @@ class ZayaRouter(nn.Module):
         # ``.is_cuda`` is tested before the import rather than left to
         # ``covered()`` alone because the kernel module imports ``triton`` at
         # module scope, which a CPU-only environment need not have.
-        if logits.is_cuda:
+        if logits.is_cuda and envs.SGLANG_OPT_ZAYA_FUSED_ROUTER.get():
             from sglang.kernels.ops.moe import zaya_router_tail as _tail
 
             # The clamp ceiling: ids above this are the MOD skip slot.
@@ -1800,7 +1800,11 @@ class ZayaRouter(nn.Module):
         """
         # ``.is_cuda`` gates the import as well as the dispatch: the kernel
         # module imports ``triton`` at module scope.
-        if self.fused_router_mlp_ok and hs_norm.is_cuda:
+        if (
+            self.fused_router_mlp_ok
+            and hs_norm.is_cuda
+            and envs.SGLANG_OPT_ZAYA_FUSED_ROUTER.get()
+        ):
             from sglang.kernels.ops.moe import zaya_router_mlp as _mlp
 
             first, second, last = (self.router_mlp[i] for i in (0, 2, 4))

@@ -1540,6 +1540,17 @@ class Envs:
     # Launch-neutral by construction and measured a LOSS (TPOT +2.4% at C=32);
     # kept so the refutation stays reproducible.
     SGLANG_OPT_ZAYA_FUSED_CCA_DECODE = EnvBool(False)
+    # Fuse the router tail (softmax + balancing_biases + argmax + gather + casts
+    # + the MOD clamp) and the router MLP (3 GEMMs + 2 GELUs) into two Triton
+    # kernels. Worth -720 launches/step of ~2382, the largest single reduction
+    # available -- the router is 14 of the ~20 launches in a MoE layer.
+    #
+    # DEFAULT OFF: as written, the tail kernel takes a DEVICE-SIDE FAULT on gfx950
+    # (surfaces as SIGABRT at the next sync, two tests after the offending
+    # launch), so the torch reference path runs until the indexing is fixed. Do
+    # not enable without running
+    # `pytest test/registered/unit/models/test_zaya_cca.py -k RouterFused`.
+    SGLANG_OPT_ZAYA_FUSED_ROUTER = EnvBool(False)
 
     # ===================================================================
     # Symmetric memory
