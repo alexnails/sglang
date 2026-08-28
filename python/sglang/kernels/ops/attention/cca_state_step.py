@@ -15,6 +15,24 @@ hidden state that feeds ``val_proj2``, and shifts both pool slots in place --
 reading each slot before overwriting it, so the gather/scatter pair on the same
 row is safe within one program.
 
+The grid is ``(T, n_channel_tiles + n_hidden_tiles)``: the second axis indexes
+one flat tile space where the low ``n_channel_tiles`` entries do the conv window
+and history shift for their slice of ``C``, and the rest do the ``prev_hs``
+read-then-overwrite for their slice of ``H``. Tiling that second axis rather
+than looping it inside one program is what makes the kernel fill the GPU at
+decode batch sizes: at 32 tokens a ``grid=(T,)`` launch is 32 programs on a
+256-CU MI355X, each serially walking 5 channel tiles and 8 hidden tiles, so the
+tiles that could run concurrently instead queue behind each other.
+
+The split is safe because it never puts two programs on the same
+``(slot, column)``: within a token the tiles partition ``C`` and ``H``
+disjointly, so the "read the old value before storing the new one" ordering that
+the shift and the ``prev_hs`` swap rely on stays *inside* one program, exactly
+as it did with the inner loops. Two tokens sharing one positive slot id would
+alias -- but they did under ``grid=(T,)`` too (two programs, same rows, no
+ordering between them), so the contract is unchanged: slot ids must be distinct,
+apart from the negative padding ids, which touch nothing.
+
 The grouped matmul itself is deliberately left outside: it is a batched
 ``[Cg, Cg*W] x [Cg*W]`` per group, which cuBLAS/rocBLAS-backed einsum already
 runs near bandwidth, and a hand-rolled Triton matvec measured no better. The
@@ -56,15 +74,17 @@ def _cca_state_step_kernel(
     num_channels,
     hidden_size,
     W: tl.constexpr,  # taps == total_padding + 1
+    NC_TILES: tl.constexpr,  # ceil(num_channels / BLOCK_C)
     BLOCK_C: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
     t = tl.program_id(0)
+    tile = tl.program_id(1)
     slot = tl.load(slots_ptr + t)
 
-    # ---- conv window + in-place history shift -------------------------------
-    for c0 in tl.range(0, num_channels, BLOCK_C):
-        c = c0 + tl.arange(0, BLOCK_C)
+    if tile < NC_TILES:
+        # ---- conv window + in-place history shift ---------------------------
+        c = tile * BLOCK_C + tl.arange(0, BLOCK_C)
         cmask = c < num_channels
 
         qk = tl.load(qk_ptr + t * s_qk_t + c, mask=cmask, other=0.0)
@@ -97,10 +117,9 @@ def _cca_state_step_kernel(
             qk,
             mask=cmask & (slot >= 0),
         )
-
-    # ---- previous hidden state: read before overwrite -----------------------
-    for h0 in tl.range(0, hidden_size, BLOCK_H):
-        h = h0 + tl.arange(0, BLOCK_H)
+    else:
+        # ---- previous hidden state: read before overwrite -------------------
+        h = (tile - NC_TILES) * BLOCK_H + tl.arange(0, BLOCK_H)
         hmask = h < hidden_size
         prev = tl.load(
             prev_hs_ptr + slot * s_ph_s + h, mask=hmask & (slot >= 0), other=0.0
@@ -185,7 +204,15 @@ def cca_state_step(
     if num_tokens == 0:
         return window, prev_out
 
-    _cca_state_step_kernel[(num_tokens,)](
+    # One flat tile axis: [0, nc_tiles) walk the channels, the rest walk the
+    # hidden dim. Tiling both instead of looping them inside one program is what
+    # gets the launch off 32 programs at decode batch sizes; see the module
+    # docstring for why no two programs can then share a (slot, column).
+    block_c, block_h = 256, 512
+    nc_tiles = triton.cdiv(num_channels, block_c)
+    nh_tiles = triton.cdiv(hidden_size, block_h)
+
+    _cca_state_step_kernel[(num_tokens, nc_tiles + nh_tiles)](
         qk,
         hidden_states,
         conv_state,
@@ -204,8 +231,9 @@ def cca_state_step(
         num_channels,
         hidden_size,
         W=taps,
-        BLOCK_C=256,
-        BLOCK_H=512,
+        NC_TILES=nc_tiles,
+        BLOCK_C=block_c,
+        BLOCK_H=block_h,
         num_warps=4,
     )
     return window, prev_out

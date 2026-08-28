@@ -594,11 +594,18 @@ class TestCCAStateStepKernel(CustomTestCase):
         torch.manual_seed(5)
         # total_padding 3 exercises a shift longer than ZAYA1's 2, where an
         # off-by-one in the history roll would otherwise be invisible.
-        for num_channels, hidden_size, total_padding in ((64, 32, 2), (48, 16, 3)):
-            for num_tokens in (1, 6):
-                with self.subTest(c=num_channels, h=hidden_size, p=total_padding):
+        # (600, 1100) spans several channel AND hidden tiles of the 2-D grid
+        # (BLOCK_C=256, BLOCK_H=512): with the small shapes alone every launch is
+        # a single tile per axis, so a wrong tile offset would never show up. 40
+        # tokens likewise puts more than one token behind each tile index.
+        shapes = ((64, 32, 2), (48, 16, 3), (600, 1100, 2))
+        for num_channels, hidden_size, total_padding in shapes:
+            for num_tokens in (1, 6, 40):
+                with self.subTest(
+                    c=num_channels, h=hidden_size, p=total_padding, t=num_tokens
+                ):
                     slots = (
-                        torch.randperm(32, device=dev)[:num_tokens].to(torch.long) + 1
+                        torch.randperm(63, device=dev)[:num_tokens].to(torch.long) + 1
                     )
                     qk = torch.randn(
                         num_tokens, num_channels, device=dev, dtype=torch.bfloat16
@@ -649,6 +656,126 @@ class TestCCAStateStepKernel(CustomTestCase):
                     self.assertTrue(torch.equal(prevhs_got, prevhs_ref))
                     self.assertTrue(torch.equal(conv_got, conv_ref))
                     self.assertTrue(torch.equal(prev_got, prev_ref))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused kernel requires a GPU")
+    def test_negative_padding_slots_repeat_freely(self):
+        """The one slot id a decode batch does repeat: the padding sentinel.
+
+        CUDA-graph replay pads the batch with ``-1`` rows, so several tokens carry
+        the same negative slot. Those must read and write nothing, whichever grid
+        program picks them up -- and with the 2-D grid there are now
+        ``n_channel_tiles + n_hidden_tiles`` programs per token that could get it
+        wrong instead of one.
+        """
+        from sglang.kernels.ops.attention import cca_state_step as kernel
+
+        dev = "cuda"
+        torch.manual_seed(9)
+        # Multi-tile on both axes so every tile index sees a padding row.
+        num_channels, hidden_size, total_padding = 600, 1100, 2
+        real, pad = 3, 5
+        num_tokens = real + pad
+        slots = torch.full((num_tokens,), -1, device=dev, dtype=torch.long)
+        slots[:real] = torch.arange(1, real + 1, device=dev)
+
+        qk = torch.randn(num_tokens, num_channels, device=dev, dtype=torch.bfloat16)
+        hs = torch.randn(num_tokens, hidden_size, device=dev, dtype=torch.bfloat16)
+        conv0 = torch.randn(
+            32, num_channels, total_padding, device=dev, dtype=torch.bfloat16
+        )
+        prev0 = torch.randn(32, hidden_size, 1, device=dev, dtype=torch.bfloat16)
+        conv_got, prev_got = conv0.clone(), prev0.clone()
+
+        with torch.no_grad():
+            self.assertTrue(
+                kernel.covered(qk, hs, conv_got, prev_got, slots, total_padding)
+            )
+            window, prev_out = kernel.cca_state_step(
+                qk, hs, conv_got, prev_got, slots, total_padding
+            )
+
+        touched = slots[:real]
+        untouched = torch.ones(32, dtype=torch.bool, device=dev)
+        untouched[touched] = False
+        # No padding row wrote into any pool slot.
+        self.assertTrue(torch.equal(conv_got[untouched], conv0[untouched]))
+        self.assertTrue(torch.equal(prev_got[untouched], prev0[untouched]))
+        # The real rows still shifted exactly as they would have alone.
+        for i in range(real):
+            slot = int(touched[i])
+            self.assertTrue(torch.equal(conv_got[slot, :, -1], qk[i]))
+            self.assertTrue(torch.equal(prev_got[slot, :, 0], hs[i]))
+            self.assertTrue(torch.equal(window[i, :, -1], qk[i]))
+            self.assertTrue(torch.equal(prev_out[i], prev0[slot, :, 0]))
+        # Padding rows read zeros, not another token's state.
+        zeros_c = torch.zeros_like(window[real:, :, :total_padding])
+        self.assertTrue(torch.equal(window[real:, :, :total_padding], zeros_c))
+        pad_prev = prev_out[real:]
+        self.assertTrue(torch.equal(pad_prev, torch.zeros_like(pad_prev)))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused kernel requires a GPU")
+    def test_duplicate_positive_slots_stay_confined_to_that_slot(self):
+        """Two tokens on one slot: undefined *at* that slot, correct everywhere else.
+
+        Out of contract -- a decode batch gives each request its own mamba slot --
+        but worth pinning, because the 2-D grid is the change that made it
+        tempting to assume otherwise. Aliasing was already unordered under
+        ``grid=(T,)`` (two programs, same rows, no ordering between them), and the
+        tile split does not widen it: each program still owns a disjoint column
+        range, so a duplicate slot can only make *that slot's* rows one of the two
+        valid serializations. It must not corrupt the other tokens, the other
+        slots, or the parts of the output that never come from the pool.
+        """
+        from sglang.kernels.ops.attention import cca_state_step as kernel
+
+        dev = "cuda"
+        torch.manual_seed(13)
+        num_channels, hidden_size, total_padding = 600, 1100, 2
+        # Tokens 0 and 2 share slot 4; token 1 owns slot 7.
+        slots = torch.tensor([4, 7, 4], device=dev, dtype=torch.long)
+
+        qk = torch.randn(3, num_channels, device=dev, dtype=torch.bfloat16)
+        hs = torch.randn(3, hidden_size, device=dev, dtype=torch.bfloat16)
+        conv0 = torch.randn(
+            16, num_channels, total_padding, device=dev, dtype=torch.bfloat16
+        )
+        prev0 = torch.randn(16, hidden_size, 1, device=dev, dtype=torch.bfloat16)
+        conv_got, prev_got = conv0.clone(), prev0.clone()
+
+        with torch.no_grad():
+            window, prev_out = kernel.cca_state_step(
+                qk, hs, conv_got, prev_got, slots, total_padding
+            )
+
+        # 1. Every slot outside {4, 7} is untouched.
+        untouched = torch.ones(16, dtype=torch.bool, device=dev)
+        untouched[torch.tensor([4, 7], device=dev)] = False
+        self.assertTrue(torch.equal(conv_got[untouched], conv0[untouched]))
+        self.assertTrue(torch.equal(prev_got[untouched], prev0[untouched]))
+
+        # 2. The token that owns its slot is exactly right.
+        self.assertTrue(torch.equal(conv_got[7, :, -1], qk[1]))
+        self.assertTrue(torch.equal(prev_got[7, :, 0], hs[1]))
+        self.assertTrue(torch.equal(prev_out[1], prev0[7, :, 0]))
+
+        # 3. The aliased tokens' own contribution to the window (the last tap is
+        #    this token's qk, never a pool read) is unaffected.
+        for i in (0, 2):
+            self.assertTrue(torch.equal(window[i, :, -1], qk[i]))
+
+        # 4. The aliased slot ends up holding one writer's value per column --
+        #    a valid serialization, not a mix of the two writes and a stale read.
+        newest = conv_got[4, :, -1]
+        self.assertTrue(bool(((newest == qk[0]) | (newest == qk[2])).all()))
+        stored = prev_got[4, :, 0]
+        self.assertTrue(bool(((stored == hs[0]) | (stored == hs[2])).all()))
+
+        # 5. Each aliased token read either the original slot content or the
+        #    other token's write -- never a third value.
+        for i, other in ((0, 2), (2, 0)):
+            got = prev_out[i]
+            ok = (got == prev0[4, :, 0]) | (got == hs[other])
+            self.assertTrue(bool(ok.all()))
 
     def test_uncovered_inputs_fall_back(self):
         # covered() gates an in-place pool mutation, so its negative branches
