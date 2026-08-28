@@ -1526,9 +1526,14 @@ class Envs:
     # one. One partial gather of the o_proj partials then does the work of both
     # the attention-TP all-reduce and the DP gather, cutting an attention+MoE
     # layer pair from three collectives to two and dropping the MoE scatter, at
-    # the cost of running each norm over every replica's rows. Measured +6.3% to
-    # +7.6% tok/s on MI350X tp=8/dp=4, greedy ids bit-identical.
-    SGLANG_OPT_ZAYA_GLOBAL_RESIDUAL = EnvBool(False)
+    # the cost of running each norm over every replica's rows.
+    #
+    # ON by default: +6.3-7.6% tok/s on MI350X and +7.0-8.8% on MI355X at
+    # tp=8/dp=4, TPOT -6 to -8%, TTFT -7 to -10%, with greedy ids BIT-IDENTICAL
+    # on both. It is also self-declining -- global_residual_layout() returns None
+    # unless the expert reduce actually spans DP replicas -- so it is inert, not
+    # wrong, at tp=1 or under plain tensor parallelism. Set 0 to A/B it back.
+    SGLANG_OPT_ZAYA_GLOBAL_RESIDUAL = EnvBool(True)
     # Run the prefill CCA conv as one varlen Triton kernel pair instead of the
     # per-request host loop in cca_extend. The loop issues O(batch) launches per
     # layer and reads CPU sequence lengths; the fused path is driven entirely by
