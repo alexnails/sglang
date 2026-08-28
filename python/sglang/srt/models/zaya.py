@@ -95,7 +95,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
 
@@ -1004,16 +1004,20 @@ class CCA(nn.Module):
         understood. The graph is the larger win and works with the reference host
         loop, so it takes precedence.
 
-        Resolved lazily rather than in ``__init__`` because the server args it
-        reads do not exist that early, and reached only once the env flag is on so
-        a module built outside a server (a CPU unit test) never touches them.
+        Resolved lazily rather than in ``__init__`` because the config bag it reads
+        is not published that early, and reached only once the env flag is on so a
+        module built outside a server (a CPU unit test) never touches it.
+
+        Reads the resolved leaf from the exec bag, NOT the published ServerArgs
+        record: ``cuda_graph_config`` is filled in by resolution, so on the record
+        it is whatever the operator typed -- ``None`` unless they passed
+        ``--cuda-graph-backend-prefill`` explicitly, which crashed here.
         """
         if self._fused_prefill_conv_ok is None:
             from sglang.srt.model_executor.cuda_graph_config import Backend
 
             prefill_graph_on = (
-                get_global_server_args().cuda_graph_config.prefill.backend
-                != Backend.DISABLED
+                get_exec().graph.cuda_graph_config.prefill.backend != Backend.DISABLED
             )
             self._fused_prefill_conv_ok = not prefill_graph_on
             if prefill_graph_on:
