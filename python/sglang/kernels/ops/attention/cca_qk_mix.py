@@ -13,6 +13,13 @@ and the two normalizations are separate torch expression trees today, each
 materializing fp32 temporaries of the full q tensor; every intermediate here
 stays in registers and only the two results are written.
 
+One program per ``(token, k head)``, holding the whole group as a ``[G, HD]``
+tile. The ``G`` q-head RMS sums then reduce together along ``axis=1`` instead of
+one serial ``tl.sum`` per head, and ``mean_j(pre_q)`` for the k blend is a
+reduction along ``axis=0`` of that same tile rather than a separate running
+accumulator -- so ``pre_q`` is read once and the group's ``G + 1`` reductions
+collapse to two.
+
 Follows the structure of ``kda_fused_decode`` (a ``covered()`` predicate gates
 supported inputs, everything else falls back to the unfused chain), but is
 written in Triton rather than CUDA-JIT so it runs on ROCm as well -- ZAYA1's
@@ -34,6 +41,12 @@ import triton.language as tl
 # The head dim is loaded as one masked block, so it must fit a single Triton
 # block. ZAYA1 uses 128; 256 leaves headroom without hurting occupancy.
 _MAX_HEAD_DIM = 256
+
+# A program holds the whole group as one [G, HD] fp32 tile (three of them: the
+# blend inputs and the result), so G bounds register pressure rather than just
+# a loop count. 16 x 256 fp32 is already 4096 elements per tile; beyond that the
+# torch fallback is the better bet. ZAYA1 uses 8.
+_MAX_GQA_GROUPS = 16
 
 _RMS_EPS = 1e-12
 
@@ -58,6 +71,7 @@ def _cca_qk_mix_kernel(
     G: tl.constexpr,  # gqa_groups: q heads per k head
     HD: tl.constexpr,
     BLOCK: tl.constexpr,
+    BLOCK_G: tl.constexpr,  # next_power_of_2(G)
 ):
     pid = tl.program_id(0)
     t = pid // NK
@@ -72,30 +86,37 @@ def _cca_qk_mix_kernel(
     )
     half_base_k = 0.5 * base_k
 
-    pre_q_sum = tl.zeros([BLOCK], dtype=tl.float32)
+    # The group's q heads as one [BLOCK_G, BLOCK] tile: their RMS sums then reduce
+    # together along the head dim instead of one serial tl.sum per head, and the
+    # k blend's mean over j becomes a reduction along the other axis of the same
+    # tile -- no separate accumulator, and pre_q is loaded once.
+    j = tl.arange(0, BLOCK_G)[:, None]
+    dd = d[None, :]
+    qmask = (j < G) & (dd < HD)
+    q_off = (g * G + j) * HD + dd
 
-    for j in tl.static_range(G):
-        head = g * G + j
-        pre_q = tl.load(
-            pre_q_ptr + t * s_pre_t + head * HD + d, mask=mask, other=0.0
-        ).to(tl.float32)
-        conv_q = tl.load(
-            conv_qk_ptr + t * s_conv_t + head * HD + d, mask=mask, other=0.0
-        ).to(tl.float32)
+    pre_q = tl.load(pre_q_ptr + t * s_pre_t + q_off, mask=qmask, other=0.0).to(
+        tl.float32
+    )
+    conv_q = tl.load(conv_qk_ptr + t * s_conv_t + q_off, mask=qmask, other=0.0).to(
+        tl.float32
+    )
 
-        q = conv_q + 0.5 * pre_q + half_base_k
-        inv = tl.rsqrt(tl.sum(q * q, axis=0) + eps) * q_scale
-        tl.store(q_out_ptr + t * s_qout_t + head * HD + d, q * inv, mask=mask)
+    q = conv_q + 0.5 * pre_q + half_base_k[None, :]
+    # Masked lanes carry 0, so they add nothing to their row's sum, and the row
+    # itself is never stored.
+    inv = tl.rsqrt(tl.sum(q * q, axis=1) + eps) * q_scale
+    tl.store(q_out_ptr + t * s_qout_t + q_off, q * inv[:, None], mask=qmask)
 
-        pre_q_sum += pre_q
+    pre_q_sum = tl.sum(pre_q, axis=0)
 
     conv_k = tl.load(
         conv_qk_ptr + t * s_conv_t + latent_q + g * HD + d, mask=mask, other=0.0
     ).to(tl.float32)
     k = conv_k + (0.5 / G) * pre_q_sum + half_base_k
     k_scale = tl.load(k_scale_ptr + g).to(tl.float32)
-    inv = tl.rsqrt(tl.sum(k * k, axis=0) + eps) * k_scale
-    tl.store(k_out_ptr + t * s_kout_t + g * HD + d, k * inv, mask=mask)
+    inv_k = tl.rsqrt(tl.sum(k * k, axis=0) + eps) * k_scale
+    tl.store(k_out_ptr + t * s_kout_t + g * HD + d, k * inv_k, mask=mask)
 
 
 def covered(
@@ -109,10 +130,11 @@ def covered(
 ) -> bool:
     """Whether the fused kernel can serve these inputs.
 
-    Requires a whole number of q heads per k head (ZAYA1 always splits evenly),
-    a head dim that fits one Triton block, row-major 2-D inputs with a unit
-    innermost stride, and float inputs on an accelerator. ``k_scale`` is the
-    folded ``sqrt(head_dim) * temperature`` vector, absent until weights load.
+    Requires a whole number of q heads per k head (ZAYA1 always splits evenly)
+    and few enough of them to hold the group as one register tile, a head dim
+    that fits one Triton block, row-major 2-D inputs with a unit innermost
+    stride, and float inputs on an accelerator. ``k_scale`` is the folded
+    ``sqrt(head_dim) * temperature`` vector, absent until weights load.
     """
     if k_scale is None:
         return False
@@ -121,6 +143,8 @@ def covered(
     if head_dim > _MAX_HEAD_DIM or head_dim <= 0:
         return False
     if num_k_heads <= 0 or num_q_heads % num_k_heads != 0:
+        return False
+    if num_q_heads // num_k_heads > _MAX_GQA_GROUPS:
         return False
     if conv_qk.ndim != 2 or pre_q.ndim != 2 or base_k.ndim != 2:
         return False
@@ -191,6 +215,13 @@ def cca_qk_mix(
         G=num_q_heads // num_k_heads,
         HD=head_dim,
         BLOCK=triton.next_power_of_2(head_dim),
-        num_warps=4,
+        BLOCK_G=triton.next_power_of_2(num_q_heads // num_k_heads),
+        # One warp, not four. The reductions are over the head dim (ZAYA1: 128
+        # elements), so 4 warps is 256 ROCm lanes per 128-element row: half of
+        # them idle, and each ``tl.sum`` becomes a cross-wavefront LDS reduction
+        # with the barriers that implies. At one warp the block is 64 lanes and
+        # the reduction stays inside the wavefront. Worth re-sweeping now that a
+        # program carries a [G, HD] tile rather than a single row.
+        num_warps=1,
     )
     return q_out, k_out

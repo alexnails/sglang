@@ -594,11 +594,18 @@ class TestCCAStateStepKernel(CustomTestCase):
         torch.manual_seed(5)
         # total_padding 3 exercises a shift longer than ZAYA1's 2, where an
         # off-by-one in the history roll would otherwise be invisible.
-        for num_channels, hidden_size, total_padding in ((64, 32, 2), (48, 16, 3)):
-            for num_tokens in (1, 6):
-                with self.subTest(c=num_channels, h=hidden_size, p=total_padding):
+        # (600, 1100) spans several channel AND hidden tiles of the 2-D grid
+        # (BLOCK_C=256, BLOCK_H=512): with the small shapes alone every launch is
+        # a single tile per axis, so a wrong tile offset would never show up. 40
+        # tokens likewise puts more than one token behind each tile index.
+        shapes = ((64, 32, 2), (48, 16, 3), (600, 1100, 2))
+        for num_channels, hidden_size, total_padding in shapes:
+            for num_tokens in (1, 6, 40):
+                with self.subTest(
+                    c=num_channels, h=hidden_size, p=total_padding, t=num_tokens
+                ):
                     slots = (
-                        torch.randperm(32, device=dev)[:num_tokens].to(torch.long) + 1
+                        torch.randperm(63, device=dev)[:num_tokens].to(torch.long) + 1
                     )
                     qk = torch.randn(
                         num_tokens, num_channels, device=dev, dtype=torch.bfloat16
@@ -650,6 +657,126 @@ class TestCCAStateStepKernel(CustomTestCase):
                     self.assertTrue(torch.equal(conv_got, conv_ref))
                     self.assertTrue(torch.equal(prev_got, prev_ref))
 
+    @unittest.skipUnless(torch.cuda.is_available(), "fused kernel requires a GPU")
+    def test_negative_padding_slots_repeat_freely(self):
+        """The one slot id a decode batch does repeat: the padding sentinel.
+
+        CUDA-graph replay pads the batch with ``-1`` rows, so several tokens carry
+        the same negative slot. Those must read and write nothing, whichever grid
+        program picks them up -- and with the 2-D grid there are now
+        ``n_channel_tiles + n_hidden_tiles`` programs per token that could get it
+        wrong instead of one.
+        """
+        from sglang.kernels.ops.attention import cca_state_step as kernel
+
+        dev = "cuda"
+        torch.manual_seed(9)
+        # Multi-tile on both axes so every tile index sees a padding row.
+        num_channels, hidden_size, total_padding = 600, 1100, 2
+        real, pad = 3, 5
+        num_tokens = real + pad
+        slots = torch.full((num_tokens,), -1, device=dev, dtype=torch.long)
+        slots[:real] = torch.arange(1, real + 1, device=dev)
+
+        qk = torch.randn(num_tokens, num_channels, device=dev, dtype=torch.bfloat16)
+        hs = torch.randn(num_tokens, hidden_size, device=dev, dtype=torch.bfloat16)
+        conv0 = torch.randn(
+            32, num_channels, total_padding, device=dev, dtype=torch.bfloat16
+        )
+        prev0 = torch.randn(32, hidden_size, 1, device=dev, dtype=torch.bfloat16)
+        conv_got, prev_got = conv0.clone(), prev0.clone()
+
+        with torch.no_grad():
+            self.assertTrue(
+                kernel.covered(qk, hs, conv_got, prev_got, slots, total_padding)
+            )
+            window, prev_out = kernel.cca_state_step(
+                qk, hs, conv_got, prev_got, slots, total_padding
+            )
+
+        touched = slots[:real]
+        untouched = torch.ones(32, dtype=torch.bool, device=dev)
+        untouched[touched] = False
+        # No padding row wrote into any pool slot.
+        self.assertTrue(torch.equal(conv_got[untouched], conv0[untouched]))
+        self.assertTrue(torch.equal(prev_got[untouched], prev0[untouched]))
+        # The real rows still shifted exactly as they would have alone.
+        for i in range(real):
+            slot = int(touched[i])
+            self.assertTrue(torch.equal(conv_got[slot, :, -1], qk[i]))
+            self.assertTrue(torch.equal(prev_got[slot, :, 0], hs[i]))
+            self.assertTrue(torch.equal(window[i, :, -1], qk[i]))
+            self.assertTrue(torch.equal(prev_out[i], prev0[slot, :, 0]))
+        # Padding rows read zeros, not another token's state.
+        zeros_c = torch.zeros_like(window[real:, :, :total_padding])
+        self.assertTrue(torch.equal(window[real:, :, :total_padding], zeros_c))
+        pad_prev = prev_out[real:]
+        self.assertTrue(torch.equal(pad_prev, torch.zeros_like(pad_prev)))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused kernel requires a GPU")
+    def test_duplicate_positive_slots_stay_confined_to_that_slot(self):
+        """Two tokens on one slot: undefined *at* that slot, correct everywhere else.
+
+        Out of contract -- a decode batch gives each request its own mamba slot --
+        but worth pinning, because the 2-D grid is the change that made it
+        tempting to assume otherwise. Aliasing was already unordered under
+        ``grid=(T,)`` (two programs, same rows, no ordering between them), and the
+        tile split does not widen it: each program still owns a disjoint column
+        range, so a duplicate slot can only make *that slot's* rows one of the two
+        valid serializations. It must not corrupt the other tokens, the other
+        slots, or the parts of the output that never come from the pool.
+        """
+        from sglang.kernels.ops.attention import cca_state_step as kernel
+
+        dev = "cuda"
+        torch.manual_seed(13)
+        num_channels, hidden_size, total_padding = 600, 1100, 2
+        # Tokens 0 and 2 share slot 4; token 1 owns slot 7.
+        slots = torch.tensor([4, 7, 4], device=dev, dtype=torch.long)
+
+        qk = torch.randn(3, num_channels, device=dev, dtype=torch.bfloat16)
+        hs = torch.randn(3, hidden_size, device=dev, dtype=torch.bfloat16)
+        conv0 = torch.randn(
+            16, num_channels, total_padding, device=dev, dtype=torch.bfloat16
+        )
+        prev0 = torch.randn(16, hidden_size, 1, device=dev, dtype=torch.bfloat16)
+        conv_got, prev_got = conv0.clone(), prev0.clone()
+
+        with torch.no_grad():
+            window, prev_out = kernel.cca_state_step(
+                qk, hs, conv_got, prev_got, slots, total_padding
+            )
+
+        # 1. Every slot outside {4, 7} is untouched.
+        untouched = torch.ones(16, dtype=torch.bool, device=dev)
+        untouched[torch.tensor([4, 7], device=dev)] = False
+        self.assertTrue(torch.equal(conv_got[untouched], conv0[untouched]))
+        self.assertTrue(torch.equal(prev_got[untouched], prev0[untouched]))
+
+        # 2. The token that owns its slot is exactly right.
+        self.assertTrue(torch.equal(conv_got[7, :, -1], qk[1]))
+        self.assertTrue(torch.equal(prev_got[7, :, 0], hs[1]))
+        self.assertTrue(torch.equal(prev_out[1], prev0[7, :, 0]))
+
+        # 3. The aliased tokens' own contribution to the window (the last tap is
+        #    this token's qk, never a pool read) is unaffected.
+        for i in (0, 2):
+            self.assertTrue(torch.equal(window[i, :, -1], qk[i]))
+
+        # 4. The aliased slot ends up holding one writer's value per column --
+        #    a valid serialization, not a mix of the two writes and a stale read.
+        newest = conv_got[4, :, -1]
+        self.assertTrue(bool(((newest == qk[0]) | (newest == qk[2])).all()))
+        stored = prev_got[4, :, 0]
+        self.assertTrue(bool(((stored == hs[0]) | (stored == hs[2])).all()))
+
+        # 5. Each aliased token read either the original slot content or the
+        #    other token's write -- never a third value.
+        for i, other in ((0, 2), (2, 0)):
+            got = prev_out[i]
+            ok = (got == prev0[4, :, 0]) | (got == hs[other])
+            self.assertTrue(bool(ok.all()))
+
     def test_uncovered_inputs_fall_back(self):
         # covered() gates an in-place pool mutation, so its negative branches
         # matter more than usual: a mismatched dtype would have the kernel write
@@ -687,12 +814,17 @@ class TestCCAQKMixKernel(CustomTestCase):
     which ``covered()`` selects when the folded scale vector is absent.
     """
 
-    def _run(self, num_q_heads: int, num_k_heads: int, num_tokens: int):
+    def _run(
+        self,
+        num_q_heads: int,
+        num_k_heads: int,
+        num_tokens: int,
+        head_dim: int = 32,
+    ):
         import torch as _torch
 
         from sglang.kernels.ops.attention import cca_qk_mix as kernel
 
-        head_dim = 32
         dev = "cuda"
         _torch.manual_seed(11)
         cca = _make_tiny_cca(seed=2)[0]
@@ -761,11 +893,29 @@ class TestCCAQKMixKernel(CustomTestCase):
     def test_matches_torch_chain_across_gqa_shapes(self):
         _ensure_dist_initialized()
         # 8:1 is ZAYA1-74B at attn_tp=2; 4:1 is 8B at tp=1; 1:1 exercises the
-        # degenerate group where the k blend reduces to a single q head.
-        for num_q_heads, num_k_heads in ((8, 1), (8, 2), (2, 2)):
+        # degenerate group where the k blend reduces to a single q head. 3:1 is
+        # the only one whose group is not a power of two, so it is the case where
+        # the [G, HD] tile is padded and the masked rows must contribute nothing
+        # to either reduction.
+        for num_q_heads, num_k_heads in ((8, 1), (8, 2), (2, 2), (6, 2)):
             for num_tokens in (1, 5):
                 with self.subTest(q=num_q_heads, k=num_k_heads, t=num_tokens):
                     self._run(num_q_heads, num_k_heads, num_tokens)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused kernel requires a GPU")
+    def test_matches_torch_chain_at_the_serving_shape(self):
+        """head_dim 128 and a decode-sized batch, i.e. the launch config in prod.
+
+        The other case pins the algebra at head_dim 32, which fits one ROCm
+        wavefront twice over; 128 is what ZAYA1 actually runs and is the shape the
+        block size and warp count are chosen for, so any reduction that only
+        happens to be right at 32 lanes shows up here. 40 tokens puts several
+        programs on every CU instead of one.
+        """
+        _ensure_dist_initialized()
+        for num_tokens in (1, 40):
+            with self.subTest(t=num_tokens):
+                self._run(8, 1, num_tokens, head_dim=128)
 
     def test_uncovered_inputs_fall_back(self):
         # covered() is the only thing standing between an unsupported shape and a
@@ -786,6 +936,10 @@ class TestCCAQKMixKernel(CustomTestCase):
         self.assertFalse(kernel.covered(conv_qk, pre_q, base_k, scale, 8, 1, 4096))
         # q heads not divisible by k heads.
         self.assertFalse(kernel.covered(conv_qk, pre_q, base_k, scale, 8, 3, 32))
+        # A group too wide to hold as one [G, HD] register tile.
+        wide_q = torch.randn(4, 64 * 32)
+        wide_conv = torch.randn(4, 65 * 32)
+        self.assertFalse(kernel.covered(wide_conv, wide_q, base_k, scale, 64, 1, 32))
 
 
 class TestCCADecodeConvFold(CustomTestCase):
@@ -1590,6 +1744,203 @@ class TestZayaPartialGatherFoldsTheAttnReduce(CustomTestCase):
             self._gather(partials, sizes, is_partial=True),
             self._gather(partials, sizes, is_partial=False),
         )
+
+
+class TestDpGatherStagingFusion(CustomTestCase):
+    """The two launches per sum_len partial gather that C1 removes.
+
+    ``_dp_gather_via_all_reduce`` used to issue four launches: ``fill_(0)``, a
+    memcpy of this rank's rows into its slot, the all-reduce, and a copy of the
+    (out-of-place) all-reduce result back into the caller's buffer. The fill now
+    folds into the memcpy, and the copy-back is skipped by callers that take the
+    returned tensor. Both are meant to be *exactly* the old behaviour, so pin the
+    fused kernel against ``fill_(0) + memcpy`` and pin what the gather returns
+    for an out-of-place and an in-place collective.
+    """
+
+    @staticmethod
+    @contextmanager
+    def _sum_len_all_reduce(all_reduce):
+        """Drive the sum_len gather path on host tensors.
+
+        Patches out everything that needs a live NCCL group: the WORLD-gather
+        switch, the attention-TP rank, the world size, the collective itself and
+        the memcpy dispatch (CPU tensors cannot go through Triton).
+        """
+        from unittest import mock
+
+        from sglang.srt.layers import dp_attention as dpa
+
+        with mock.patch.object(
+            dpa, "memcpy_scatter_zero_rest_func", dpa.memcpy_scatter_zero_rest_cpu
+        ), mock.patch.object(
+            dpa, "world_dp_gather_enabled", lambda: False
+        ), mock.patch.object(
+            dpa, "get_attn_tensor_model_parallel_rank", lambda: 0
+        ), mock.patch.object(
+            dpa, "get_tensor_model_parallel_world_size", lambda: 1
+        ), mock.patch.object(
+            dpa, "tensor_model_parallel_all_reduce", all_reduce
+        ):
+            yield
+
+    @staticmethod
+    def _forward_batch(sizes: List[int]):
+        from sglang.srt.layers.dp_attention import DpPaddingMode
+
+        return SimpleNamespace(
+            dp_local_start_pos=None,
+            dp_local_num_tokens=None,
+            global_num_tokens_gpu=torch.tensor(sizes, dtype=torch.int32),
+            dp_padding_mode=DpPaddingMode.SUM_LEN,
+        )
+
+    def test_fused_scatter_zero_matches_fill_then_memcpy(self):
+        """The fused staging write must equal ``fill_(0)`` then ``memcpy``."""
+        from sglang.srt.layers.dp_attention import (
+            memcpy_cpu,
+            memcpy_scatter_zero_rest_cpu,
+        )
+
+        torch.manual_seed(3)
+        rows, hidden = 16, 5
+        # sz == 0 (idle replica) and sz < src rows (a src padded for cuda graph)
+        # are the two cases where the fill is the only thing zeroing a row.
+        for offset, sz, src_rows in ((0, 4, 4), (4, 3, 3), (12, 4, 4), (7, 0, 2)):
+            with self.subTest(offset=offset, sz=sz):
+                src = torch.randn(src_rows, hidden)
+                # A dirty destination: the fill is what makes the untouched rows
+                # zero, so starting from zeros would hide a missing zero-fill.
+                dirty = torch.randn(rows, hidden)
+                ref = dirty.clone()
+                ref.fill_(0)
+                memcpy_cpu(
+                    ref,
+                    src,
+                    0,
+                    torch.tensor(offset),
+                    torch.tensor(sz),
+                    False,
+                )
+                got = dirty.clone()
+                memcpy_scatter_zero_rest_cpu(
+                    got, src, 0, torch.tensor(offset), torch.tensor(sz)
+                )
+                self.assertTrue(torch.equal(got, ref))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "Triton memcpy needs a GPU")
+    def test_fused_scatter_zero_matches_on_device(self):
+        """Same equivalence for the Triton kernel the serving path uses."""
+        from sglang.kernels.ops.memory.memcpy_triton import (
+            memcpy_scatter_zero_rest_triton,
+            memcpy_triton,
+        )
+
+        dev = "cuda"
+        torch.manual_seed(4)
+        cases = (
+            # (dst shape, src shape, offset, sz)
+            ((16, 5), (4, 5), 4, 4),
+            ((16, 5), (8, 5), 0, 3),
+            ((16, 5), (4, 5), 12, 4),
+            ((16, 5), (4, 5), 7, 0),
+            # 1-D int32 input ids: chunk_size collapses to 1.
+            ((16,), (4,), 8, 4),
+        )
+        for dst_shape, src_shape, offset, sz in cases:
+            for dtype in (torch.bfloat16, torch.int32):
+                with self.subTest(dst=dst_shape, off=offset, sz=sz, dt=dtype):
+                    if dtype.is_floating_point:
+                        src = torch.randn(src_shape, device=dev).to(dtype)
+                        dirty = torch.randn(dst_shape, device=dev).to(dtype)
+                    else:
+                        src = torch.randint(1, 99, src_shape, device=dev, dtype=dtype)
+                        dirty = torch.randint(1, 99, dst_shape, device=dev, dtype=dtype)
+                    off_t = torch.tensor(offset, device=dev, dtype=torch.int32)
+                    sz_t = torch.tensor(sz, device=dev, dtype=torch.int32)
+
+                    ref = dirty.clone()
+                    ref.fill_(0)
+                    memcpy_triton(ref, src, 0, off_t, sz_t, False)
+                    got = dirty.clone()
+                    memcpy_scatter_zero_rest_triton(got, src, 0, off_t, sz_t)
+                    self.assertTrue(torch.equal(got, ref))
+
+    def test_out_variant_returns_the_collective_output(self):
+        """An out-of-place all-reduce: the result is the collective's buffer."""
+        from sglang.srt.layers.dp_attention import dp_gather_partial_out
+
+        sizes = [3, 7, 1, 5]
+        hidden = 4
+        marker = torch.full((sum(sizes), hidden), 7.0)
+
+        def all_reduce(x):
+            # Mimic the custom all-reduce: a fresh buffer, input untouched.
+            return x + marker
+
+        local = torch.randn(sizes[1], hidden)
+        staging = torch.randn(sum(sizes), hidden)
+        fb = self._forward_batch(sizes)
+        with _dp_layout(sizes, 1, is_max_len=False):
+            with self._sum_len_all_reduce(all_reduce):
+                out = dp_gather_partial_out(staging, local, fb)
+
+        expected = torch.zeros(sum(sizes), hidden)
+        expected[3 : 3 + 7] = local
+        self.assertIsNot(out, staging)
+        torch.testing.assert_close(out, expected + marker)
+        # The staging buffer is left holding the pre-reduce content, which is
+        # what makes the copy-back removable: nothing reads it afterwards.
+        torch.testing.assert_close(staging, expected)
+
+    def test_out_variant_returns_the_buffer_for_an_in_place_collective(self):
+        """An in-place all-reduce returns its input, so the buffer is the result."""
+        from sglang.srt.layers.dp_attention import dp_gather_partial_out
+
+        sizes = [2, 2]
+        hidden = 3
+
+        def all_reduce(x):
+            x.add_(1.0)
+            return x
+
+        local = torch.randn(sizes[0], hidden)
+        staging = torch.randn(sum(sizes), hidden)
+        fb = self._forward_batch(sizes)
+        with _dp_layout(sizes, 0, is_max_len=False):
+            with self._sum_len_all_reduce(all_reduce):
+                out = dp_gather_partial_out(staging, local, fb)
+
+        expected = torch.zeros(sum(sizes), hidden)
+        expected[:2] = local
+        self.assertIs(out, staging)
+        torch.testing.assert_close(out, expected + 1.0)
+
+    def test_in_place_wrapper_still_fills_the_caller_buffer(self):
+        """``dp_gather_partial`` keeps its in-place contract for every caller.
+
+        This is what makes C1 a no-op for the models that did not opt into the
+        returning variant: the copy back into ``global_tokens`` is still there
+        when (and only when) the collective handed back a different tensor.
+        """
+        from sglang.srt.layers.dp_attention import dp_gather_partial
+
+        sizes = [2, 2]
+        hidden = 3
+
+        def all_reduce(x):
+            return x + 5.0
+
+        local = torch.randn(sizes[1], hidden)
+        buf = torch.randn(sum(sizes), hidden)
+        fb = self._forward_batch(sizes)
+        with _dp_layout(sizes, 1, is_max_len=False):
+            with self._sum_len_all_reduce(all_reduce):
+                dp_gather_partial(buf, local, fb)
+
+        expected = torch.zeros(sum(sizes), hidden)
+        expected[2:] = local
+        torch.testing.assert_close(buf, expected + 5.0)
 
 
 def _reference_extend_conv(

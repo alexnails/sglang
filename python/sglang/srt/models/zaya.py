@@ -62,7 +62,7 @@ from sglang.srt.distributed import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
-    dp_gather_partial,
+    dp_gather_partial_out,
     dp_gather_replicate,
     dp_scatter,
     get_attention_dp_rank,
@@ -1906,7 +1906,9 @@ class ZayaBlock(nn.Module):
             is_tp_path=False
         ):
             experts_out = moe_expert_parallel_all_reduce(experts_out)
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(is_tp_path=True):
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True
+        ):
             experts_out = moe_tensor_model_parallel_all_reduce(experts_out)
         return experts_out
 
@@ -2134,8 +2136,16 @@ class ZayaDecoderATTLayer(nn.Module):
             forward_batch,
             reduce_output=False,
         )
-        hidden_states = get_global_dp_buffer(get_tp_group())
-        dp_gather_partial(hidden_states, partial, forward_batch)
+        #
+        # ``dp_gather_partial_out`` rather than ``dp_gather_partial``: under
+        # sum_len padding the all-reduce is out-of-place, so its output buffer
+        # already holds the gathered rows and copying them back into the staging
+        # buffer is a wasted launch per attention layer (60 of them per decode
+        # step here, where every launch is ~1.5-2.5us of a launch-bound step).
+        # The staging buffer is a fresh per-layer allocation with no other
+        # reader, so nothing needs the result to land there.
+        staging = get_global_dp_buffer(get_tp_group())
+        hidden_states = dp_gather_partial_out(staging, partial, forward_batch)
         return hidden_states, residual, prev_router_hidden_states
 
 
