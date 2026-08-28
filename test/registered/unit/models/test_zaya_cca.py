@@ -445,6 +445,66 @@ class TestZayaCCA(CustomTestCase):
         ):
             torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
 
+    def test_folded_prefill_then_decode_matches_the_two_stage_reference(self):
+        """End-to-end with the folded decode conv, including the bias column.
+
+        The other equivalence tests leave ``_decode_conv_folded`` False, so decode
+        runs the real two-stage ``conv_qk`` and never touches the folded weight.
+        This one folds the module under test and compares it against an UNFOLDED
+        reference, so one assertion covers the fold itself, the bias now riding in
+        a trailing weight column, and the state plumbing around them.
+
+        Without a GPU the window arrives from the unfused gather/concat, so this
+        exercises the ``F.pad`` arm that appends the constant-1.0 tap; the fused
+        arm gets it from ``cca_state_step`` and is pinned on GPU instead.
+        """
+        cca, config = _make_tiny_cca(seed=35)
+        cca_ref, _ = _make_tiny_cca(seed=35)
+        with torch.no_grad():
+            cca_ref.load_state_dict(cca.state_dict())
+        cca.fold_decode_conv()
+        self.assertTrue(cca._decode_conv_folded)
+        self.assertFalse(cca_ref._decode_conv_folded)
+
+        S0, S1 = 4, 3
+        torch.manual_seed(351)
+        hs = torch.randn(S0 + S1, cca.hidden_size, dtype=torch.float32) * 0.1
+        q_ref, k_ref, v_ref = cca_ref._forward_no_state(hs)
+
+        pool = _MockReqToTokenPool(pool_size=8, cca_config=config)
+        batches = [
+            (
+                hs[:S0],
+                _make_forward_batch(
+                    is_decode=False,
+                    extend_seq_lens_cpu=[S0],
+                    extend_prefix_lens_cpu=[0],
+                    req_pool_indices=[0],
+                    input_ids=torch.arange(S0, dtype=torch.int64),
+                ),
+            )
+        ] + [
+            (
+                hs[S0 + t : S0 + t + 1],
+                _make_forward_batch(
+                    is_decode=True,
+                    extend_seq_lens_cpu=[],
+                    extend_prefix_lens_cpu=[],
+                    req_pool_indices=[0],
+                    input_ids=torch.tensor([0], dtype=torch.int64),
+                ),
+            )
+            for t in range(S1)
+        ]
+        outs = []
+        with _mock_pool_context(pool):
+            for chunk_hs, fb in batches:
+                outs.append(cca.forward(chunk_hs, fb))
+
+        for i, ref in enumerate((q_ref, k_ref, v_ref)):
+            got = torch.cat([o[i] for o in outs], dim=0)
+            torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
+
     def test_projected_lag_is_narrower_than_the_hidden_state(self):
         """The whole point: conv[1] shrinks to the val_proj2 output width.
 
@@ -1130,6 +1190,8 @@ class TestCCADecodeConvFold(CustomTestCase):
         _ensure_dist_initialized()
 
     def _check(self, cca, T: int):
+        from sglang.srt.models.zaya import _cca_decode_conv
+
         taps = cca.total_padding + 1
         torch.manual_seed(7)
         window = torch.randn(T, cca.in_out_ch, taps, dtype=torch.float32) * 0.3
@@ -1140,12 +1202,60 @@ class TestCCADecodeConvFold(CustomTestCase):
             ref = ref.squeeze(-1)
 
             cca.fold_decode_conv()
-            grouped = window.reshape(T, cca.decode_conv_groups, -1)
-            got = (
-                torch.einsum("tgk,gok->tgo", grouped, cca.decode_conv_weight)
-                + cca.decode_conv_bias
-            ).reshape(T, -1)
+            # Drive the production consumer rather than re-deriving the einsum:
+            # the folded weight now carries the conv bias in a trailing column
+            # activated by a constant-1.0 tap, and re-deriving it here would let
+            # the two layouts drift apart unnoticed.
+            got = _cca_decode_conv(
+                window,
+                cca.conv_qk,
+                cca.decode_conv_weight,
+                cca.decode_conv_bias,
+                cca.decode_conv_groups,
+            )
         torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-4)
+
+        # The window that ``cca_state_step`` emits already carries the ones
+        # column; the one built by the unfused fallback does not and gets it
+        # appended. Both must give the same answer, or the fused and fallback
+        # decode paths disagree only on GPU, where the fused one runs.
+        with torch.no_grad():
+            widened = torch.cat([window, torch.ones(T, cca.in_out_ch, 1)], dim=-1)
+            got_widened = _cca_decode_conv(
+                widened,
+                cca.conv_qk,
+                cca.decode_conv_weight,
+                cca.decode_conv_bias,
+                cca.decode_conv_groups,
+            )
+        torch.testing.assert_close(got_widened, got, rtol=0, atol=0)
+
+    def test_folded_weight_carries_the_bias_column(self):
+        """The bias rides in the weight so the separate add can go.
+
+        ``_cca_decode_conv`` used to do ``einsum(...) + decode_conv_bias``, one
+        launch per attention layer -- 60 per decode step on ZAYA1-74B. Folding
+        the bias into a trailing weight column, activated by a constant-1.0 tap
+        the window kernel writes for free, puts it inside the matmul's fp32
+        accumulator instead. Pin both halves: the column holds the bias on the
+        last input channel, and zero on every other, so each output picks it up
+        exactly once.
+        """
+        cca, _ = _make_tiny_cca(seed=9)
+        cca.fold_decode_conv()
+        groups = cca.decode_conv_groups
+        cg = cca.in_out_ch // groups
+        taps = cca.total_padding + 1
+
+        self.assertEqual(cca.decode_conv_taps_ext, taps + 1)
+        self.assertEqual(
+            tuple(cca.decode_conv_weight.shape), (groups, cg, cg * (taps + 1))
+        )
+        w = cca.decode_conv_weight.reshape(groups, cg, cg, taps + 1)
+        torch.testing.assert_close(
+            w[:, :, cg - 1, taps], cca.decode_conv_bias, rtol=0, atol=0
+        )
+        self.assertTrue(torch.all(w[:, :, : cg - 1, taps] == 0))
 
     def test_fold_matches_two_stage_conv(self):
         cca, _ = _make_tiny_cca(seed=3)
@@ -2614,10 +2724,16 @@ class TestCCAFusedDecodeConv(CustomTestCase):
 
         qk = torch.randn(num_tokens, channels, device=dev, dtype=dt)
         lag_now = torch.randn(num_tokens, self.LAG_DIM, device=dev, dtype=dt)
-        weight = (
-            torch.randn(self.GROUPS, self.CG, self.CG * taps, device=dev, dtype=dt)
-            * 0.1
+        # The einsum path's weight spans taps + 1 inputs per channel; the extra
+        # column is the bias, which this kernel does not read (it adds the bias
+        # itself). Fill it so a kernel that mistakenly indexed it would show up.
+        coeffs = torch.randn(self.GROUPS, self.CG, self.CG, taps, device=dev, dtype=dt)
+        coeffs *= 0.1
+        weight = torch.randn(
+            self.GROUPS, self.CG, self.CG, taps + 1, device=dev, dtype=dt
         )
+        weight[..., :taps] = coeffs
+        weight = weight.reshape(self.GROUPS, self.CG, self.CG * (taps + 1)).contiguous()
         bias = torch.randn(self.GROUPS, self.CG, device=dev, dtype=dt) * 0.1
         conv_state = torch.randn(
             num_slots, channels, self.TOTAL_PADDING, device=dev, dtype=dt
@@ -2625,14 +2741,16 @@ class TestCCAFusedDecodeConv(CustomTestCase):
         lag_state = torch.randn(num_slots, self.LAG_DIM, 1, device=dev, dtype=dt)
         slots = torch.tensor(slot_ids, dtype=torch.int64, device=dev)
 
-        # Reference: build the window, apply the einsum, shift the pools.
+        # Reference: build the window, apply the einsum over the real taps only,
+        # add the bias, shift the pools.
         live = [s for s in slot_ids if s >= 0]
         ref_cs, ref_ls = conv_state.clone(), lag_state.clone()
         left = conv_state.index_select(0, slots.clamp(min=0))
         window = torch.cat([left, qk.unsqueeze(-1)], dim=-1)
         grouped = window.reshape(num_tokens, self.GROUPS, -1)
+        packed = coeffs.reshape(self.GROUPS, self.CG, self.CG * taps)
         ref_qk = (
-            torch.einsum("tgk,gok->tgo", grouped.float(), weight.float()) + bias.float()
+            torch.einsum("tgk,gok->tgo", grouped.float(), packed.float()) + bias.float()
         ).reshape(num_tokens, -1)
         ref_prev = lag_state.index_select(0, slots.clamp(min=0)).squeeze(-1)
         for i, s in enumerate(slot_ids):
@@ -2700,7 +2818,9 @@ class TestCCAFusedDecodeConv(CustomTestCase):
         qk = torch.randn(4, channels, device=dev, dtype=dt)
         lag_now = torch.randn(4, self.LAG_DIM, device=dev, dtype=dt)
         weight = (
-            torch.randn(self.GROUPS, self.CG, self.CG * taps, device=dev, dtype=dt)
+            torch.randn(
+                self.GROUPS, self.CG, self.CG * (taps + 1), device=dev, dtype=dt
+            )
             * 0.1
         )
         bias = torch.randn(self.GROUPS, self.CG, device=dev, dtype=dt) * 0.1

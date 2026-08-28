@@ -61,6 +61,7 @@ def _cca_conv1d_update_kernel(
     num_tokens,
     CG: tl.constexpr,  # channels per group
     W: tl.constexpr,  # taps
+    WSPAN: tl.constexpr,  # per-input-channel span of the weight (W + bias col)
     BLOCK_T: tl.constexpr,
 ):
     t = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
@@ -92,11 +93,14 @@ def _cca_conv1d_update_kernel(
                 mask=live[:, None],
                 other=0.0,
             )
-        # The folded weight flattens (ci, tap) into one axis of width CG*W, so
-        # tap m occupies the stride-W slice starting at m -- load it as [ci, co]
-        # to contract over ci.
+        # The folded weight flattens (ci, tap) into one axis of width
+        # CG*WSPAN, so tap m occupies the stride-WSPAN slice starting at m --
+        # load it as [ci, co] to contract over ci. WSPAN exceeds W by the
+        # trailing bias column the einsum path folds in (see
+        # ``CCA.fold_decode_conv``); this kernel never reads that column, it
+        # adds the bias itself, which is already free inside the accumulator.
         wm = tl.load(
-            w_ptr + g * s_w_g + co_local[None, :] * s_w_o + ci[:, None] * W + m
+            w_ptr + g * s_w_g + co_local[None, :] * s_w_o + ci[:, None] * WSPAN + m
         )
         acc += tl.dot(xm, wm, out_dtype=tl.float32)
 
@@ -174,7 +178,8 @@ def covered(
     """Whether the fused decode conv can serve these inputs.
 
     Mirrors ``cca_state_step.covered`` and additionally requires the folded
-    grouped weight in its ``[G, CG, CG*W]`` matmul layout and a group width
+    grouped weight in its ``[G, CG, CG*(W+1)]`` matmul layout -- the einsum path's
+    layout, whose trailing column carries the conv bias -- and a group width
     ``tl.dot`` can take as a tile.
     """
     if weight is None or bias is None or slots is None:
@@ -207,7 +212,7 @@ def covered(
         return False
 
     taps = total_padding + 1
-    if tuple(weight.shape) != (groups, ch_per_group, ch_per_group * taps):
+    if tuple(weight.shape) != (groups, ch_per_group, ch_per_group * (taps + 1)):
         return False
     if tuple(bias.shape) != (groups, ch_per_group):
         return False
@@ -285,6 +290,7 @@ def cca_conv1d_update(
         num_tokens,
         CG=ch_per_group,
         W=taps,
+        WSPAN=taps + 1,
         BLOCK_T=block_t,
         num_warps=4,
     )

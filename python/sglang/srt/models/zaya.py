@@ -429,7 +429,11 @@ def cca_decode(
     if _state_step.covered(
         qk, lag_now, conv_state, lag_state, mamba_indices, total_padding
     ):
-        # One kernel for the gathers, the concat and the scatters.
+        # One kernel for the gathers, the concat and the scatters. When the
+        # folded weight is available it carries the conv bias in a trailing
+        # column, so ask for the matching constant-1.0 tap and let the bias land
+        # in the matmul accumulator instead of a separate add (see
+        # ``fold_decode_conv``).
         padded, lag_prev = _state_step.cca_state_step(
             qk,
             lag_now,
@@ -437,6 +441,7 @@ def cca_decode(
             lag_state,
             mamba_indices,
             total_padding,
+            ones_column=decode_conv_weight is not None,
         )
         qk_out = _cca_decode_conv(
             padded,
@@ -505,16 +510,25 @@ def _cca_decode_conv(
     :meth:`CCA.fold_decode_conv`) and falls back to running the real two-stage
     ``conv_qk``, which is what an unfolded module (e.g. a CPU unit test) gets.
 
+    The folded weight spans ``taps + 1`` inputs per channel: the extra one is the
+    bias, activated by a constant-1.0 column in the window. ``cca_state_step``
+    writes that column for free; a window that arrives without it (the unfused
+    gather/concat fallback) gets it appended here, which is one extra op on a
+    path that is already off the fast one.
     """
     if decode_conv_weight is not None:
-        # [T, C, taps] -> [T, G, Cg*taps] (the trailing (Cg, taps) dims flatten
-        # in place, matching how fold_decode_conv laid out the weight) -> one
-        # grouped matmul -> [T, C].
-        num_tokens = padded.shape[0]
+        num_tokens, num_channels = padded.shape[0], padded.shape[1]
+        taps_ext = decode_conv_weight.shape[-1] // (num_channels // decode_conv_groups)
+        if padded.shape[-1] != taps_ext:
+            padded = F.pad(padded, (0, taps_ext - padded.shape[-1]), value=1.0)
+        # [T, C, taps_ext] -> [T, G, Cg*taps_ext] (the trailing (Cg, taps_ext)
+        # dims flatten in place, matching how fold_decode_conv laid out the
+        # weight) -> one grouped matmul -> [T, C]. The bias is already inside the
+        # accumulator, so there is nothing to add afterwards.
         grouped = padded.reshape(num_tokens, decode_conv_groups, -1)
-        return (
-            torch.einsum("tgk,gok->tgo", grouped, decode_conv_weight) + decode_conv_bias
-        ).reshape(num_tokens, -1)
+        return torch.einsum("tgk,gok->tgo", grouped, decode_conv_weight).reshape(
+            num_tokens, -1
+        )
     return conv_qk(padded).squeeze(-1)
 
 
@@ -768,16 +782,27 @@ class CCA(nn.Module):
         # fold is automatically per-rank correct).
         self.decode_conv_groups = self.num_q_heads + self.num_k_heads
         self.decode_conv_taps = self.total_padding + 1
+        # The matmul's window carries one extra constant-1.0 tap per channel so
+        # the conv bias can ride in the weight instead of a separate add -- see
+        # ``fold_decode_conv``. Only the last of those columns holds the bias;
+        # the other ``ch_per_group - 1`` are zero, which costs a wider K on a
+        # GEMM that is launch-bound anyway and buys back one launch per
+        # attention layer (60 per decode step on ZAYA1-74B).
+        self.decode_conv_taps_ext = self.decode_conv_taps + 1
         ch_per_group = self.in_out_ch // self.decode_conv_groups
         self.register_buffer(
             "decode_conv_weight",
             torch.zeros(
                 self.decode_conv_groups,
                 ch_per_group,
-                ch_per_group * self.decode_conv_taps,
+                ch_per_group * self.decode_conv_taps_ext,
             ),
             persistent=False,
         )
+        # Kept alongside the folded weight even though the einsum path no longer
+        # adds it: ``_conv_qk_run`` hands it to ``F.conv1d`` and the fused prefill
+        # conv takes it as a kernel argument, both of which absorb a bias for
+        # free.
         self.register_buffer(
             "decode_conv_bias",
             torch.zeros(self.decode_conv_groups, ch_per_group),
@@ -1052,6 +1077,15 @@ class CCA(nn.Module):
         on MI350X under graph replay. Extend still uses the real two-stage conv,
         which produces many timesteps and cannot be folded this way.
 
+        ``decode_conv_weight`` additionally carries that bias as a trailing
+        column, matched by the constant-1.0 tap ``cca_state_step`` appends to the
+        window. The affine map becomes a pure linear one over ``taps + 1`` inputs,
+        so the bias is summed inside the matmul's fp32 accumulator instead of
+        being added to an already-rounded bf16 output. That removes a launch per
+        attention layer AND drops a rounding step, so the decode conv output is
+        *closer* to the fp32 reference than before, not bit-identical to it. The
+        column lands at ``ci == ch_per_group - 1`` and the other ``ci`` slots of
+        that tap are zero, so each output gets the bias exactly once.
         """
         t0, t1 = self.cca_time0, self.cca_time1
         groups = self.decode_conv_groups
@@ -1072,14 +1106,24 @@ class CCA(nn.Module):
                 # itself reads input tap j + k.
                 folded[..., j + k] += w1[..., j] * w0[:, None, :, k]
 
-        self.decode_conv_weight.copy_(
-            folded.reshape(groups, cg, cg * taps).to(self.decode_conv_weight.dtype)
+        bias = b1 + (w1.sum(dim=3) * b0[:, None, :]).sum(dim=2)  # [G, Cg]
+
+        # [G, Co_g, Ci_g, taps] -> [G, Co_g, Ci_g, taps + 1], the extra tap
+        # holding the bias on the last input channel and zero on the rest. The
+        # window's matching column is a constant 1.0, so the matmul contracts to
+        # ``sum_ci sum_m A[co,ci,m] x[ci,m] + b[co]`` with the bias inside the
+        # fp32 accumulator.
+        folded_ext = torch.zeros(
+            groups, cg, cg, taps + 1, device=w0.device, dtype=torch.float32
         )
-        self.decode_conv_bias.copy_(
-            (b1 + (w1.sum(dim=3) * b0[:, None, :]).sum(dim=2)).to(
-                self.decode_conv_bias.dtype
+        folded_ext[..., :taps] = folded
+        folded_ext[:, :, cg - 1, taps] = bias
+        self.decode_conv_weight.copy_(
+            folded_ext.reshape(groups, cg, cg * (taps + 1)).to(
+                self.decode_conv_weight.dtype
             )
         )
+        self.decode_conv_bias.copy_(bias.to(self.decode_conv_bias.dtype))
         # [G, Co_g, Ci_g, taps] -> [G*Co_g, Ci_g, taps] == [C, C/groups, kernel]
         self.fold_conv1d_weight.copy_(
             folded.reshape(groups * cg, cg, taps).to(self.fold_conv1d_weight.dtype)

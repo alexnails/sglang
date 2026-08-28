@@ -22,6 +22,14 @@ ZAYA1-74B. Passing ``lag_now`` / ``lag_state`` as ``None`` compiles the stream
 out entirely (``HAS_LAG``) *and* drops its tiles from the grid, which is what a
 rank whose K heads all come from ``val_proj1`` wants -- it never reads the lag.
 
+``ones_column`` appends a constant-1.0 tap to the emitted window. It costs one
+extra store on a window the kernel is already writing, and it lets the caller
+fold the conv bias into the matmul's weight (see ``CCA.fold_decode_conv``) so
+the separate bias add -- one launch per attention layer, 60 per decode step on
+ZAYA1-74B -- disappears. The bias then lands in the matmul's fp32 accumulator
+instead of being added after the output has already been rounded to bf16, so the
+result is *more* accurate than the two-step form, not merely equal to it.
+
 The grid is ``(T, n_channel_tiles + n_lag_tiles)``: the second axis indexes one
 flat tile space where the low ``n_channel_tiles`` entries do the conv window and
 history shift for their slice of ``C``, and the rest do the lag
@@ -86,6 +94,7 @@ def _cca_state_step_kernel(
     BLOCK_C: tl.constexpr,
     BLOCK_D: tl.constexpr,
     HAS_LAG: tl.constexpr,
+    ONES_COL: tl.constexpr,  # append a constant-1.0 tap at index W
 ):
     t = tl.program_id(0)
     tile = tl.program_id(1)
@@ -107,6 +116,11 @@ def _cca_state_step_kernel(
             )
             tl.store(window_ptr + t * s_win_t + c * s_win_c + w, hist, mask=cmask)
         tl.store(window_ptr + t * s_win_t + c * s_win_c + (W - 1), qk, mask=cmask)
+        if ONES_COL:
+            # The bias column's activation. Exactly 1.0 in every float format,
+            # so ``1.0 * b`` contributes ``b`` to the fp32 accumulator unrounded.
+            ones = tl.full([BLOCK_C], 1.0, dtype=window_ptr.dtype.element_ty)
+            tl.store(window_ptr + t * s_win_t + c * s_win_c + W, ones, mask=cmask)
 
         # Shift the history left by one: new[w] = old[w+1], new[W-2] = qk. Read
         # every old tap above before storing so the two do not alias.
@@ -217,19 +231,21 @@ def cca_state_step(
     lag_state: Optional[torch.Tensor],
     slots: torch.Tensor,
     total_padding: int,
+    ones_column: bool = False,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Return ``(window, lag_prev)`` and shift both pool slots in place.
 
-    ``window`` is ``[T, C, total_padding + 1]`` in ``qk``'s dtype; ``lag_prev``
-    is ``[T, D]`` in ``lag_now``'s dtype, or ``None`` when the lag stream is
-    compiled out. Caller must have checked :func:`covered`."""
+    ``window`` is ``[T, C, total_padding + 1 (+ 1 if ones_column)]`` in ``qk``'s
+    dtype; ``lag_prev`` is ``[T, D]`` in ``lag_now``'s dtype, or ``None`` when the
+    lag stream is compiled out. Caller must have checked :func:`covered`."""
     num_tokens, num_channels = qk.shape
     taps = total_padding + 1
+    win_taps = taps + 1 if ones_column else taps
     has_lag = lag_now is not None
     lag_dim = lag_now.shape[-1] if has_lag else 0
 
     window = torch.empty(
-        (num_tokens, num_channels, taps), dtype=qk.dtype, device=qk.device
+        (num_tokens, num_channels, win_taps), dtype=qk.dtype, device=qk.device
     )
     lag_prev = (
         torch.empty((num_tokens, lag_dim), dtype=lag_now.dtype, device=lag_now.device)
@@ -270,6 +286,7 @@ def cca_state_step(
         BLOCK_C=block_c,
         BLOCK_D=block_d,
         HAS_LAG=has_lag,
+        ONES_COL=ones_column,
         num_warps=4,
     )
     return window, lag_prev
