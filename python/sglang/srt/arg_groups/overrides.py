@@ -1877,15 +1877,16 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         # KDA backend's track-snapshot writes (decode + extend) so donated
         # slots hold real states for prefix-cache restores.
         "KimiK3ForConditionalGeneration",
-        # Short-conv hybrid served by ShortConvAttnBackend, which implements the
-        # track snapshot for both of ZAYA1's conv entries (conv_qk left padding +
-        # prev_hs). Needs mamba_cache_chunk_size to be derived from the conv
-        # window rather than from the model's scan length -- ZAYA1 reports
-        # mamba_chunk_size == 1 because CCA has no chunked recurrence, and a
-        # granularity of 1 is below its conv window. LFM2 rides the same backend
-        # and the same derivation, but is deliberately NOT listed: it has not
-        # been validated on hardware, and no_buffer is a safe default for it.
-        "ZayaForCausalLM",
+        # ZayaForCausalLM is withheld again, pending one more fix. The chunk-size
+        # derivation is done (it now boots, with disable_overlap_schedule False
+        # and max_running_requests 170 -> 102 as the 3 -> 5 slots/request
+        # predicts), but the track hook still snapshots conv[1] as the raw
+        # hidden state at hidden_size, while the projected-v2 change narrowed
+        # that pool entry to latent_k_dim_full. The first extend forward dies:
+        #   shape mismatch: value tensor of shape [4096, 1] cannot be broadcast
+        #   to indexing result of shape [1, 128, 1]
+        # Re-add once the snapshot takes the projected lag and a test pins the
+        # snapshot width against the pool entry width.
     }
 )
 
