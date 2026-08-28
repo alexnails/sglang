@@ -45,7 +45,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Iterable
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, NamedTuple, Optional, Tuple
 
 import msgspec
 import torch
@@ -1515,6 +1515,71 @@ class ZayaAttention(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def fusable_router_mlp(router_mlp: nn.Sequential) -> bool:
+    """Whether ``ZayaRouter.router_mlp`` has the shape the fused kernel assumes.
+
+    Structural, not numerical: exactly Linear / GELU / Linear / GELU / Linear,
+    no ``skip_bias_add``, no bias on the final projection, and -- the one thing
+    the kernel's own ``covered()`` cannot see from its tensors -- both
+    activations the *erf* GELU.
+
+    That last check is the point of this function. ``nn.GELU()`` is
+    ``approximate='none'``, i.e. ``0.5 * x * (1 + erf(x / sqrt(2)))``. The tanh
+    approximation differs from it by only ~5e-4 absolute: small enough to pass
+    for ordinary numerical noise in an end-to-end eval, large enough to flip
+    routing on near-ties, in every one of the 74B's 60 MoE layers. Fusing the
+    wrong flavour would be a silent accuracy regression, so nothing gets fused
+    until the flavour is verified.
+
+    Kept a free function -- like ``mod_premask_experts`` / ``mod_blend`` -- so
+    the guard is unit-testable without building a router.
+    """
+    if len(router_mlp) != 5:
+        return False
+    for i in (0, 2, 4):
+        stage = router_mlp[i]
+        if not isinstance(stage, ReplicatedLinear) or stage.skip_bias_add:
+            return False
+    for i in (1, 3):
+        activation = router_mlp[i]
+        if not isinstance(activation, nn.GELU):
+            return False
+        if getattr(activation, "approximate", "none") != "none":
+            return False
+    # The kernel folds no bias into the final projection.
+    return getattr(router_mlp[4], "bias", None) is None
+
+
+class ZayaRouting(NamedTuple):
+    """Everything :class:`ZayaBlock` needs out of one router forward.
+
+    ``moe_weight`` / ``moe_ids`` are the FusedMoE-ready pair: fp32 weights --
+    the dtype every other sglang top-k emits, so the MoE runner's opening
+    ``topk_weights.to(torch.float32)`` is a no-op rather than a launch -- and
+    int32 expert ids already clamped into ``[0, num_moe_experts - 1]``.
+
+    ``route_prob`` is the same probability at the model dtype, which is what the
+    MOD residual blend multiplies the hidden state by. It stays separate from
+    ``moe_weight`` so fusing the tail does not quietly change the MOD
+    arithmetic's precision.
+
+    ``skip_ids`` is the *unclamped* choice. MOD needs it: the clamp folds the
+    skip slot (``num_moe_experts``) onto real expert ``num_moe_experts - 1``, so
+    ``moe_ids`` can no longer distinguish a skipped token from one genuinely
+    routed to the last expert. Without MOD it aliases ``moe_ids``.
+
+    ``hidden_states_next`` is the POST-EDA, PRE-NORM router state that the next
+    MoE layer folds in. Publishing the normalized tensor instead would change
+    the EDA recursion in every downstream MoE layer without crashing.
+    """
+
+    moe_weight: torch.Tensor
+    moe_ids: torch.Tensor
+    route_prob: torch.Tensor
+    skip_ids: torch.Tensor
+    hidden_states_next: torch.Tensor
+
+
 class ZayaRouter(nn.Module):
     """ZAYA1 expert router: 3-layer MLP with optional EDA and MOD.
 
@@ -1545,6 +1610,7 @@ class ZayaRouter(nn.Module):
         self.router_softmax_fp32 = bool(getattr(config, "zaya_high_prec", False))
 
         self.use_mod = bool(getattr(config, "zaya_use_mod", False))
+        self.num_moe_experts = int(num_moe_experts)
         self.num_experts = (num_moe_experts + 1) if self.use_mod else num_moe_experts
         # Whether the MOD skip slot can actually win the argmax on the LOADED
         # biases; resolved by fold_mod_reachability() after every weight load.
@@ -1608,6 +1674,10 @@ class ZayaRouter(nn.Module):
             ),
         )
 
+        # Checked once, here, because it is a property of the module graph
+        # rather than of the inputs.
+        self.fused_router_mlp_ok = fusable_router_mlp(self.router_mlp)
+
         self.register_buffer(
             "balancing_biases",
             torch.zeros(self.num_experts, dtype=torch.float32),
@@ -1647,7 +1717,7 @@ class ZayaRouter(nn.Module):
         self,
         hidden_states: torch.Tensor,
         prev_router_hidden_states: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> ZayaRouting:
         # ``hidden_states`` is ``[T, H]``.
         hs, _ = self.down_proj(hidden_states)
         if (
@@ -1655,15 +1725,100 @@ class ZayaRouter(nn.Module):
             and prev_router_hidden_states is not None
             and hasattr(self, "router_states_scale")
         ):
-            hs = hs + prev_router_hidden_states * self.router_states_scale
+            # One fused multiply-add instead of a separate mul and add: 2
+            # launches become 1 on all but the first MoE layer (59 of 60 on the
+            # 74B, since the first has no previous router state). In-place is
+            # safe because ``hs`` is the freshly-allocated ``down_proj`` output
+            # that nothing else aliases, and it drops the temporary as well.
+            #
+            # NOT bit-identical: ``a + b * c`` rounds the product before the
+            # add, ``addcmul`` fuses them and rounds once. At bf16 that is up to
+            # one ULP on the EDA term, which then threads through the whole
+            # 60-layer recursion. Verified with assert_close, not assert_equal.
+            hs.addcmul_(prev_router_hidden_states, self.router_states_scale)
 
-        # ``hs`` is a freshly-allocated tensor (output of ``down_proj`` or the
-        # EDA add above) and ``rmsnorm_eda`` is non-residual / out-of-place,
-        # so we can hand the same buffer to the next layer without cloning.
+        # ``hs`` is a freshly-allocated tensor (output of ``down_proj``, updated
+        # in place by the EDA add above) and ``rmsnorm_eda`` is non-residual /
+        # out-of-place, so we can hand the same buffer to the next layer without
+        # cloning. This is the POST-EDA, PRE-NORM tensor: the EDA recursion is
+        # defined on the un-normalized state, so publishing ``hs_norm`` here
+        # instead would silently change routing in every downstream MoE layer.
         router_hidden_states_next = hs
 
         hs_norm = self.rmsnorm_eda(hs)
+        logits = self._router_logits(hs_norm)
 
+        # One kernel for the whole tail: softmax, balancing bias, top-1, the
+        # probability gather, the model-dtype rounding, and the int32/clamp/int32
+        # expert-id munging that ZayaBlock used to do on the way into FusedMoE.
+        # Nine launches per MoE layer become one, and on the 74B there are 60 of
+        # them in a decode step that is launch-bound rather than bandwidth-bound.
+        #
+        # ``.is_cuda`` is tested before the import rather than left to
+        # ``covered()`` alone because the kernel module imports ``triton`` at
+        # module scope, which a CPU-only environment need not have.
+        if logits.is_cuda:
+            from sglang.kernels.ops.moe import zaya_router_tail as _tail
+
+            # The clamp ceiling: ids above this are the MOD skip slot.
+            max_expert_id = self.num_moe_experts - 1
+            if _tail.covered(
+                logits,
+                self.balancing_biases,
+                num_experts=self.num_experts,
+                max_expert_id=max_expert_id,
+                topk=self.topk,
+                out_dtype=hidden_states.dtype,
+            ):
+                moe_weight, moe_ids, route_prob, skip_ids = _tail.router_tail(
+                    logits,
+                    self.balancing_biases,
+                    num_experts=self.num_experts,
+                    max_expert_id=max_expert_id,
+                    softmax_fp32=self.router_softmax_fp32,
+                    out_dtype=hidden_states.dtype,
+                )
+                return ZayaRouting(
+                    moe_weight=moe_weight,
+                    moe_ids=moe_ids,
+                    route_prob=route_prob,
+                    skip_ids=skip_ids,
+                    hidden_states_next=router_hidden_states_next,
+                )
+
+        return self._routing_reference(
+            logits, hidden_states.dtype, router_hidden_states_next
+        )
+
+    def _router_logits(self, hs_norm: torch.Tensor) -> torch.Tensor:
+        """Expert logits from the normalized router state, ``[T, num_experts]``.
+
+        The 3-stage MLP with its two GELUs is five launches as an
+        ``nn.Sequential`` and one as a fused kernel -- 240 per decode step across
+        the 74B's 60 MoE layers. The weights are only ~270 KB per layer, so this
+        is launch overhead, not bandwidth.
+        """
+        # ``.is_cuda`` gates the import as well as the dispatch: the kernel
+        # module imports ``triton`` at module scope.
+        if self.fused_router_mlp_ok and hs_norm.is_cuda:
+            from sglang.kernels.ops.moe import zaya_router_mlp as _mlp
+
+            first, second, last = (self.router_mlp[i] for i in (0, 2, 4))
+            operands = (
+                hs_norm,
+                first.weight,
+                first.bias,
+                second.weight,
+                second.bias,
+                last.weight,
+            )
+            if _mlp.covered(*operands, num_experts=self.num_experts):
+                return _mlp.router_mlp(*operands, num_experts=self.num_experts)
+
+        return self._router_logits_reference(hs_norm)
+
+    def _router_logits_reference(self, hs_norm: torch.Tensor) -> torch.Tensor:
+        """The unfused ``nn.Sequential``: reference semantics and fallback."""
         # Step through the Sequential manually so the ``(tensor, bias)`` tuple
         # returned by each ReplicatedLinear is unpacked correctly.
         out = hs_norm
@@ -1672,8 +1827,20 @@ class ZayaRouter(nn.Module):
                 out, _ = stage(out)
             else:
                 out = stage(out)
-        logits = out
+        return out
 
+    def _routing_reference(
+        self,
+        logits: torch.Tensor,
+        model_dtype: torch.dtype,
+        router_hidden_states_next: torch.Tensor,
+    ) -> ZayaRouting:
+        """The unfused torch chain: reference semantics and fallback in one place.
+
+        This is the single definition of what the fused tail must reproduce, and
+        the path taken whenever ``zaya_router_tail.covered`` says no -- CPU
+        tensors, top-k > 1, or an expert axis wider than one Triton block.
+        """
         if self.router_softmax_fp32:
             expert_prob = torch.softmax(logits, dim=-1, dtype=torch.float32)
         else:
@@ -1696,10 +1863,30 @@ class ZayaRouter(nn.Module):
             expert_choice = expert_choice.masked_fill(cumsum_mask > 0, skip_idx)
 
         route_prob = torch.gather(expert_prob, dim=1, index=expert_choice)
-        if route_prob.dtype != hidden_states.dtype:
-            route_prob = route_prob.to(hidden_states.dtype)
+        # fp32 for the MoE runner -- a no-op cast whenever the softmax already
+        # ran in fp32, which ``zaya_high_prec`` makes the default -- and the
+        # model dtype for the MOD blend.
+        moe_weight = route_prob.to(torch.float32)
+        if route_prob.dtype != model_dtype:
+            route_prob = route_prob.to(model_dtype)
 
-        return route_prob, expert_choice, router_hidden_states_next
+        if self.use_mod:
+            # Clamp the skip slot into the valid expert range so FusedMoE never
+            # indexes out of bounds. ``skip_ids`` keeps the unclamped choice,
+            # which is the only thing that can still identify a skipped token.
+            moe_ids = torch.clamp(
+                expert_choice, min=0, max=self.num_moe_experts - 1
+            ).to(torch.int32)
+        else:
+            moe_ids = expert_choice.to(torch.int32)
+
+        return ZayaRouting(
+            moe_weight=moe_weight,
+            moe_ids=moe_ids,
+            route_prob=route_prob,
+            skip_ids=expert_choice,
+            hidden_states_next=router_hidden_states_next,
+        )
 
 
 def mod_premask_experts(
@@ -1823,30 +2010,29 @@ class ZayaBlock(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states, hidden_states.new_zeros((0, self.mlp_expansion))
 
-        probs, indices, router_hs_next = self.router(
-            hidden_states, prev_router_hidden_states
-        )
+        routing = self.router(hidden_states, prev_router_hidden_states)
+        probs = routing.route_prob
+        # The *unclamped* choice. MOD's skip predicate is
+        # ``id == num_moe_experts``, which ``routing.moe_ids`` has clamped away.
+        indices = routing.skip_ids
+        router_hs_next = routing.hidden_states_next
 
+        # ``moe_ids`` arrives int32 and already clamped into the real-expert
+        # range, and ``moe_weight`` arrives fp32 -- the dtype the MoE runners
+        # cast to anyway -- so nothing is left to do here. See ``ZayaRouting``.
         topk_out = StandardTopKOutput(
-            topk_weights=probs.to(hidden_states.dtype),
-            topk_ids=indices.to(torch.int32),
-            router_logits=probs.to(hidden_states.dtype),
+            topk_weights=routing.moe_weight,
+            topk_ids=routing.moe_ids,
+            router_logits=routing.moe_weight,
         )
 
         # ``mod_reachable``, not ``zaya_use_mod``: a checkpoint whose skip bias puts
         # the slot permanently out of reach turns this whole branch into two
         # elementwise launches per MoE layer computing an always-false predicate
-        # (see ZayaRouter.fold_mod_reachability).
+        # (see ZayaRouter.fold_mod_reachability). The clamp that used to live here
+        # is now done inside the fused router tail, which emits both the clamped
+        # ``moe_ids`` and the unclamped ``skip_ids`` the predicate below needs.
         if self.router.mod_reachable:
-            # MOD: clamp the "skip expert" id (== num_moe_experts) into the
-            # valid expert range so FusedMoE never indexes out of bounds; the
-            # mask below decides per-token whether to actually use experts or
-            # the skip path.
-            clamped_ids = torch.clamp(indices, min=0, max=self.num_moe_experts - 1).to(
-                torch.int32
-            )
-            topk_out = topk_out._replace(topk_ids=clamped_ids)
-
             experts_out = self.experts(hidden_states, topk_out)
             # ``mod_out`` is computed identically on every rank that owns this
             # token (both ``hidden_states`` and ``probs`` are replicated across

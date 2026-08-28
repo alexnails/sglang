@@ -52,11 +52,11 @@ below ~256 ISL, a loss above ~1k. Decode is neutral (-0.5%).
 ## Code tracks
 
 ### A — small, high-confidence (owner: me)
-- [ ] A1 MoD dead-code gate. `balancing_biases[-1] = -1.0` on all 60 layers and the
+- [x] A1 MoD dead-code gate. `balancing_biases[-1] = -1.0` on all 60 layers and the
       bias is added to a *softmax probability*, so the skip slot is provably
       unreachable: `p_skip + b_skip <= 1 + b_skip <= max_j b_j <= max_j(p_j + b_j)`.
       Gate the branch at load time. **-120 launches/step, bit-identical.**
-- [ ] A2 `inplace=False` on the FusedMoE construction. Latent aliasing hazard on the
+- [x] A2 `inplace=False` on the FusedMoE construction. Latent aliasing hazard on the
       triton runner (aiter allocates fresh, so not live here). Defensive.
 - [~] A3 conv bias-add. DEFERRED, and the obvious form is a trap: `baddbmm` batches
       over G and yields `[G,T,O]`, so transposing back to `[T,G,O]` costs a copy and
@@ -77,10 +77,10 @@ below ~256 ISL, a loss above ~1k. Decode is neutral (-0.5%).
       i.e. pure launch overhead.
 
 ### C — dp_gather wrapper + Triton occupancy (owner: agent, worktree)
-- [ ] C1 `_dp_gather_via_all_reduce` under SUM_LEN does fill_(0) + memcpy_triton +
+- [x] C1 (-120, not -180: see commit) `_dp_gather_via_all_reduce` under SUM_LEN does fill_(0) + memcpy_triton +
       all-reduce + copy-back = 4 launches/attention layer. Only the AR is
       irreducible. **-180/step.**
-- [ ] C2 `cca_state_step` launches 32 programs on a 256-CU GPU; `cca_qk_mix` runs
+- [x] C2 `cca_state_step` launches 32 programs on a 256-CU GPU; `cca_qk_mix` runs
       num_warps=4 (256 threads) on a 128-element tensor. Duration, not count.
 
 ### D — CCA v2 projected cache (owner: agent, worktree)
@@ -90,14 +90,26 @@ below ~256 ISL, a loss above ~1k. Decode is neutral (-0.5%).
       drops ~2.0 GB/step of memcpy => est. **TTFT -5 to -9%**.
 
 ## GPU arms (serial, one node)
-- [ ] G1 finish chain2: long prefill (ISL 4096/16384) +/- fused CCA prefill; C=512.
+- [x] G1 finish chain2: long prefill (ISL 4096/16384) +/- fused CCA prefill; C=512.
 - [ ] G2 aiter fmoe tuned-table clone. Confirmed miss: every MoE call logs
       `[aiter] [fused_moe] using 2stage default for ('gfx950',256,M,4096,512,24,1,...)`
       and `/tmp/aiter_configs/tuned_fmoe.csv` has **zero rows with expert=24**
       (2403 rows, 1357 gfx950). Clone the E=512/513 rows at the identical
       model_dim=4096/inter_dim=512 and point `AITER_CONFIG_FMOE` at the copy.
       **No code change.**
-      **RESULT: CONFIRMED WIN, prefill only.** The only *unquantized* gfx950 rows at
+      **RESULT: NOT ESTABLISHED -- retracted pending a clean rerun (chain 5).**
+      Measured -6.0% TTFT, but the control's own rep spread was 6.3% (349.7 vs
+      371.6 ms at ISL4096/C=8), i.e. the effect sits inside the noise. Root cause:
+      `--num-prompts` was `conc*4`, so ISL4096/C=8 got 32 prompts and ISL16384/C=4
+      got 16 -- a median TTFT over 16 samples is worthless. Fixed: floored at
+      max(8*conc, 64). Confounder worth keeping in mind: the TREATMENT arms were
+      stable to 0.06% at the same 32 prompts, so the control looks disturbed rather
+      than the cell being inherently unmeasurable.
+      Note the C=128 decode cells are unaffected -- `conc*4` gives 512 prompts
+      there, and those reps agreed to 0.1-0.3%. TPOT figures throughout are solid
+      (averaged over 256 output tokens/request); low-concurrency TTFT figures are
+      the weak ones.
+      **The original observation stands regardless:** The only *unquantized* gfx950 rows at
       our model_dim=4096 sit at inter_dim=384/E=128/topk=8, and what they encode is a
       block_m ladder (32 for token<=256, 64 at 512, 128 at 1024+, ksplit 0). At decode
       M is small so the default already picks 32 -- hence no decode effect -- but on
