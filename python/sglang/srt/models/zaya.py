@@ -78,7 +78,10 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import get_moe_a2a_backend
+from sglang.srt.layers.moe import (
+    get_moe_a2a_backend,
+    should_skip_post_experts_all_reduce,
+)
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -1845,10 +1848,19 @@ class ZayaBlock(nn.Module):
         MoE-tensor-parallel (TP) group. Under plain TP this is a single reduce
         over the global TP group; under EP / DP attention it stays scoped to the
         MoE groups and never spans the DP-attention replicas.
+
+        Both legs go through ``should_skip_post_experts_all_reduce``, which is what
+        makes an A2A backend safe here: an a2a combine already reduces partial
+        expert outputs back to the source rank, so reducing again double-counts
+        (and overflows bf16). ``dp_gather_required()`` separately drops the DP
+        gather once a2a is on, so without this guard the two changes would not be
+        consistent with each other.
         """
-        if self.ep_size > 1:
+        if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=False
+        ):
             experts_out = moe_expert_parallel_all_reduce(experts_out)
-        if self.tp_size > 1:
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(is_tp_path=True):
             experts_out = moe_tensor_model_parallel_all_reduce(experts_out)
         return experts_out
 
