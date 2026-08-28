@@ -87,8 +87,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
 
 logger = logging.getLogger(__name__)
@@ -2104,7 +2103,7 @@ class ZayaForCausalLM(nn.Module):
                 org_num_embeddings=config.vocab_size,
                 bias=bool(getattr(config, "lm_head_bias", False)),
                 quant_config=None,
-                use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                use_attn_tp_group=get_server_args().enable_dp_lm_head,
                 prefix=add_prefix("lm_head", prefix),
             )
             if config.tie_word_embeddings:

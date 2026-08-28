@@ -408,6 +408,57 @@ def add_linear_attn_kernel_backend_choices(choices):
     LINEAR_ATTN_KERNEL_BACKEND_CHOICES.extend(choices)
 
 
+def _max_conv_state_window(hf_config: Any) -> int:
+    """Widest conv sliding window over a hybrid model's conv states, or 0.
+
+    The window is the trailing axis of each entry of
+    ``mamba2_cache_params.shape.conv`` (``conv_kernel - 1`` for a depthwise
+    short conv; ZAYA1 carries two entries, ``total_padding`` and ``1``). It is
+    deliberately the ONLY thing read here, because it is the one part of the
+    conv-state shape that does not depend on the TP width -- only the channel
+    axis is sharded. That is what makes this safe to consult from a memoized
+    property that may be first touched either side of distributed init: the
+    answer cannot change once the process has a real ``attn_tp_size``.
+
+    Returns 0 when the model exposes no conv state, or when the shape cannot be
+    built yet; callers must treat 0 as "unknown" and fall back to the generic
+    chunk, never to a smaller one.
+    """
+    for cfg in (hf_config, getattr(hf_config, "text_config", None)):
+        if cfg is None:
+            continue
+        try:
+            params = getattr(cfg, "mamba2_cache_params", None)
+        except (AttributeError, AssertionError, RuntimeError, ValueError):
+            continue
+        conv_shapes = getattr(getattr(params, "shape", None), "conv", None)
+        if conv_shapes:
+            return max(int(shape[-1]) for shape in conv_shapes)
+    return 0
+
+
+def _short_conv_cache_chunk_size(hf_config: Any) -> int:
+    """Radix caching granularity for a model with no chunked recurrence.
+
+    A short-conv model (ZAYA1 CCA, LFM2) reports ``mamba_chunk_size == 1``,
+    which is honest about the model -- there is no chunked scan -- but says
+    nothing about how often the radix cache should checkpoint state. Taking it
+    as the caching granularity makes every single token a caching point, which
+    (a) lets the tree adopt a neighbour's state at a one-token shared prefix
+    and (b) is below the conv window, so a checkpoint cannot even be built.
+
+    Use the generic FLA chunk instead, raised to clear the widest conv window:
+    the extend-side snapshot gathers ``window`` input rows ending at the
+    aligned position, so the granularity must exceed the window. Round the
+    floor up to a whole number of ``FLA_CHUNK_SIZE`` so the result keeps
+    dividing (or being divided by) every page size in use, which the caller's
+    divisibility assert requires.
+    """
+    floor = _max_conv_state_window(hf_config) + 1
+    num_chunks = max(1, -(-floor // FLA_CHUNK_SIZE))
+    return FLA_CHUNK_SIZE * num_chunks
+
+
 @dataclasses.dataclass
 class ServerArgs:
     """Server-wide configuration for SGLang.
@@ -8270,15 +8321,33 @@ class ServerArgs:
 
     @property
     def mamba_cache_chunk_size(self) -> int:
-        # For mamba cache with extra buffer, the chunk size is the max of FLA_CHUNK_SIZE
-        # (or mamba_chunk_size if it is defined in the model's config) and page_size.
-        # It is used to determine the caching point in a sequence during prefill.
+        """Radix caching-point granularity for hybrid linear-attention models.
+
+        This is the *caching* chunk: how often a prefill may checkpoint the
+        per-request state, and therefore at what boundary a cached prefix may
+        be trimmed. It is NOT the model's chunk-scan length, even though for an
+        SSM the two coincide -- a scan checkpoints at chunk boundaries anyway,
+        so reusing that length costs nothing.
+
+        For a conv-only model the two come apart. ZAYA1 and LFM2 report
+        ``mamba_chunk_size == 1`` because they have no chunked recurrence at
+        all, which is honest about the model but useless as a caching
+        granularity, and below their conv window besides. Those take the
+        short-conv derivation instead; every model with a real scan
+        (``mamba_chunk_size > 1``) and every model that declares none
+        (defaulting to ``FLA_CHUNK_SIZE``) keeps the historical
+        ``max(scan_chunk, page_size)`` exactly.
+        """
         if not hasattr(self, "_mamba_cache_chunk_size"):
             from sglang.srt.arg_groups.overrides import resolved_view
 
             hf_config = self.get_model_config().hf_config
-            chunk_size = getattr(hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE)
+            scan_chunk_size = getattr(hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE)
             page_size = resolved_view(self).page_size
+            if scan_chunk_size > 1:
+                chunk_size = scan_chunk_size
+            else:
+                chunk_size = _short_conv_cache_chunk_size(hf_config)
             assert (
                 max(chunk_size, page_size) % min(chunk_size, page_size) == 0
             ), f"For SSM models, either chunk_size or page_size must be divisible by the other, got {chunk_size=}, {page_size=}"

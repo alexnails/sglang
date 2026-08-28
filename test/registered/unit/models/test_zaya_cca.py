@@ -1717,6 +1717,190 @@ class TestShortConvTrackStateGuards(CustomTestCase):
             )
 
 
+class TestShortConvCacheChunkSize(CustomTestCase):
+    """``mamba_cache_chunk_size`` must not be the model's scan length.
+
+    Two different quantities share the word "chunk".
+    ``hf_config.mamba_chunk_size`` is the SSM chunk-scan length; ZAYA1 and LFM2
+    honestly report ``1`` because they have no chunked recurrence at all.
+    ``ServerArgs.mamba_cache_chunk_size`` is the radix caching-point
+    granularity -- how often a prefill checkpoints state and at what boundary a
+    cached prefix may be trimmed. Taking the first as the second gave a
+    granularity of 1, which is below ZAYA1's conv window and made
+    ``ShortConvAttnBackend`` refuse to start.
+    """
+
+    @staticmethod
+    def _lfm2_config():
+        from sglang.srt.configs.lfm2 import Lfm2Config
+
+        return Lfm2Config(
+            hidden_size=16,
+            num_hidden_layers=4,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            conv_L_cache=3,
+            layer_types=["conv", "full_attention", "conv", "full_attention"],
+        )
+
+    def test_zaya_window_is_the_two_conv_time_constants(self):
+        # The window is (cca_time0 - 1) + (cca_time1 - 1) for conv[0] and 1 for
+        # conv[1] -- a pure function of the conv time constants, with no TP term
+        # (only the channel axis shards). That is what lets the memoized
+        # property read it from either side of distributed init.
+        from sglang.srt.server_args import _max_conv_state_window
+
+        config = _make_tiny_config()
+        expected = (config.cca_time0 - 1) + (config.cca_time1 - 1)
+        self.assertEqual(_max_conv_state_window(config), expected)
+        self.assertEqual(expected, 2)
+
+    def test_conv_window_axis_is_tp_invariant(self):
+        # Direct proof of the property the memoization relies on: sharding
+        # moves the channel axis and leaves the window axis alone.
+        from sglang.srt.configs.mamba_utils import Mamba2StateShape
+
+        shapes = [
+            Mamba2StateShape.create(
+                tp_world_size=tp,
+                intermediate_size=64,
+                n_groups=1,
+                num_heads=tp,
+                head_dim=64,
+                state_size=0,
+                conv_kernel=4,
+            )
+            for tp in (1, 2, 4)
+        ]
+        windows = {s.conv[0][-1] for s in shapes}
+        channels = {s.conv[0][0] for s in shapes}
+        self.assertEqual(windows, {3})
+        self.assertEqual(len(channels), 3)
+
+    def test_zaya_gets_the_generic_chunk_not_its_scan_length(self):
+        from sglang.srt.server_args import (
+            FLA_CHUNK_SIZE,
+            _short_conv_cache_chunk_size,
+        )
+
+        config = _make_tiny_config()
+        self.assertEqual(config.mamba_chunk_size, 1)
+        self.assertEqual(_short_conv_cache_chunk_size(config), FLA_CHUNK_SIZE)
+
+    def test_lfm2_hits_the_same_wall_and_the_same_fix(self):
+        # LFM2 is on no_buffer today, so this never fires -- but its config
+        # reports mamba_chunk_size == 1 with a conv window of conv_L_cache - 1,
+        # exactly ZAYA1's shape, so promoting it would have hit the identical
+        # assertion. The derivation cures both.
+        from sglang.srt.server_args import (
+            FLA_CHUNK_SIZE,
+            _max_conv_state_window,
+            _short_conv_cache_chunk_size,
+        )
+
+        config = self._lfm2_config()
+        self.assertEqual(config.mamba_chunk_size, 1)
+        self.assertEqual(_max_conv_state_window(config), config.conv_L_cache - 1)
+        self.assertEqual(_short_conv_cache_chunk_size(config), FLA_CHUNK_SIZE)
+
+    def test_wide_window_rounds_up_and_stays_page_divisible(self):
+        # A window at or above the generic chunk raises the granularity, but to
+        # a whole number of FLA_CHUNK_SIZE so the caller's
+        # max(chunk, page) % min(chunk, page) assert still holds for every page
+        # size in use.
+        from sglang.srt.server_args import (
+            FLA_CHUNK_SIZE,
+            _short_conv_cache_chunk_size,
+        )
+
+        wide = SimpleNamespace(
+            mamba_chunk_size=1,
+            mamba2_cache_params=SimpleNamespace(
+                shape=SimpleNamespace(conv=[(8, FLA_CHUNK_SIZE + 36), (4, 1)])
+            ),
+        )
+        chunk = _short_conv_cache_chunk_size(wide)
+        self.assertEqual(chunk, 2 * FLA_CHUNK_SIZE)
+        self.assertGreater(chunk, FLA_CHUNK_SIZE + 36)
+        for page_size in (1, 16, 32, 64, 128):
+            self.assertEqual(max(chunk, page_size) % min(chunk, page_size), 0)
+
+    def test_unknown_conv_shape_falls_back_up_never_down(self):
+        # An unreadable shape must not silently produce a granularity below the
+        # generic chunk; the backend guard is then the thing that fails loudly.
+        from sglang.srt.server_args import (
+            FLA_CHUNK_SIZE,
+            _max_conv_state_window,
+            _short_conv_cache_chunk_size,
+        )
+
+        bare = SimpleNamespace(mamba_chunk_size=1)
+        self.assertEqual(_max_conv_state_window(bare), 0)
+        self.assertEqual(_short_conv_cache_chunk_size(bare), FLA_CHUNK_SIZE)
+
+        class _Exploding:
+            mamba_chunk_size = 1
+
+            @property
+            def mamba2_cache_params(self):
+                raise AssertionError("tp size not divisible")
+
+        self.assertEqual(_max_conv_state_window(_Exploding()), 0)
+        self.assertEqual(_short_conv_cache_chunk_size(_Exploding()), FLA_CHUNK_SIZE)
+
+    def test_multimodal_wrapper_window_is_found_via_text_config(self):
+        from sglang.srt.server_args import _max_conv_state_window
+
+        inner = self._lfm2_config()
+        wrapper = SimpleNamespace(mamba_chunk_size=1, text_config=inner)
+        self.assertEqual(_max_conv_state_window(wrapper), inner.conv_L_cache - 1)
+
+    def test_ssm_models_keep_the_historical_derivation(self):
+        # Only the mamba_chunk_size <= 1 branch changed. A real scan length, and
+        # the FLA_CHUNK_SIZE default for a config that declares none, must both
+        # go through max(scan_chunk, page_size) untouched -- so the short-conv
+        # helper is never consulted for them.
+        from sglang.srt.server_args import FLA_CHUNK_SIZE
+
+        def resolve(hf_config, page_size):
+            scan = getattr(hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE)
+            self.assertGreater(scan, 1)  # takes the untouched branch
+            return max(scan, page_size)
+
+        self.assertEqual(resolve(SimpleNamespace(mamba_chunk_size=256), 1), 256)
+        self.assertEqual(resolve(SimpleNamespace(mamba_chunk_size=256), 128), 256)
+        self.assertEqual(resolve(SimpleNamespace(), 1), FLA_CHUNK_SIZE)
+        self.assertEqual(resolve(SimpleNamespace(), 128), 128)
+        # Inkling already worked around this by pinning 64 in its config; the
+        # new branch must leave that answer alone.
+        self.assertEqual(resolve(SimpleNamespace(mamba_chunk_size=64), 1), 64)
+
+    def test_derived_chunk_satisfies_the_backend_guard(self):
+        # The regression this fixes end to end: with the old chunk of 1 the
+        # short-conv backend refused to build its track state; with the derived
+        # chunk it builds.
+        from sglang.srt.server_args import _short_conv_cache_chunk_size
+
+        config = _make_tiny_config()
+        derived = _short_conv_cache_chunk_size(config)
+
+        with self.assertRaises(AssertionError):
+            _TrackHarness(chunk_size=1, windows=(2, 1))
+        # mamba_track_interval defaults to 256, comfortably above the derived
+        # 64 -- the backend's other precondition.
+        harness = _TrackHarness(chunk_size=derived, track_interval=256, windows=(2, 1))
+        self.assertEqual(len(harness.backend._track_pairs), 1)
+        self.assertGreaterEqual(256, derived)
+
+    def test_guard_names_the_minimum_viable_chunk(self):
+        # The failure an operator sees has to say what value would work.
+        with self.assertRaises(AssertionError) as caught:
+            _TrackHarness(chunk_size=1, windows=(2, 1))
+        message = str(caught.exception)
+        self.assertIn("minimum viable chunk here is 3", message)
+        self.assertIn("mamba_cache_chunk_size", message)
+
+
 def _make_swa_config(
     *,
     num_hidden_layers: int,
