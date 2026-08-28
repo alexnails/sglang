@@ -68,6 +68,7 @@ CUDA-JIT, so it runs on ROCm -- ZAYA1's reference deployment is MI355X.
 from __future__ import annotations
 
 import functools
+from typing import Optional
 
 import torch
 import triton
@@ -205,6 +206,84 @@ def _router_tail_kernel(
         tl.store(skip_ids_ptr + safe_t, idx.to(tl.int32), mask=row_ok)
 
 
+def _same_device(tensor: torch.Tensor, device: torch.device) -> bool:
+    """Whether ``tensor`` sits on ``device``, treating a bare type as a wildcard.
+
+    ``torch.device("cuda") != torch.device("cuda:0")`` -- the index is part of
+    the identity, so a plain equality check against a hand-written un-indexed
+    device fails for every real tensor. That has cost this campaign hardware
+    round trips twice: because these gates decline by *falling back*, the only
+    symptom is baseline-identical numbers. An un-indexed reference means "any
+    device of this type", so honor that.
+    """
+    got = tensor.device
+    if got.type != device.type:
+        return False
+    return device.index is None or got.index == device.index
+
+
+def decline_reason(
+    logits: torch.Tensor,
+    balancing_biases: torch.Tensor,
+    *,
+    num_experts: int,
+    max_expert_id: int,
+    topk: int,
+    out_dtype: torch.dtype,
+) -> Optional[str]:
+    """Why the fused tail cannot serve these inputs, or ``None`` if it can.
+
+    Restricted to top-1 routing, which is what ZAYA1 ships; wider top-k needs
+    the cumulative-skip rewrite in ``ZayaRouter.forward``. Also requires the
+    expert axis to fit one Triton block, row-major logits with a unit innermost
+    stride, and a float bias vector sized to the expert count.
+
+    Returns the *reason* rather than a bare bool because every decline here is a
+    silent fallback: the numbers stay right and only the launch count moves, so
+    a precondition that quietly stops matching reads as a clean null result in
+    an A/B. The string feeds the once-per-outcome fusion log and the tests'
+    assertion messages, and is built only on decline.
+    """
+    if topk != 1:
+        return f"topk {topk} != 1"
+    if num_experts <= 0 or num_experts > _MAX_EXPERTS:
+        return f"num_experts {num_experts} outside 1..{_MAX_EXPERTS}"
+    if not (0 <= max_expert_id < num_experts):
+        return f"max_expert_id {max_expert_id} outside 0..{num_experts - 1}"
+    if logits.ndim != 2 or logits.shape[1] != num_experts:
+        return f"logits {tuple(logits.shape)} is not [T, {num_experts}]"
+    if logits.stride(-1) != 1:
+        return "logits innermost stride != 1"
+    if balancing_biases.numel() != num_experts:
+        return f"balancing_biases has {balancing_biases.numel()} of {num_experts}"
+    if not balancing_biases.is_contiguous():
+        return "balancing_biases not contiguous"
+    # The bias vector is fp32 in the checkpoint and the kernel widens it to fp32
+    # regardless, so any float dtype is served -- and served identically to the
+    # torch chain, which also promotes before adding. Accepting bf16 here
+    # matters: a stray ``model.to(dtype)`` would otherwise drop the whole router
+    # onto the fallback with no error and no clue why decode got slower.
+    if balancing_biases.dtype not in _FLOAT_DTYPES:
+        return f"balancing_biases dtype {balancing_biases.dtype}"
+    if logits.dtype not in _FLOAT_DTYPES:
+        return f"logits dtype {logits.dtype}"
+    if out_dtype not in _FLOAT_DTYPES:
+        return f"out_dtype {out_dtype}"
+    # Device last, deliberately: everything above is a property of the tensors
+    # rather than of where they live, so checking it first is what lets a
+    # CPU-only test reach every structural branch.
+    if not logits.is_cuda:
+        return f"logits on {logits.device}"
+    if not balancing_biases.is_cuda:
+        return f"balancing_biases on {balancing_biases.device}"
+    if not _same_device(balancing_biases, logits.device):
+        return (
+            f"balancing_biases on {balancing_biases.device}, "
+            f"logits on {logits.device}"
+        )
+    return None
+
+
 def covered(
     logits: torch.Tensor,
     balancing_biases: torch.Tensor,
@@ -214,37 +293,18 @@ def covered(
     topk: int,
     out_dtype: torch.dtype,
 ) -> bool:
-    """Whether the fused tail can serve these inputs.
-
-    Restricted to top-1 routing, which is what ZAYA1 ships; wider top-k needs
-    the cumulative-skip rewrite in ``ZayaRouter.forward`` and falls back. Also
-    requires the expert axis to fit one Triton block, row-major logits with a
-    unit innermost stride, and an fp32 bias vector sized to the expert count.
-    """
-    if not (logits.is_cuda and balancing_biases.is_cuda):
-        return False
-    if topk != 1:
-        return False
-    if num_experts <= 0 or num_experts > _MAX_EXPERTS:
-        return False
-    if not (0 <= max_expert_id < num_experts):
-        return False
-    if logits.ndim != 2 or logits.shape[1] != num_experts:
-        return False
-    if logits.stride(-1) != 1:
-        return False
-    if balancing_biases.numel() != num_experts:
-        return False
-    if not balancing_biases.is_contiguous():
-        return False
-    # The bias vector is fp32 in the checkpoint and the kernel widens it to fp32
-    # regardless, so any float dtype is served -- and served identically to the
-    # torch chain, which also promotes before adding. Accepting bf16 here
-    # matters: a stray ``model.to(dtype)`` would otherwise drop the whole router
-    # onto the fallback with no error and no clue why decode got slower.
-    if balancing_biases.dtype not in _FLOAT_DTYPES:
-        return False
-    return logits.dtype in _FLOAT_DTYPES and out_dtype in _FLOAT_DTYPES
+    """Whether the fused tail can serve these inputs. See the reason variant."""
+    return (
+        decline_reason(
+            logits,
+            balancing_biases,
+            num_experts=num_experts,
+            max_expert_id=max_expert_id,
+            topk=topk,
+            out_dtype=out_dtype,
+        )
+        is None
+    )
 
 
 def router_tail(

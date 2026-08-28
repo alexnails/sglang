@@ -41,8 +41,26 @@ trade when the acceptance bar is "the argmax downstream picks the same expert".
 The ``K`` axis of each dense stage is split in halves and the weight tiles are
 loaded one at a time. That is deliberate: a single ``tl.dot`` against the whole
 ``[256, 256]`` operand needs 128 KiB of LDS to stage, which does not fit on
-gfx942 and crowds out occupancy even on gfx950's 160 KiB. Two sequential
-``[128, 128]`` tiles reuse one 32 KiB scratch.
+gfx942 and crowds out occupancy even on gfx950's 160 KiB.
+
+LDS budget at the shipping shape (``D = 256``, so ``HALF = 128``), since this is
+the part most likely not to survive contact with the compiler:
+
+===========================  =========================  ========
+tile                         shape                      bf16
+===========================  =========================  ========
+dot operand B (per half)     ``[128, 128]``             32 KiB
+dot operand A                ``[BLOCK_M=32, 128]``       8 KiB
+stage-3 operand B            ``[128, NPAD=32]``          8 KiB
+===========================  =========================  ========
+
+The two B halves are written to the same variable and consumed immediately, so
+liveness should let them share one 32 KiB scratch: peak ~40 KiB. If the compiler
+keeps both live instead, it is ~72 KiB -- still inside gfx950's 160 KiB, over
+gfx942's 64 KiB. gfx950 is the target, so that is an accepted risk rather than a
+designed-around one, and ``router_mlp(..., block_m=...)`` is the lever if it
+turns out to be tight: BLOCK_M only sizes the A tile and the accumulator, so
+halving it costs occupancy, not correctness.
 
 Follows ``kda_fused_decode`` / ``zaya_mod`` / ``zaya_router_tail``: a
 ``covered()`` predicate gates supported inputs and the caller falls back to the
@@ -58,7 +76,10 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.moe.zaya_router_tail import debug_asserts_enabled
+from sglang.kernels.ops.moe.zaya_router_tail import (
+    _same_device,
+    debug_asserts_enabled,
+)
 
 # The K split is two halves, so a stage's dot operand is [D/2, D/2]. Capping D at
 # 256 caps that at [128, 128] -- 32 KiB in bf16, which stages comfortably in LDS
@@ -208,6 +229,79 @@ def _router_mlp_kernel(
     )
 
 
+def decline_reason(
+    x: torch.Tensor,
+    w1: torch.Tensor,
+    b1: Optional[torch.Tensor],
+    w2: torch.Tensor,
+    b2: Optional[torch.Tensor],
+    w3: torch.Tensor,
+    *,
+    num_experts: int,
+) -> Optional[str]:
+    """Why the fused router MLP cannot serve these tensors, or ``None``.
+
+    Note what this canNOT check: that the two activations between the stages are
+    the erf GELU. That is a property of the module graph, not of any tensor, so
+    ``fusable_router_mlp`` checks it once at construction and refuses to call in
+    here otherwise.
+
+    Returns the reason rather than a bool for the same purpose as the tail's:
+    a decline costs four launches and changes nothing else, so without a name
+    for the gate that said no it is indistinguishable from the fusion working.
+    """
+    named = (("x", x), ("w1", w1), ("b1", b1), ("w2", w2), ("b2", b2), ("w3", w3))
+    for name, t in named:
+        if t is None:
+            return f"{name} is None"
+    # Device last, deliberately. Everything above is a property of the tensors
+    # rather than of where they live, so ordering it first is what lets a
+    # CPU-only test reach every structural branch -- and a shape or dtype
+    # mismatch is a configuration bug worth naming, where "on cpu" is not.
+    for name, t in named:
+        if t.dtype not in _FUSED_DTYPES:
+            return f"{name} dtype {t.dtype}"
+    for name, t in (("x", x), ("w1", w1), ("w2", w2), ("w3", w3)):
+        if t.ndim != 2:
+            return f"{name} is {t.ndim}-D, not 2-D"
+
+    expansion = x.shape[1]
+    if expansion % 2 != 0 or expansion > _MAX_EXPANSION:
+        return f"expansion {expansion} is odd or above {_MAX_EXPANSION}"
+    half = expansion // 2
+    if half < _MIN_DOT_DIM:
+        return f"K-split half {half} below the tl.dot minimum {_MIN_DOT_DIM}"
+    if num_experts <= 0 or num_experts > _MAX_EXPANSION:
+        return f"num_experts {num_experts} outside 1..{_MAX_EXPANSION}"
+
+    if tuple(w1.shape) != (expansion, expansion):
+        return f"w1 {tuple(w1.shape)} is not [{expansion}, {expansion}]"
+    if tuple(w2.shape) != (expansion, expansion):
+        return f"w2 {tuple(w2.shape)} is not [{expansion}, {expansion}]"
+    if tuple(w3.shape) != (num_experts, expansion):
+        return f"w3 {tuple(w3.shape)} is not [{num_experts}, {expansion}]"
+    if tuple(b1.shape) != (expansion,):
+        return f"b1 {tuple(b1.shape)} is not [{expansion}]"
+    if tuple(b2.shape) != (expansion,):
+        return f"b2 {tuple(b2.shape)} is not [{expansion}]"
+    if not b1.is_contiguous():
+        return "b1 not contiguous"
+    if not b2.is_contiguous():
+        return "b2 not contiguous"
+    # The kernel indexes both axes of each weight explicitly, so an arbitrary
+    # stride pair is fine as long as the innermost element step is unit -- which
+    # is what makes the k-major dot-operand load coalesce.
+    for name, t in (("x", x), ("w1", w1), ("w2", w2), ("w3", w3)):
+        if t.stride(-1) != 1:
+            return f"{name} innermost stride != 1"
+    for name, t in named:
+        if not t.is_cuda:
+            return f"{name} on {t.device}"
+        if not _same_device(t, x.device):
+            return f"{name} on {t.device}, x on {x.device}"
+    return None
+
+
 def covered(
     x: torch.Tensor,
     w1: torch.Tensor,
@@ -218,45 +312,8 @@ def covered(
     *,
     num_experts: int,
 ) -> bool:
-    """Whether the fused router MLP can serve these tensors.
-
-    Note what this canNOT check: that the two activations between the stages are
-    the erf GELU. That is a property of the module graph, so
-    ``ZayaRouter.__init__`` checks it once and refuses to call in here otherwise.
-    """
-    tensors = (x, w1, b1, w2, b2, w3)
-    if any(t is None for t in tensors):
-        return False
-    if not all(t.is_cuda for t in tensors):
-        return False
-    if not all(t.dtype in _FUSED_DTYPES for t in tensors):
-        return False
-    if x.ndim != 2 or w1.ndim != 2 or w2.ndim != 2 or w3.ndim != 2:
-        return False
-
-    expansion = x.shape[1]
-    if expansion % 2 != 0 or expansion > _MAX_EXPANSION:
-        return False
-    half = expansion // 2
-    if half < _MIN_DOT_DIM:
-        return False
-    if num_experts <= 0 or num_experts > _MAX_EXPANSION:
-        return False
-
-    if tuple(w1.shape) != (expansion, expansion):
-        return False
-    if tuple(w2.shape) != (expansion, expansion):
-        return False
-    if tuple(w3.shape) != (num_experts, expansion):
-        return False
-    if b1.shape != (expansion,) or b2.shape != (expansion,):
-        return False
-    if not (b1.is_contiguous() and b2.is_contiguous()):
-        return False
-    # The kernel indexes both axes of each weight explicitly, so an arbitrary
-    # stride pair is fine as long as the innermost element step is unit -- which
-    # is what makes the k-major dot-operand load coalesce.
-    return all(t.stride(-1) == 1 for t in (x, w1, w2, w3))
+    """Whether the fused router MLP can serve these. See the reason variant."""
+    return decline_reason(x, w1, b1, w2, b2, w3, num_experts=num_experts) is None
 
 
 def router_mlp(

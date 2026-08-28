@@ -5629,6 +5629,32 @@ class TestZayaRouterTailKernel(_SyncEachTest, CustomTestCase):
             "building a ZayaRouter must not initialize torch.distributed",
         )
 
+    def test_same_device_treats_a_bare_type_as_a_wildcard(self):
+        """CPU-checkable: ``torch.device("cuda") != torch.device("cuda:0")``.
+
+        Regression. The index is part of a device's identity, so a plain
+        equality check against a hand-written un-indexed device is False for
+        every real tensor. Because these gates decline by falling back, that
+        would turn the whole router fusion off on the box while every number
+        stayed identical -- the exact failure mode this campaign has now paid
+        for more than once. An un-indexed reference means "any device of this
+        type".
+        """
+        from sglang.kernels.ops.moe import zaya_router_tail as kernel
+
+        cpu = torch.zeros(2)
+        self.assertTrue(kernel._same_device(cpu, torch.device("cpu")))
+        self.assertFalse(kernel._same_device(cpu, torch.device("cuda")))
+        # The wildcard rule, spelled out against the raw equality it replaces.
+        self.assertNotEqual(torch.device("cuda"), torch.device("cuda:0"))
+        if torch.cuda.is_available():
+            gpu = torch.zeros(2, device="cuda")
+            self.assertEqual(gpu.device, torch.device("cuda:0"))
+            self.assertTrue(kernel._same_device(gpu, torch.device("cuda")))
+            self.assertTrue(kernel._same_device(gpu, gpu.device))
+            self.assertFalse(kernel._same_device(gpu, torch.device("cpu")))
+            self.assertFalse(kernel._same_device(gpu, torch.device("cuda:1")))
+
     def test_block_padding_is_never_narrower_than_the_minimum(self):
         """CPU-checkable: the launch never emits a sub-16-wide column block.
 
@@ -5657,6 +5683,265 @@ class TestZayaRouterTailKernel(_SyncEachTest, CustomTestCase):
                 torch.manual_seed(num_experts)
                 logits = torch.randn(3, num_experts, device="cuda")
                 self._check(logits, self._biases(num_experts), num_experts - 2)
+
+
+class TestZayaRouterMlpKernel(_SyncEachTest, CustomTestCase):
+    """``zaya_router_mlp`` on its own, at ZAYA1's real width.
+
+    This class exists because the MLP kernel had never been compiled: its
+    ``decline_reason`` rejects a K-split half below 16, so the tiny 8-wide
+    routers the rest of this file builds never reached it, and every run that
+    would have reached it through the model path aborted first for unrelated
+    reasons. So: raw tensors only, no ZayaRouter, no sglang layer of any kind --
+    both so the kernel gets compiled independently of whatever the model path is
+    doing, and because handing an sglang fused op a CPU tensor on a ROCm host
+    drives a device kernel over host pointers.
+
+    The shipping shape is ``mlp_expansion=256`` -> halves of 128, and 25 experts
+    -> a padded output axis of 32. LDS budget at that shape, which is the thing
+    most likely not to survive contact: the B tile of each ``tl.dot`` is
+    ``[128, 128]`` bf16 = 32 KiB and the A tile is ``[BLOCK_M, 128]`` bf16 = 8
+    KiB at BLOCK_M=32, loaded one at a time so the two halves share one scratch.
+    Peak ~40 KiB against 160 KiB on gfx950 and 64 KiB on gfx942.
+    """
+
+    EXPANSION = 256
+    NUM_EXPERTS = 25
+
+    def _weights(self, expansion, num_experts, dtype=torch.bfloat16, seed=0):
+        """The five tensors, shaped exactly as ReplicatedLinear stores them."""
+        torch.manual_seed(seed)
+        std = 1.0 / (expansion**0.5)
+
+        def mk(*shape):
+            return (torch.randn(*shape, device="cuda") * std).to(dtype)
+
+        return (
+            mk(expansion, expansion),  # w1 [out, in]
+            mk(expansion),  # b1
+            mk(expansion, expansion),  # w2
+            mk(expansion),  # b2
+            mk(num_experts, expansion),  # w3, no bias
+        )
+
+    def _reference(self, x, w1, b1, w2, b2, w3):
+        """Linear / erf-GELU / Linear / erf-GELU / Linear, in plain torch.
+
+        F.linear and F.gelu are exactly the ops the nn.Sequential runs, so this
+        reproduces the rounding the kernel is written to match: one round per
+        linear with the bias folded in, one more after each activation.
+        ``approximate`` is left at its default 'none' deliberately -- the tanh
+        form differs by ~5e-4 and is this kernel's one silent failure mode.
+        """
+        fn = torch.nn.functional
+        h = fn.gelu(fn.linear(x, w1, b1))
+        h = fn.gelu(fn.linear(h, w2, b2))
+        return fn.linear(h, w3)
+
+    def _check(self, x, w1, b1, w2, b2, w3, num_experts):
+        from sglang.kernels.ops.moe import zaya_router_mlp as kernel
+
+        reason = kernel.decline_reason(x, w1, b1, w2, b2, w3, num_experts=num_experts)
+        self.assertIsNone(reason, f"the fused path must be under test, got: {reason}")
+        got = kernel.router_mlp(x, w1, b1, w2, b2, w3, num_experts=num_experts)
+        # Sync on the launch itself so a fault names this shape, not whatever
+        # runs next.
+        torch.cuda.synchronize()
+        ref = self._reference(x, w1, b1, w2, b2, w3)
+
+        self.assertEqual(got.shape, ref.shape)
+        self.assertEqual(got.dtype, ref.dtype)
+        self.assertEqual(got.device, ref.device)
+        # Two bf16 GEMM chains whose K reductions run in different orders, so
+        # close but not identical. bf16 carries ~3 decimal digits.
+        torch.testing.assert_close(got.float(), ref.float(), rtol=3e-2, atol=3e-2)
+        return got
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused MLP is a GPU kernel")
+    def test_compiles_and_matches_at_the_real_shape(self):
+        """The headline: 256-wide, 25 experts, every token count that matters."""
+        w1, b1, w2, b2, w3 = self._weights(self.EXPANSION, self.NUM_EXPERTS, seed=7)
+        for num_tokens in (1, 2, 31, 32, 33, 64, 129, 1024):
+            with self.subTest(tokens=num_tokens):
+                torch.manual_seed(num_tokens)
+                x = (
+                    torch.randn(num_tokens, self.EXPANSION, device="cuda") * 0.5
+                ).bfloat16()
+                self._check(x, w1, b1, w2, b2, w3, self.NUM_EXPERTS)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused MLP is a GPU kernel")
+    def test_matches_across_widths_and_expert_counts(self):
+        """The other shapes the K split and the padded output axis can take."""
+        for expansion, num_experts in ((32, 5), (32, 16), (64, 25), (128, 24)):
+            with self.subTest(d=expansion, e=num_experts):
+                w1, b1, w2, b2, w3 = self._weights(
+                    expansion, num_experts, seed=expansion + num_experts
+                )
+                x = (torch.randn(17, expansion, device="cuda") * 0.5).bfloat16()
+                self._check(x, w1, b1, w2, b2, w3, num_experts)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused MLP is a GPU kernel")
+    def test_fp16_is_served_too(self):
+        """fp16 shares the bf16 path; fp32 is declined, not silently downcast."""
+        w1, b1, w2, b2, w3 = self._weights(
+            64, self.NUM_EXPERTS, dtype=torch.float16, seed=3
+        )
+        x = (torch.randn(9, 64, device="cuda") * 0.5).half()
+        self._check(x, w1, b1, w2, b2, w3, self.NUM_EXPERTS)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused MLP is a GPU kernel")
+    def test_padded_expert_columns_cannot_influence_the_result(self):
+        """25 experts through a 32-wide output tile: 7 padded columns.
+
+        w3 is the smallest of the three weights, so a padded column lane that
+        escaped its mask reads past it. Poison a 32-row backing buffer and hand
+        the kernel the 25-row view: the addresses are mapped, so a mask failure
+        is a wrong answer rather than a fault.
+        """
+        expansion = 64
+        w1, b1, w2, b2, _ = self._weights(expansion, self.NUM_EXPERTS, seed=11)
+        backing = torch.empty(32, expansion, device="cuda", dtype=torch.bfloat16)
+        backing[self.NUM_EXPERTS :] = _POISON
+        torch.manual_seed(11)
+        backing[: self.NUM_EXPERTS] = (
+            torch.randn(self.NUM_EXPERTS, expansion, device="cuda") * 0.1
+        ).bfloat16()
+        w3 = backing[: self.NUM_EXPERTS]
+        self.assertEqual(w3.stride(), (expansion, 1))
+        self.assertEqual(float(backing[self.NUM_EXPERTS, 0]), _POISON)
+
+        x = (torch.randn(6, expansion, device="cuda") * 0.5).bfloat16()
+        got_poisoned = self._check(x, w1, b1, w2, b2, w3, self.NUM_EXPERTS)
+        got_clean = self._check(x, w1, b1, w2, b2, w3.contiguous(), self.NUM_EXPERTS)
+        self.assertTrue(torch.equal(got_poisoned, got_clean))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused MLP is a GPU kernel")
+    def test_zero_tokens_is_a_no_op(self):
+        """Idle DP-attention forwards arrive with T == 0 and must not launch."""
+        from sglang.kernels.ops.moe import zaya_router_mlp as kernel
+
+        w1, b1, w2, b2, w3 = self._weights(32, 5, seed=1)
+        out = kernel.router_mlp(
+            torch.empty(0, 32, device="cuda", dtype=torch.bfloat16),
+            w1,
+            b1,
+            w2,
+            b2,
+            w3,
+            num_experts=5,
+        )
+        self.assertEqual(tuple(out.shape), (0, 5))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused MLP is a GPU kernel")
+    def test_erf_not_tanh_at_the_kernel_level(self):
+        """The activation flavour, measured through the kernel itself.
+
+        ``fusable_router_mlp`` refuses to fuse a tanh GELU, but nothing until now
+        checked which one the *kernel* computes. Drive the two references apart
+        with large-magnitude activations, where erf and tanh disagree most, and
+        pin that the kernel tracks erf.
+        """
+        expansion, num_experts = 64, 8
+        w1, b1, w2, b2, w3 = self._weights(expansion, num_experts, seed=5)
+        x = (torch.randn(32, expansion, device="cuda") * 3.0).bfloat16()
+        got = self._check(x, w1, b1, w2, b2, w3, num_experts)
+
+        fn = torch.nn.functional
+        tanh_ref = fn.gelu(fn.linear(x, w1, b1), approximate="tanh")
+        tanh_ref = fn.gelu(fn.linear(tanh_ref, w2, b2), approximate="tanh")
+        tanh_ref = fn.linear(tanh_ref, w3)
+        erf_gap = (got.float() - self._reference(x, w1, b1, w2, b2, w3).float()).abs()
+        tanh_gap = (got.float() - tanh_ref.float()).abs()
+        self.assertLess(
+            float(erf_gap.max()),
+            float(tanh_gap.max()),
+            "the kernel must track the erf GELU more closely than the tanh one",
+        )
+
+    def test_decline_reasons_name_the_failing_gate(self):
+        """CPU-checkable: every negative branch says which check refused.
+
+        These gates decline by falling back, so a precondition that stops
+        matching is invisible in the numbers. The reason string is the only
+        signal and it reaches the fusion log, so it has to be specific.
+        """
+        from sglang.kernels.ops.moe import zaya_router_mlp as kernel
+
+        d, e, dt = 32, 5, torch.bfloat16
+        x = torch.randn(6, d, dtype=dt)
+        w1 = torch.randn(d, d, dtype=dt)
+        w2 = torch.randn(d, d, dtype=dt)
+        w3 = torch.randn(e, d, dtype=dt)
+        b1 = torch.zeros(d, dtype=dt)
+        b2 = torch.zeros(d, dtype=dt)
+
+        def why(*args, num_experts=e):
+            return kernel.decline_reason(*args, num_experts=num_experts)
+
+        self.assertIn("on cpu", why(x, w1, b1, w2, b2, w3))
+        self.assertIn("b1 is None", why(x, w1, None, w2, b2, w3))
+        self.assertIn(
+            "dtype",
+            why(x.float(), w1.float(), b1.float(), w2.float(), b2.float(), w3.float()),
+        )
+        wide = 512
+        self.assertIn(
+            "above",
+            why(
+                torch.randn(6, wide, dtype=dt),
+                torch.randn(wide, wide, dtype=dt),
+                torch.zeros(wide, dtype=dt),
+                torch.randn(wide, wide, dtype=dt),
+                torch.zeros(wide, dtype=dt),
+                torch.randn(e, wide, dtype=dt),
+            ),
+        )
+        narrow = 30
+        self.assertIn(
+            "below the tl.dot minimum",
+            why(
+                torch.randn(6, narrow, dtype=dt),
+                torch.randn(narrow, narrow, dtype=dt),
+                torch.zeros(narrow, dtype=dt),
+                torch.randn(narrow, narrow, dtype=dt),
+                torch.zeros(narrow, dtype=dt),
+                torch.randn(e, narrow, dtype=dt),
+            ),
+        )
+        self.assertIn("w2", why(x, w1, b1, torch.randn(d, d + 2, dtype=dt), b2, w3))
+        self.assertIn("w3", why(x, w1, b1, w2, b2, w3, num_experts=e + 1))
+        self.assertIn("b1", why(x, w1, torch.zeros(d + 1, dtype=dt), w2, b2, w3))
+        self.assertIn(
+            "innermost stride",
+            why(torch.randn(d, 6, dtype=dt).t(), w1, b1, w2, b2, w3),
+        )
+
+    def test_real_shape_is_accepted_by_the_gate(self):
+        """CPU-checkable: ZAYA1's own shape must not be declined for its shape.
+
+        The gate rejects a K-split half below 16, which is exactly why the tiny
+        routers elsewhere in this file never reached the kernel. Pin that the
+        shipping width does reach it, so nobody narrows the bound and silently
+        turns the fusion off everywhere.
+        """
+        from sglang.kernels.ops.moe import zaya_router_mlp as kernel
+
+        d, e = self.EXPANSION, self.NUM_EXPERTS
+        dt = torch.bfloat16
+        reason = kernel.decline_reason(
+            torch.randn(4, d, dtype=dt),
+            torch.randn(d, d, dtype=dt),
+            torch.zeros(d, dtype=dt),
+            torch.randn(d, d, dtype=dt),
+            torch.zeros(d, dtype=dt),
+            torch.randn(e, d, dtype=dt),
+            num_experts=e,
+        )
+        # On CPU the only thing that may refuse it is the device check.
+        self.assertIn("on cpu", reason)
+        self.assertEqual(d // 2, 128)
+        self.assertGreaterEqual(d // 2, kernel._MIN_DOT_DIM)
+        self.assertLessEqual(d, kernel._MAX_EXPANSION)
 
 
 class TestZayaRouterFusedTail(_SyncEachTest, CustomTestCase):

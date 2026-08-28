@@ -2227,6 +2227,13 @@ class ZayaRouter(nn.Module):
         # rather than of the inputs.
         self.fused_router_mlp_ok = fusable_router_mlp(self.router_mlp)
 
+        # Fusion-log bookkeeping. ``_mlp_fusion_reason`` is written by
+        # ``_router_logits`` and read by ``_log_fusion`` on the same forward, so
+        # one line reports both gates; the initial value is what a router that
+        # has never run reports.
+        self._mlp_fusion_reason: Optional[str] = "no forward yet"
+        self._last_router_fusion_state: Optional[tuple] = None
+
         self.register_buffer(
             "balancing_biases",
             torch.zeros(self.num_experts, dtype=torch.float32),
@@ -2306,19 +2313,22 @@ class ZayaRouter(nn.Module):
         # ``.is_cuda`` is tested before the import rather than left to
         # ``covered()`` alone because the kernel module imports ``triton`` at
         # module scope, which a CPU-only environment need not have.
+        tail_reason = "not enabled"
         if logits.is_cuda and envs.SGLANG_OPT_ZAYA_FUSED_ROUTER.get():
             from sglang.kernels.ops.moe import zaya_router_tail as _tail
 
             # The clamp ceiling: ids above this are the MOD skip slot.
             max_expert_id = self.num_moe_experts - 1
-            if _tail.covered(
+            tail_reason = _tail.decline_reason(
                 logits,
                 self.balancing_biases,
                 num_experts=self.num_experts,
                 max_expert_id=max_expert_id,
                 topk=self.topk,
                 out_dtype=hidden_states.dtype,
-            ):
+            )
+            if tail_reason is None:
+                self._log_fusion(tail_reason)
                 moe_weight, moe_ids, route_prob, skip_ids = _tail.router_tail(
                     logits,
                     self.balancing_biases,
@@ -2335,8 +2345,38 @@ class ZayaRouter(nn.Module):
                     hidden_states_next=router_hidden_states_next,
                 )
 
+        self._log_fusion(tail_reason)
         return self._routing_reference(
             logits, hidden_states.dtype, router_hidden_states_next
+        )
+
+    def _log_fusion(self, tail_reason: Optional[str]) -> None:
+        """Log which router fusions took -- and why not -- once per outcome.
+
+        Both gates decline by *falling back*, so a precondition that stops
+        matching costs launches and nothing else. That is how this campaign
+        produced baseline-identical numbers three separate times that read as a
+        clean null result. Naming the gate that said no turns that into an
+        observation. Grep a run for ``mlp=True tail=True`` before trusting a
+        router A/B.
+
+        Cost on the hot path is a tuple compare per MoE layer; the message is
+        built only when the outcome changes, and ``_log_dataflow_decision``
+        dedupes across layers, so a uniform model logs one line, not sixty.
+        """
+        state = (self._mlp_fusion_reason, tail_reason)
+        if state == self._last_router_fusion_state:
+            return
+        self._last_router_fusion_state = state
+        mlp_reason = self._mlp_fusion_reason
+        detail = ""
+        if mlp_reason is not None:
+            detail += f" (mlp declined: {mlp_reason})"
+        if tail_reason is not None:
+            detail += f" (tail declined: {tail_reason})"
+        _log_dataflow_decision(
+            f"zaya router fusion: mlp={mlp_reason is None} "
+            f"tail={tail_reason is None}{detail}"
         )
 
     def _router_logits(self, hs_norm: torch.Tensor) -> torch.Tensor:
@@ -2348,12 +2388,15 @@ class ZayaRouter(nn.Module):
         is launch overhead, not bandwidth.
         """
         # ``.is_cuda`` gates the import as well as the dispatch: the kernel
-        # module imports ``triton`` at module scope.
-        if (
-            self.fused_router_mlp_ok
-            and hs_norm.is_cuda
-            and envs.SGLANG_OPT_ZAYA_FUSED_ROUTER.get()
-        ):
+        # module imports ``triton`` at module scope. The reason is stashed rather
+        # than returned because the tail's log line reports both gates together.
+        if not envs.SGLANG_OPT_ZAYA_FUSED_ROUTER.get():
+            self._mlp_fusion_reason = "not enabled"
+        elif not self.fused_router_mlp_ok:
+            self._mlp_fusion_reason = "router_mlp is not Linear/erf-GELU x3"
+        elif not hs_norm.is_cuda:
+            self._mlp_fusion_reason = f"hs_norm on {hs_norm.device}"
+        else:
             from sglang.kernels.ops.moe import zaya_router_mlp as _mlp
 
             first, second, last = (self.router_mlp[i] for i in (0, 2, 4))
@@ -2365,7 +2408,10 @@ class ZayaRouter(nn.Module):
                 second.bias,
                 last.weight,
             )
-            if _mlp.covered(*operands, num_experts=self.num_experts):
+            self._mlp_fusion_reason = _mlp.decline_reason(
+                *operands, num_experts=self.num_experts
+            )
+            if self._mlp_fusion_reason is None:
                 return _mlp.router_mlp(*operands, num_experts=self.num_experts)
 
         return self._router_logits_reference(hs_norm)
