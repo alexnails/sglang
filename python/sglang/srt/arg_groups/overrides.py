@@ -1202,6 +1202,12 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "GraniteMoeHybridForCausalLM",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
+        # Short-conv hybrid served by ShortConvAttnBackend, which implements
+        # the track snapshot for both of ZAYA1's conv entries (conv_qk left
+        # padding + prev_hs). LFM2 rides the same backend and the same code
+        # path, but is deliberately NOT listed: it has not been validated on
+        # hardware, and no_buffer is a safe default for it.
+        "ZayaForCausalLM",
     }
 )
 

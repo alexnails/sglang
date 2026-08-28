@@ -1125,7 +1125,8 @@ class CCA(nn.Module):
         # prefix mask, cuda-graph buffers); CCA runs its own two-stage grouped
         # conv against it and gets back the conv output + val_proj2 input, with
         # the conv_state / prev_hs pool slots updated in place.
-        meta = get_attn_backend().conv_state_metadata(self.layer_id, forward_batch)
+        backend = get_attn_backend()
+        meta = backend.conv_state_metadata(self.layer_id, forward_batch)
         conv_state = meta.layer_cache.conv[0]
         prev_hs_state = meta.layer_cache.conv[1]
         if forward_batch.forward_mode.is_decode_or_idle():
@@ -1155,6 +1156,12 @@ class CCA(nn.Module):
                 forward_batch.extend_seq_lens_cpu,
                 self.total_padding,
             )
+            # Radix mamba-cache checkpoint (extra_buffer strategy only): both
+            # conv entries are windows of these two inputs -- conv[0] is the
+            # last ``total_padding`` rows of ``qk``, conv[1] the last row of
+            # ``hidden_states`` -- so the snapshot at the chunk-aligned track
+            # position is a gather over them. No-op under ``no_buffer``.
+            backend.track_conv_states_extend(meta.layer_cache, (qk, hidden_states))
 
         query_conv = qk_out[:, : self.latent_q_dim].view(
             T, self.num_q_heads, self.head_dim
@@ -2030,6 +2037,14 @@ class ZayaModel(nn.Module):
                 forward_batch=forward_batch,
                 prev_router_hidden_states=prev_router_hidden_states,
             )
+
+        # Radix mamba-cache checkpoint, decode side (extra_buffer strategy
+        # only). Snapshots every CCA layer's conv_state + prev_hs into the
+        # per-request track slots in ONE launch, and must run after the last
+        # layer has updated its state. It stays inside the captured decode
+        # graph -- see ShortConvAttnBackend.track_conv_states_decode. No-op
+        # under ``no_buffer``.
+        get_attn_backend().track_conv_states_decode(forward_batch)
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
