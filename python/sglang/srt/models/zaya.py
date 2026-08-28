@@ -1581,9 +1581,11 @@ class CCA(nn.Module):
         """Reference path: process the entire ``hs`` of shape ``[S, H]`` with
         a zero initial conv state and a zero ``val_proj2`` lag.
 
-        Exercised by the CCA unit tests so the prefill / decode paths can be
-        compared against a single-shot torch reference, and used as a fallback
-        for profile / warmup runs where no state cache is meaningful.
+        Test-only, and deliberately so: it has no caller in ``srt/`` and is not
+        dead code. The prefill and decode paths are checked against it, which
+        only means anything while it shares no implementation with them -- so
+        do not refactor the common algebra out of here into a helper they also
+        call, and do not delete it for want of a caller.
         """
         S = hs.shape[0]
         hs_3d = hs.unsqueeze(1)  # [S, 1, H]
