@@ -397,6 +397,16 @@ add_linear_attn_kernel_backend_choices = LINEAR_ATTN_KERNEL_BACKEND_CHOICES.exte
 # --------------------------------------------------------------------------
 
 
+try:
+    from sglang.kernels.ops.attention.fla.chunk_delta_h import (
+        CHUNK_SIZE as FLA_CHUNK_SIZE,
+    )
+except ImportError:
+    # Kept guarded so server_args stays importable without the kernel package.
+    # Must match sglang.kernels.ops.attention.fla.chunk_delta_h.CHUNK_SIZE.
+    FLA_CHUNK_SIZE = 64
+
+
 def _max_conv_state_window(hf_config: Any) -> int:
     """Widest conv sliding window over a hybrid model's conv states, or 0.
 
@@ -443,9 +453,10 @@ def _short_conv_cache_chunk_size(hf_config: Any) -> int:
     dividing (or being divided by) every page size in use, which the caller's
     divisibility assert requires.
     """
+    fla_chunk_size = FLA_CHUNK_SIZE
     floor = _max_conv_state_window(hf_config) + 1
-    num_chunks = max(1, -(-floor // FLA_CHUNK_SIZE))
-    return FLA_CHUNK_SIZE * num_chunks
+    num_chunks = max(1, -(-floor // fla_chunk_size))
+    return fla_chunk_size * num_chunks
 
 
 @dataclasses.dataclass
@@ -10304,14 +10315,6 @@ class ServerArgs:
         supply one so a dummy model never loads an HF config) is honored as-is.
         """
         if not hasattr(self, "_mamba_cache_chunk_size"):
-
-            try:
-                from sglang.kernels.ops.attention.fla.chunk_delta_h import (
-                    CHUNK_SIZE as FLA_CHUNK_SIZE,
-                )
-            except ImportError:
-                # Must match sglang.kernels.ops.attention.fla.chunk_delta_h.CHUNK_SIZE
-                FLA_CHUNK_SIZE = 64
 
             hf_config = self.get_model_config().hf_config
             scan_chunk_size = getattr(hf_config, "mamba_chunk_size", FLA_CHUNK_SIZE)
