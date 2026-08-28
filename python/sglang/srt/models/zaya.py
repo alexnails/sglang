@@ -1542,6 +1542,10 @@ class ZayaRouter(nn.Module):
 
         self.use_mod = bool(getattr(config, "zaya_use_mod", False))
         self.num_experts = (num_moe_experts + 1) if self.use_mod else num_moe_experts
+        # Whether the MOD skip slot can actually win the argmax on the LOADED
+        # biases; resolved by fold_mod_reachability() after every weight load.
+        # Assume it can until the weights say otherwise.
+        self.mod_reachable = self.use_mod
         self.topk = int(moe_router_topk)
         self.mlp_expansion = int(mlp_expansion)
 
@@ -1608,6 +1612,32 @@ class ZayaRouter(nn.Module):
         if self.use_mod:
             with torch.no_grad():
                 self.balancing_biases[-1] = -1.0
+
+    def fold_mod_reachability(self) -> None:
+        """Decide whether the MOD skip slot can ever win, from the loaded biases.
+
+        ``balancing_biases`` is added to a *softmax probability*, not to a logit, so
+        the skip slot's score is bounded by ``1 + b_skip`` while every real expert's
+        is at least ``b_j``. When
+
+            1 + b_skip  <  max_j b_j        (j over the real experts)
+
+        the skip score is strictly below the best real score for every possible
+        input, so no tie-breaking rule can select it and the whole MOD path is dead
+        work. ZAYA1-74B ships ``b_skip = -1.0`` on all 60 MoE layers against real
+        biases peaking around +0.03, so it is dead there -- which is worth two
+        kernel launches per MoE layer.
+
+        Deliberately conservative: any bias layout that does not prove
+        unreachability keeps the MOD path.
+        """
+        if not self.use_mod:
+            self.mod_reachable = False
+            return
+        biases = self.balancing_biases.detach().float()
+        skip_bias = float(biases[-1])
+        max_real_bias = float(biases[:-1].max())
+        self.mod_reachable = not (1.0 + skip_bias < max_real_bias)
 
     def forward(
         self,
@@ -1771,6 +1801,14 @@ class ZayaBlock(nn.Module):
             prefix=add_prefix("experts", prefix),
             activation="silu",
             reduce_results=False,
+            # FusedMoE defaults to inplace=True, which on the triton runner aliases
+            # the expert output onto ``hidden_states``. The MOD blend below reads
+            # ``hidden_states`` *after* the experts run, so aliasing would feed it
+            # the unreduced per-rank partial -- a different value on every TP rank,
+            # silently diverging the replicated residual stream. The aiter runner
+            # allocates a fresh output so this never fired in the measured config;
+            # pinned here so the triton runner is not a correctness trap.
+            inplace=False,
         )
 
     def forward(
@@ -1791,7 +1829,11 @@ class ZayaBlock(nn.Module):
             router_logits=probs.to(hidden_states.dtype),
         )
 
-        if self.config.zaya_use_mod:
+        # ``mod_reachable``, not ``zaya_use_mod``: a checkpoint whose skip bias puts
+        # the slot permanently out of reach turns this whole branch into two
+        # elementwise launches per MoE layer computing an always-false predicate
+        # (see ZayaRouter.fold_mod_reachability).
+        if self.router.mod_reachable:
             # MOD: clamp the "skip expert" id (== num_moe_experts) into the
             # valid expert range so FusedMoE never indexes out of bounds; the
             # mask below decides per-token whether to actually use experts or
@@ -2576,6 +2618,8 @@ class ZayaForCausalLM(nn.Module):
             elif isinstance(module, CCA):
                 module.fold_decode_conv()
                 module.fold_qk_scales()
+            elif isinstance(module, ZayaRouter):
+                module.fold_mod_reachability()
 
 
 EntryClass = ZayaForCausalLM

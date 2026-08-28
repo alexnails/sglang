@@ -1948,5 +1948,81 @@ class TestCCAFusedDecodeConv(CustomTestCase):
         self.assertTrue(torch.equal(prev_hs, before_ph))
 
 
+class TestZayaMoDReachability(CustomTestCase):
+    """``ZayaRouter.fold_mod_reachability`` decides whether MOD is live.
+
+    ``balancing_biases`` is added to a *softmax probability*, not a logit, so the
+    skip slot's score is bounded above by ``1 + b_skip`` while every real expert's
+    is at least ``b_j``. When ``1 + b_skip < max_j b_j`` the skip slot is strictly
+    below the best real slot for every possible input and no tie-breaking rule can
+    pick it -- so the two MOD kernels per MoE layer are dead work.
+
+    ZAYA1-74B ships ``b_skip = -1.0`` on all 60 MoE layers, so this decides the
+    real checkpoint. Pinned because the branch is a silent 120-launch-per-step
+    cost when it is wrong in one direction, and silently wrong OUTPUT when it is
+    wrong in the other.
+    """
+
+    def _router(self, *, use_mod=True):
+        from sglang.srt.models.zaya import ZayaRouter
+
+        config = _make_swa_config(num_hidden_layers=4, swa_layers=[0, 0, 0, 0])
+        config.zaya_use_mod = use_mod
+        return ZayaRouter(
+            config=config,
+            num_moe_experts=4,
+            moe_router_topk=1,
+            mlp_expansion=8,
+            layer_id=1,
+        )
+
+    def test_skip_bias_of_minus_one_makes_mod_dead(self):
+        # The shipped ZAYA1-74B layout: skip at -1.0, real biases straddling 0.
+        router = self._router()
+        with torch.no_grad():
+            router.balancing_biases.copy_(
+                torch.tensor([0.03, -0.06, 0.02, -0.01, -1.0])
+            )
+        router.fold_mod_reachability()
+        self.assertFalse(router.mod_reachable)
+
+    def test_all_real_biases_negative_keeps_mod_live(self):
+        # 1 + b_skip == 0 is NOT below max_j b_j here, so the proof does not hold
+        # and the branch must stay -- the check is conservative by design.
+        router = self._router()
+        with torch.no_grad():
+            router.balancing_biases.copy_(
+                torch.tensor([-0.03, -0.06, -0.02, -0.01, -1.0])
+            )
+        router.fold_mod_reachability()
+        self.assertTrue(router.mod_reachable)
+
+    def test_a_reachable_skip_bias_keeps_mod_live(self):
+        # Distinct from the case above: there the real biases fail the test, here
+        # the SKIP bias does. Catches a predicate that ignores b_skip entirely.
+        router = self._router()
+        with torch.no_grad():
+            router.balancing_biases.copy_(torch.tensor([0.03, 0.01, 0.02, 0.0, 0.5]))
+        router.fold_mod_reachability()
+        self.assertTrue(router.mod_reachable)
+
+    def test_boundary_is_strict(self):
+        # 1 + b_skip exactly equal to max_j b_j must stay live: torch.argmax
+        # tie-breaking is unspecified, so equality is not a proof of anything.
+        router = self._router()
+        with torch.no_grad():
+            router.balancing_biases.copy_(torch.tensor([0.25, 0.1, 0.0, 0.0, -0.75]))
+        router.fold_mod_reachability()
+        self.assertTrue(router.mod_reachable)
+
+    def test_mod_disabled_in_config_is_never_reachable(self):
+        # Without the use_mod early return there is no skip slot at all, so
+        # ``biases[-1]`` is a real expert's bias and the comparison reads garbage
+        # -- which could mark MOD live on a model that has no skip path.
+        router = self._router(use_mod=False)
+        router.fold_mod_reachability()
+        self.assertFalse(router.mod_reachable)
+
+
 if __name__ == "__main__":
     unittest.main()
