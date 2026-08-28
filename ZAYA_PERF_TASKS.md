@@ -147,3 +147,70 @@ NEVER `kill -9` an sglang server on this box: ROCm leaks the ranks' device
 allocations and the container PID 1 is `sleep infinity`, so ~200 of 288 GiB per
 card is lost for the pod's lifetime. The harness gates `stop` on VRAM bytes
 returning to idle and refuses to start another arm otherwise.
+
+## RESULT: the landed stack (measured, MI355X, ISL 1024/OSL 256, reps 2-3)
+
+-299 launches/step banked: A1 MoD gate (-120), C1 sum_len gather fusion (-120),
+B2 EDA addcmul_ (-59), plus the CCA Triton occupancy fixes (duration, not count).
+
+| C | reference (global residual) | landed | d tok/s | d TPOT |
+|---|---|---|---|---|
+| 1 | 65.4 / 15.00 ms | **74.4 / 13.11** | **+13.7%** | **-12.6%** |
+| 32 | 1826.9 / 16.45 ms | **2025.7 / 14.82** | **+10.9%** | **-9.9%** |
+| 128 | 5306.2 / 20.98 ms | **5801.2 / 19.12** | **+9.3%** | **-8.9%** |
+
+Better than proportional: 299 of ~2382 launches is 12.5%, which at "launches are
+~45% of the step" predicts ~5.6% TPOT, and ~10% was measured. The removed ops are
+not average ones -- MoD premask/blend and the gather's fill_/copy-back each move a
+full [T, 4096] buffer, so ~250 MB/step of traffic left with them.
+
+Cumulative vs the session's bf16 start: C=1 TPOT -18.1%, C=32 -15.7%,
+C=128 tok/s +18.9%.
+
+## NOT banked, and why
+
+- **B1/B3 router fusion (-720).** The two Triton kernels had never been compiled.
+  The TAIL kernel takes a DEVICE-SIDE FAULT on gfx950: SIGABRT at the next sync,
+  two tests after the offending launch, no Python error. The traceback points at
+  `ReplicatedLinear.__init__` in an unrelated third test -- that is just where the
+  CPU thread was. Both kernels are behind `SGLANG_OPT_ZAYA_FUSED_ROUTER` (default
+  off) and their 19 tests are skipped with the reason recorded. Handed back to the
+  agent with the signature and `AMD_SERIALIZE_KERNEL=3`.
+- **D1 CCA v2 projected cache (2.63x state shrink).** Built before `cca_conv1d.py`
+  existed on the branch, and that file also writes the 4096-wide v2 stream D1
+  shrinks to 128. Needs reconciling before it is safe to merge.
+
+## Refuted DURING this session (my own hypotheses, corrected)
+
+- **page_size=1 costs TTFT: WRONG.** `extend_attention.py:500` states PAGE_SIZE==1
+  compiles to byte-identical SASS, and `create_flashinfer_kv_indices_triton` is
+  per-token at every page size. `--page-size 64` is a DECODE flag (it unlocks
+  aiter's vectorized_5d layout). The `_MAMBA_EXTRA_BUFFER_ARCHS` gap still gates
+  the overlap scheduler and page size, but NOT the prefill path.
+- **The prefill graph corrupts conv state: WRONG.** The graph demonstrably engages
+  (`Capture target prefill CUDA graph begin. backend=breakable`) and gsm8k holds
+  at 0.285 vs 0.270 control. A bug giving 31 of 32 requests the wrong state would
+  have been catastrophic. Real finding underneath: **ZAYA1 is not batch-invariant
+  at all** -- 4 distinct outputs from 8 identical greedy prompts at bs=8 with NO
+  graph -- which is what actually explains "the graph changes greedy token ids".
+- **Quantization is only a capacity lever: WRONG.** mxfp4 gives TPOT -23.7% at C=1
+  where weight traffic is ~3% of the step, so it cannot be bandwidth. It is KERNEL
+  QUALITY: mxfp4 hits aiter's tuned per_1x32 path (976 gfx950 rows) while bf16
+  falls to the untuned 2stage default. Same root cause as the table miss.
+  => Highest-value cheap experiment left: tune the **bf16** E=24/topk=1/
+  inter_dim=512 shape properly. It may capture much of that 20% with no
+  quantization and no accuracy question.
+
+## Measurement hygiene learned the hard way
+
+- `--num-prompts conc*4` gave 16-32 samples in the long-prefill cells; the control
+  spread 6.3% against 4-6% effects. Floored at max(8*conc, 64). TPOT figures were
+  never affected (averaged over 256 output tokens, reps agree to 0.1-0.3%).
+- Never rewrite a script in place while a chain is invoking it: bash reads
+  incrementally and the running instance sees corrupted content ("unbound
+  variable" at a shifted line). Write to .tmp and `mv`.
+- Gate a stop on VRAM BYTES returning to idle, three consecutive readings, and
+  refuse to serve unless every card has >=240 GiB free. A single low sample let an
+  arm start against ~274 GB still in use.
+- gsm8k on this preview checkpoint has 37-49% unparseable answers, so it catches
+  only gross regressions.
