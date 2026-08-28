@@ -1877,12 +1877,19 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         # KDA backend's track-snapshot writes (decode + extend) so donated
         # slots hold real states for prefix-cache restores.
         "KimiK3ForConditionalGeneration",
-        # Short-conv hybrid served by ShortConvAttnBackend, which implements
-        # the track snapshot for both of ZAYA1's conv entries (conv_qk left
-        # padding + prev_hs). LFM2 rides the same backend and the same code
-        # path, but is deliberately NOT listed: it has not been validated on
-        # hardware, and no_buffer is a safe default for it.
-        "ZayaForCausalLM",
+        # ZayaForCausalLM is NOT listed yet, though ShortConvAttnBackend now
+        # implements the track snapshot for both of its conv entries (conv_qk
+        # left padding + prev_hs). Listing it today makes the default config
+        # UNBOOTABLE: ZayaConfig.mamba_chunk_size is 1 (CCA has no chunked
+        # recurrence, so that is honest for the model), which makes
+        # ServerArgs.mamba_cache_chunk_size = max(1, page_size=1) = 1, and the
+        # backend's own guard then correctly refuses because the conv windows
+        # [2, 1] must be strictly smaller than the caching granularity. The
+        # radix caching-point granularity and the SSM scan length are different
+        # quantities that happen to share the word "chunk"; the former has to be
+        # derived independently for a conv-only model. Add this back once that
+        # derivation is fixed. LFM2 rides the same backend and would hit the
+        # same wall.
     }
 )
 
