@@ -1545,15 +1545,18 @@ class Envs:
     # kernels. Worth -720 launches/step of ~2382, the largest single reduction
     # available -- the router is 14 of the ~20 launches in a MoE layer.
     #
-    # STILL DEFAULT OFF, now pending validation rather than known-broken. The
-    # first version took a device-side fault on gfx950; both kernels have since
-    # been hardened so every load and store address is formed from a clamped
-    # index (in bounds whether or not the mask is honoured), all stores are
-    # masked, the chosen expert id is clamped on both sides, and the column block
-    # never goes below 16 lanes. None of that has run on a GPU. Flip this on only
-    # after `pytest test/registered/unit/models/test_zaya_cca.py -k Router`
-    # passes on the target hardware -- TestZayaRouterTailKernel runs first and
-    # touches no sglang module, so it isolates the kernel from the model path.
+    # STILL DEFAULT OFF, but the "device fault" that put it here was never in
+    # these kernels. On gfx950 the tail kernel is crash-free and correct at the
+    # shipping 25-expert shape across T in 1..1024 and both dtypes; the abort was
+    # sglang's model-parallel init being called from a test helper on a GPU box
+    # (it builds CUDA device communicators over a gloo group), and the one test
+    # failure was a bug in that test's own setup. Both are fixed.
+    #
+    # What is still unverified is the MLP kernel, which has never been compiled:
+    # its tests were skipped behind the abort. So flip this on only after
+    # `pytest test/registered/unit/models/test_zaya_cca.py -k Router` passes on
+    # the target hardware. TestZayaRouterTailKernel runs first and touches no
+    # sglang module, so a failure there is the kernel and a failure later is not.
     SGLANG_OPT_ZAYA_FUSED_ROUTER = EnvBool(False)
     # Compile the in-kernel index assertions into the fused router kernels, so a
     # bad index aborts AT the kernel naming the violated invariant instead of

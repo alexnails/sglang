@@ -65,6 +65,20 @@ def _ensure_dist_initialized() -> None:
         )
 
     if not model_parallel_is_initialized():
+        # WARNING, on a machine with a GPU: ``backend="gloo"`` does not keep this
+        # on the CPU. ``GroupCoordinator.__init__`` sets
+        # ``self.device = cuda:{local_rank}`` whenever ``is_cuda_alike()``, which
+        # is fixed at import from the platform and not from the backend argument,
+        # and ``init_model_parallel_group`` then defaults ``use_pynccl=True`` and
+        # ``use_custom_allreduce=_ENABLE_CUSTOM_ALL_REDUCE``. So this builds CUDA
+        # device communicators -- RCCL, custom-allreduce IPC -- over a gloo
+        # process group. On gfx950 that aborts the process, and because the abort
+        # is asynchronous it lands wherever the CPU thread happens to be.
+        #
+        # Only call this from tests that genuinely need model-parallel state
+        # (CCA reads the TP rank in __init__). ZayaRouter does not -- see
+        # ``_make_tiny_router``.
+        #
         # Pass arguments as kwargs because ``ensure_model_parallel_initialized``
         # forwards positional ``backend`` into the ``attention_data_parallel_size``
         # slot of ``initialize_model_parallel``, which then explodes on
@@ -2418,10 +2432,21 @@ def _make_tiny_router(
     stages at std 0.5 and width 256 amplify by ~500x, which saturates the
     downstream softmax and makes a numerical comparison meaningless. Pass
     ``1 / sqrt(mlp_expansion)`` for the wide cases.
+
+    Deliberately does NOT call ``_ensure_dist_initialized()``. ZayaRouter is
+    built entirely from ``ReplicatedLinear`` and ``RMSNorm``, neither of which
+    reads model-parallel state, so it constructs and runs a full forward with
+    ``torch.distributed`` never initialized -- unlike CCA, which queries the TP
+    rank in ``__init__`` and does need the helper.
+
+    That is not a tidy-up. Calling the helper here aborted the process on
+    gfx950: see the warning on ``_ensure_dist_initialized`` for why. The abort
+    landed inside ``ReplicatedLinear.__init__``, which is simply where the CPU
+    thread was, and cost a round of hunting through Triton kernels that were
+    never at fault. Do not add it back.
     """
     from sglang.srt.models.zaya import ZayaRouter
 
-    _ensure_dist_initialized()
     config = _make_router_config(num_moe_experts, mlp_expansion, **config_overrides)
     torch.manual_seed(seed)
     router = ZayaRouter(
@@ -2603,28 +2628,61 @@ class TestZayaRouterTailKernel(CustomTestCase):
         torch.testing.assert_close(weight_poisoned, weight_clean, rtol=0, atol=0)
 
     @unittest.skipUnless(torch.cuda.is_available(), "fused tail is a GPU kernel")
-    @unittest.expectedFailure  # real bug: bias load picks up padding lanes
     def test_padding_bias_lanes_cannot_influence_the_result(self):
-        """Same probe for the bias vector, which is only 25 floats long.
+        """The bias vector is 25 floats read through a 32-wide block.
 
-        This is the load the fault report singled out: 25 elements read through
-        a 32-wide block. Poison elements 25..31 with a value that would win any
-        argmax, and hand the kernel a contiguous 25-element prefix view.
+        Poison elements 25..31 of a 32-element buffer and hand the kernel a
+        contiguous 25-element prefix view of it.
+
+        The real per-index values are written AFTER the poison. Writing them
+        first is what made the first version of this test fail, and the failure
+        was mine, not the kernel's: ``wide_bias[-1]`` addresses element 31 of the
+        32-element buffer, not the last of the 25 the kernel sees, so the poison
+        line overwrote it and the *setup* assertion two lines later failed. The
+        kernel was never reached. Every assertion below that belongs to the setup
+        now says so in its message.
+
+        Scope, stated honestly. The poison can only reach the output if BOTH the
+        masked load AND the ``tl.where`` that forces every padding lane's biased
+        score to -inf fail; a padding bias on its own has no path to the answer.
+        So this is a guard on the combination rather than a probe of the load,
+        and it could not have detected a load-mask failure by itself. It earns
+        its place as a regression guard: remove either mask later and it goes
+        red.
         """
         num_tokens = 6
         torch.manual_seed(4)
         logits = torch.randn(num_tokens, self.NUM_EXPERTS, device="cuda")
 
-        wide_bias = torch.zeros(32, dtype=torch.float32, device="cuda")
-        wide_bias[-1] = -1.0
-        wide_bias[self.NUM_EXPERTS :] = 1e30
+        wide_bias = torch.empty(32, dtype=torch.float32, device="cuda")
+        wide_bias[self.NUM_EXPERTS :] = 1e30  # poison the padding lanes first
+        # Then the real vector: distinct per index, so smearing one lane's value
+        # onto another changes the answer, plus the MOD skip slot's own -1.
+        real = torch.arange(self.NUM_EXPERTS, dtype=torch.float32, device="cuda")
+        real = real * 0.01
+        real[-1] = -1.0
+        wide_bias[: self.NUM_EXPERTS] = real
         biases = wide_bias[: self.NUM_EXPERTS]
-        self.assertTrue(biases.is_contiguous())
-        self.assertEqual(biases.numel(), self.NUM_EXPERTS)
-        # The MOD skip slot's own bias must survive the poisoning above.
-        self.assertEqual(float(biases[-1]), -1.0)
 
-        self._check(logits, biases, self.NUM_MOE_EXPERTS - 1)
+        self.assertTrue(biases.is_contiguous(), "setup: the view must be contiguous")
+        self.assertEqual(biases.numel(), self.NUM_EXPERTS, "setup: wrong length")
+        self.assertEqual(
+            float(biases[-1]), -1.0, "setup: the skip-slot bias was clobbered"
+        )
+        self.assertEqual(
+            float(wide_bias[self.NUM_EXPERTS]), 1e30, "setup: the poison is missing"
+        )
+
+        weight_poisoned, ids_poisoned, _, _ = self._check(
+            logits, biases, self.NUM_MOE_EXPERTS - 1
+        )
+        # Kernel against kernel as well as against torch: the same 25 values in a
+        # tight buffer must give bit-identical results.
+        weight_clean, ids_clean, _, _ = self._check(
+            logits, biases.clone(), self.NUM_MOE_EXPERTS - 1
+        )
+        self.assertTrue(torch.equal(ids_poisoned, ids_clean))
+        torch.testing.assert_close(weight_poisoned, weight_clean, rtol=0, atol=0)
 
     @unittest.skipUnless(torch.cuda.is_available(), "fused tail is a GPU kernel")
     def test_outputs_are_exactly_t_rows_and_ids_are_distinct_tensors(self):
@@ -2701,6 +2759,25 @@ class TestZayaRouterTailKernel(CustomTestCase):
         self.assertGreaterEqual(int(skip_ids.min()), 0)
         self.assertLessEqual(int(skip_ids.max()), self.NUM_EXPERTS - 1)
 
+    def test_router_construction_needs_no_distributed_init(self):
+        """``_make_tiny_router`` must never require a process group.
+
+        The regression guard for the gfx950 abort. Initializing sglang's
+        model-parallel groups on a GPU box builds CUDA device communicators over
+        a gloo process group and kills the process, so the router factory has to
+        stay free of it. Meaningful exactly when the router classes are run on
+        their own, which is how they are run while this is being chased; skipped
+        rather than faked when something earlier in the file has already brought
+        distributed up.
+        """
+        if torch.distributed.is_initialized():
+            self.skipTest("distributed already initialized earlier in this file")
+        _make_tiny_router(num_moe_experts=4, seed=1)
+        self.assertFalse(
+            torch.distributed.is_initialized(),
+            "building a ZayaRouter must not initialize torch.distributed",
+        )
+
     def test_block_padding_is_never_narrower_than_the_minimum(self):
         """CPU-checkable: the launch never emits a sub-16-wide column block.
 
@@ -2731,15 +2808,6 @@ class TestZayaRouterTailKernel(CustomTestCase):
                 self._check(logits, self._biases(num_experts), num_experts - 2)
 
 
-@unittest.skip(
-    "Aborts on gfx950 at the first ReplicatedLinear construction after the "
-    "kernel tests have used the GPU. This is NOT a kernel fault: "
-    "TestZayaRouterTailKernel alone is crash-free (1 failed, 7 passed) and "
-    "RMSNorm at width 8 is fine. Suspect _ensure_dist_initialized() being "
-    "called after GPU work -- the MOD-reachability tests construct a "
-    "ZayaRouter without that helper and pass. Kernels are default-off "
-    "behind SGLANG_OPT_ZAYA_FUSED_ROUTER."
-)
 class TestZayaRouterFusedTail(CustomTestCase):
     """The fused router tail must reproduce the torch chain it replaces.
 
@@ -3093,15 +3161,6 @@ class TestZayaRouterFusedTail(CustomTestCase):
 # ---------------------------------------------------------------------------
 
 
-@unittest.skip(
-    "Aborts on gfx950 at the first ReplicatedLinear construction after the "
-    "kernel tests have used the GPU. This is NOT a kernel fault: "
-    "TestZayaRouterTailKernel alone is crash-free (1 failed, 7 passed) and "
-    "RMSNorm at width 8 is fine. Suspect _ensure_dist_initialized() being "
-    "called after GPU work -- the MOD-reachability tests construct a "
-    "ZayaRouter without that helper and pass. Kernels are default-off "
-    "behind SGLANG_OPT_ZAYA_FUSED_ROUTER."
-)
 class TestZayaRouterFusedMLP(CustomTestCase):
     """The fused router MLP must reproduce the ``nn.Sequential`` it replaces.
 
