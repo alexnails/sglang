@@ -1603,8 +1603,13 @@ class TestShortConvTrackIndices(CustomTestCase):
             short_conv_backend, "get_server_args", lambda: harness.server_args
         ):
             mine = harness.backend._init_track_conv_indices(qsl, fb)[0]
+        # The base reads the derived accessor, not the record:
+        # hybrid_linear_attn_backend imports mamba_cache_chunk_size, whereas
+        # short_conv_backend imports get_server_args. Patch what each one binds.
         with unittest.mock.patch.object(
-            hb, "get_server_args", lambda: harness.server_args
+            hb,
+            "mamba_cache_chunk_size",
+            lambda: harness.server_args.mamba_cache_chunk_size,
         ):
             theirs = hb.MambaAttnBackendBase._init_track_conv_indices(
                 harness.backend, qsl, fb
