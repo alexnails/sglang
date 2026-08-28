@@ -396,11 +396,16 @@ def capture_prefill_graph(
     model_runner.attention_layers = _align_pipeline_layers(
         model_runner.attention_layers, layer_model
     )
-    if len(model_runner.attention_layers) < model_runner.model_config.num_hidden_layers:
-        # TODO(yuwei): support Non-Standard GQA
+    if len(model_runner.attention_layers) != len(layer_model.layers):
+        # The list is read as ``attention_layers[layer_id]``, so it has to cover
+        # every layer; a short one means this model's layer structure was not
+        # recognized and the entries past the first unrecognized layer are
+        # shifted. Note a None entry is fine -- a layer that holds no attention
+        # (a MoE-only layer in an alternating stack) is never the one indexing.
         log_info_on_rank0(
             logger,
-            "Disable prefill CUDA graph because some layers do not apply Standard GQA",
+            "Disable prefill CUDA graph because the attention layers could not be "
+            f"mapped one-to-one onto the {len(layer_model.layers)} decoder layers",
         )
         return result(None)
 

@@ -21,6 +21,7 @@ GPU dependency. State is stored in a mock centralized pool that mirrors the
 ``HybridReqToTokenPool`` / ``MambaPool`` interface used at serving time.
 """
 
+import os
 import unittest
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -29,24 +30,56 @@ from typing import List, Optional
 
 import torch
 
-from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.layer_ut_utils import init_single_process_dist
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 
-def _ensure_dist_initialized(cls) -> None:
-    """CCA reads the TP rank / world size inside ``__init__`` to size its
-    head-parallel projections. The rank is the live group's, so the groups must
-    exist before construction; the size answers from the published ``parallel``
-    bag, so the case has to publish a context as well.
+def _ensure_dist_initialized() -> None:
+    """Set up a minimal single-rank gloo distributed environment plus the
+    SGLang model-parallel groups (TP=1, PP=1, EP=1). The CCA module reads
+    ``get_tensor_model_parallel_rank()`` / ``get_tensor_model_parallel_world_size()``
+    inside ``__init__`` to size its head-parallel projections, so the world
+    group and model parallel groups must both be initialized before any CCA
+    construction.
     """
-    init_single_process_dist()
-    override = get_context().override_server_args(tp_size=1)
-    override.install()
-    cls.addClassCleanup(override.restore)
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ.setdefault("MASTER_PORT", "29632")
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("WORLD_SIZE", "1")
+    os.environ.setdefault("LOCAL_RANK", "0")
+
+    from sglang.srt.distributed.parallel_state import (
+        init_distributed_environment,
+        initialize_model_parallel,
+        model_parallel_is_initialized,
+    )
+
+    if not torch.distributed.is_initialized():
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            local_rank=0,
+            backend="gloo",
+        )
+
+    if not model_parallel_is_initialized():
+        # Pass arguments as kwargs because ``ensure_model_parallel_initialized``
+        # forwards positional ``backend`` into the ``attention_data_parallel_size``
+        # slot of ``initialize_model_parallel``, which then explodes on
+        # ``int // str``. Using kwargs avoids that footgun.
+        initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            backend="gloo",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Mock centralized pool
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -169,6 +202,11 @@ def _mock_pool_context(pool: _MockReqToTokenPool):
         set_forward_context(prev)
 
 
+# ---------------------------------------------------------------------------
+# Helper factories
+# ---------------------------------------------------------------------------
+
+
 def _make_forward_batch(
     *,
     is_decode: bool,
@@ -250,7 +288,7 @@ def _make_tiny_cca(
 class TestZayaCCA(CustomTestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        _ensure_dist_initialized(cls)
+        _ensure_dist_initialized()
 
     def test_single_chunk_matches_reference(self):
         """A single-chunk extend with empty prefix matches the no-state path."""
@@ -1121,7 +1159,7 @@ class TestZayaCCATensorParallel(CustomTestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        _ensure_dist_initialized(cls)
+        _ensure_dist_initialized()
 
     def _slice_full_state_dict_into_rank(self, ref_cca, tp_cca, tp_rank: int):
         """Copy the reference's full weights into the per-rank CCA, using the
@@ -1360,126 +1398,566 @@ class TestZayaCCATensorParallel(CustomTestCase):
             )
 
 
-class TestDPCombine(CustomTestCase):
-    """The reduce-scatter MoE combine: when it is allowed, and that blending on
-    the reduce-scattered rows equals blending globally and then scattering.
+@contextmanager
+def _dp_layout(sizes: List[int], rank: int, is_max_len: bool):
+    """Install ``sizes`` as the per-rank padded token counts, viewed from ``rank``.
+
+    Mirrors what ``prepare_mlp_sync_batch`` publishes for a real forward: the DP
+    rank globals plus the process-wide DP buffer metadata.
+    """
+    from sglang.srt.layers import dp_attention as dpa
+
+    saved = (dpa._ATTN_DP_RANK, dpa._ATTN_DP_SIZE)
+    saved_buffer = (
+        dpa._DpGatheredBufferWrapper._global_dp_buffer_len,
+        dpa._DpGatheredBufferWrapper._local_dp_buffer_len,
+        dpa._DpGatheredBufferWrapper._dp_max_padding,
+        dpa._DpGatheredBufferWrapper._global_num_tokens,
+    )
+    dpa._ATTN_DP_RANK, dpa._ATTN_DP_SIZE = rank, len(sizes)
+    dpa.set_dp_buffer_len(sum(sizes), sizes[rank], is_max_len, list(sizes))
+    try:
+        yield
+    finally:
+        dpa._ATTN_DP_RANK, dpa._ATTN_DP_SIZE = saved
+        dpa.set_dp_buffer_len(*saved_buffer)
+
+
+class TestZayaGlobalResidualLayout(CustomTestCase):
+    """Row arithmetic for the global-residual DP dataflow.
+
+    On that dataflow the residual stream lives in the global DP layout and each
+    attention layer slices its own rows back out of it, so the CPU offsets in
+    ``GlobalResidualLayout`` and the device-side offsets that ``dp_gather_partial``
+    writes at (``get_dp_local_info``, a cumsum over ``global_num_tokens_gpu``) must
+    describe the same rows. Nothing at runtime cross-checks them: if they drift,
+    attention silently reads another replica's tokens.
     """
 
-    @contextmanager
-    def _dp_layout(self, *, tp_size, dp_size, dp_rank, max_padding=True):
-        """Stub the four layout facts ``dp_combine_for`` reads."""
+    def _layout(self, sizes: List[int], rank: int, is_max_len: bool):
+        from unittest import mock
+
+        from sglang.srt.environ import envs
         from sglang.srt.models import zaya
 
-        saved = (zaya.get_parallel, zaya.is_dp_max_padding, zaya.get_attention_dp_rank)
-        zaya.get_parallel = lambda: SimpleNamespace(
-            tp_size=tp_size, attn_dp_size=dp_size
+        # The parallel-layout precondition is orthogonal to the arithmetic under
+        # test and needs a live runtime context, so stub it out.
+        with _dp_layout(sizes, rank, is_max_len), mock.patch.object(
+            zaya, "dp_gather_required", return_value=True
+        ), envs.SGLANG_OPT_ZAYA_GLOBAL_RESIDUAL.override(True):
+            return zaya.global_residual_layout()
+
+    def _device_slice(self, sizes: List[int], rank: int):
+        from sglang.srt.layers.dp_attention import get_dp_local_info
+
+        forward_batch = SimpleNamespace(
+            dp_local_start_pos=None,
+            dp_local_num_tokens=None,
+            global_num_tokens_gpu=torch.tensor(sizes, dtype=torch.int32),
         )
-        zaya.is_dp_max_padding = lambda: max_padding
-        zaya.get_attention_dp_rank = lambda: dp_rank
-        try:
-            yield
-        finally:
-            (
-                zaya.get_parallel,
-                zaya.is_dp_max_padding,
-                zaya.get_attention_dp_rank,
-            ) = saved
+        with _dp_layout(sizes, rank, is_max_len=False):
+            start, length = get_dp_local_info(forward_batch)
+        return int(start), int(length)
 
-    def test_combine_describes_this_replicas_block(self):
-        from sglang.srt.models.zaya import dp_combine_for
+    def test_offsets_match_the_gather_destination(self):
+        """SUM_LEN: unequal per-rank counts, so a wrong cumsum shows up as a shift."""
+        sizes = [3, 7, 1, 5]
+        for rank in range(len(sizes)):
+            layout = self._layout(sizes, rank, is_max_len=False)
+            self.assertEqual(
+                (layout.local_start, layout.local_len),
+                self._device_slice(sizes, rank),
+                f"CPU layout disagrees with get_dp_local_info at rank {rank}",
+            )
 
-        # tp=8/dp=4, 8 tokens per replica -> 32 global rows, replica 2 owns 16:24.
-        with self._dp_layout(tp_size=8, dp_size=4, dp_rank=2):
-            combine = dp_combine_for(global_rows=32, local_rows=8)
-        self.assertIsNotNone(combine)
-        self.assertEqual(combine.local_start, 16)
-        self.assertEqual(combine.local_rows, 8)
+    def test_offsets_match_under_max_len_padding(self):
+        """MAX_LEN: every rank padded to the same width (the cuda-graph layout)."""
+        sizes = [8, 8, 8, 8]
+        for rank in range(len(sizes)):
+            layout = self._layout(sizes, rank, is_max_len=True)
+            self.assertEqual(
+                (layout.local_start, layout.local_len),
+                (rank * 8, 8),
+            )
 
-    def test_combine_declined_when_global_rows_not_divisible_by_tp(self):
-        """A tp=8/dp=4 decode of one token per replica gathers 4 rows, which the
-        reduce-scatter cannot split 8 ways -- it must fall back to the all-reduce.
+    def test_slices_tile_the_buffer_without_gaps_or_overlap(self):
+        """Every row of the global buffer belongs to exactly one replica.
+
+        The MoE layers run over the whole buffer, so a gap would feed the experts
+        uninitialized rows and an overlap would double-count a token.
         """
-        from sglang.srt.models.zaya import dp_combine_for
+        sizes = [3, 7, 1, 5]
+        covered = torch.zeros(sum(sizes), dtype=torch.int32)
+        for rank in range(len(sizes)):
+            layout = self._layout(sizes, rank, is_max_len=False)
+            covered[layout.local_start : layout.local_start + layout.local_len] += 1
+        self.assertTrue(torch.equal(covered, torch.ones_like(covered)))
 
-        with self._dp_layout(tp_size=8, dp_size=4, dp_rank=0):
-            self.assertIsNone(dp_combine_for(global_rows=4, local_rows=1))
+    def test_idle_replica_gets_an_empty_slice(self):
+        """A replica with no requests must slice to zero rows, not to its neighbour's.
 
-    def test_combine_declined_under_sum_len_padding(self):
-        from sglang.srt.models.zaya import dp_combine_for
-
-        with self._dp_layout(tp_size=8, dp_size=4, dp_rank=0, max_padding=False):
-            self.assertIsNone(dp_combine_for(global_rows=32, local_rows=8))
-
-    def test_combine_declined_when_blocks_do_not_tile_the_buffer(self):
-        """Ragged replicas: 8 local rows cannot describe a 40-row/4-replica buffer."""
-        from sglang.srt.models.zaya import dp_combine_for
-
-        with self._dp_layout(tp_size=8, dp_size=4, dp_rank=0):
-            self.assertIsNone(dp_combine_for(global_rows=40, local_rows=8))
-
-    def test_slice_is_identity_without_a_combine(self):
-        from sglang.srt.models.zaya import _slice_combined_rows
-
-        a, b = torch.randn(6, 3), torch.randn(6, 3)
-        out = _slice_combined_rows(None, a, b)
-        self.assertIs(out[0], a)
-        self.assertIs(out[1], b)
-
-    def test_sliced_rows_stay_contiguous(self):
-        """The fused MOD kernels' coverage check requires contiguous operands."""
-        from sglang.srt.models.zaya import DPCombine, _slice_combined_rows
-
-        (sliced,) = _slice_combined_rows(
-            DPCombine(local_start=16, local_rows=8), torch.randn(32, 4)
-        )
-        self.assertEqual(sliced.shape, (8, 4))
-        self.assertTrue(sliced.is_contiguous())
-
-    def test_local_blend_matches_global_blend_then_scatter(self):
-        """The blend is per-token, so reduce-scatter-then-blend must equal
-        all-reduce-then-blend-then-scatter. This pins the slicing arithmetic:
-        ``local_start`` has to select the same rows the reduce-scatter delivers.
+        Its attention still runs (and returns early on the empty batch) and it must
+        still join the gather, so the layout has to survive a zero-width block.
         """
-        from sglang.srt.models.zaya import (
-            DPCombine,
-            _slice_combined_rows,
-            mod_blend,
-            mod_premask_experts,
+        sizes = [4, 0, 4]
+        layout = self._layout(sizes, 1, is_max_len=False)
+        self.assertEqual((layout.local_start, layout.local_len), (4, 0))
+        hidden = torch.arange(8 * 2, dtype=torch.float32).reshape(8, 2)
+        self.assertEqual(layout.local_view(hidden).shape, (0, 2))
+
+    def test_local_view_is_a_contiguous_alias(self):
+        """Attention and the gather both assert contiguity on what they are handed."""
+        layout = self._layout([3, 7, 1, 5], 1, is_max_len=False)
+        hidden = torch.randn(16, 4)
+        view = layout.local_view(hidden)
+        self.assertTrue(view.is_contiguous())
+        self.assertEqual(view.data_ptr(), hidden[3].data_ptr())
+
+    def test_disabled_by_default_without_touching_parallel_state(self):
+        """Flag off must yield the DP-local dataflow, and decide that first.
+
+        The env check has to short-circuit ahead of the parallel-layout probe, or
+        merely importing the model on a machine with no runtime context breaks.
+        """
+        from sglang.srt.models import zaya
+
+        with _dp_layout([3, 7, 1, 5], 0, is_max_len=False):
+            self.assertIsNone(zaya.global_residual_layout())
+
+
+class TestZayaPartialGatherFoldsTheAttnReduce(CustomTestCase):
+    """The algebra that lets one collective replace two.
+
+    The global-residual dataflow drops ``attn_tp_all_reduce`` from the attention
+    layer and gathers the *unreduced* o_proj partials instead: every attention-TP
+    rank of a replica memcpys its partial into the same slot of the global buffer,
+    so the all-reduce that gathers across replicas also sums within them. These
+    cases pin that equivalence, and the failure mode of getting it wrong (using the
+    replicate gather, which takes rank 0's rows and discards the rest).
+    """
+
+    HIDDEN = 4
+
+    def _gather(self, partials: List[List[torch.Tensor]], sizes: List[int], is_partial):
+        """Replay ``_dp_gather_via_all_reduce`` over all ranks on host tensors.
+
+        Each rank zero-fills the buffer and memcpys its own rows into its replica's
+        slot -- only attention-TP rank 0 does so on the replicate gather -- and the
+        all-reduce leaves the sum of those per-rank buffers behind.
+        """
+        from sglang.srt.layers.dp_attention import get_dp_local_info
+
+        total = torch.zeros(sum(sizes), self.HIDDEN)
+        for replica, rank_partials in enumerate(partials):
+            forward_batch = SimpleNamespace(
+                dp_local_start_pos=None,
+                dp_local_num_tokens=None,
+                global_num_tokens_gpu=torch.tensor(sizes, dtype=torch.int32),
+            )
+            with _dp_layout(sizes, replica, is_max_len=False):
+                start, length = get_dp_local_info(forward_batch)
+            for attn_tp_rank, partial in enumerate(rank_partials):
+                if not is_partial and attn_tp_rank != 0:
+                    continue
+                contribution = torch.zeros(sum(sizes), self.HIDDEN)
+                contribution[int(start) : int(start) + int(length)] = partial
+                total = total + contribution
+        return total
+
+    def _partials(self, sizes: List[int], attn_tp_size: int):
+        torch.manual_seed(0)
+        return [
+            [torch.randn(rows, self.HIDDEN) for _ in range(attn_tp_size)]
+            for rows in sizes
+        ]
+
+    def test_partial_gather_equals_reduce_then_replicate_gather(self):
+        sizes = [3, 7, 1, 5]
+        partials = self._partials(sizes, attn_tp_size=2)
+        # Baseline: reduce within the replica, then gather the reduced rows.
+        reduced = [[sum(rank_partials)] for rank_partials in partials]
+        baseline = self._gather(reduced, sizes, is_partial=False)
+        folded = self._gather(partials, sizes, is_partial=True)
+        torch.testing.assert_close(folded, baseline)
+
+    def test_replicate_gather_of_partials_drops_a_rank(self):
+        """Guards the swap this campaign has already made in the other direction.
+
+        ``dp_gather_replicate`` is correct for already-reduced rows and wrong for
+        partials: it keeps attention-TP rank 0's contribution and silently discards
+        every other rank's, which at attn_tp=1 is invisible and at attn_tp=2 is
+        garbage output.
+        """
+        sizes = [3, 7, 1, 5]
+        partials = self._partials(sizes, attn_tp_size=2)
+        folded = self._gather(partials, sizes, is_partial=True)
+        wrong = self._gather(partials, sizes, is_partial=False)
+        self.assertFalse(torch.allclose(folded, wrong))
+
+    def test_single_attn_tp_rank_makes_the_two_gathers_agree(self):
+        """At attn_tp=1 there is nothing to sum, so both gathers must coincide."""
+        sizes = [3, 7, 1, 5]
+        partials = self._partials(sizes, attn_tp_size=1)
+        torch.testing.assert_close(
+            self._gather(partials, sizes, is_partial=True),
+            self._gather(partials, sizes, is_partial=False),
         )
+
+
+def _reference_extend_conv(
+    qk: torch.Tensor,
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    conv_state: torch.Tensor,
+    prev_hs_state: torch.Tensor,
+    seq_lens: List[int],
+    slot_ids: List[int],
+    has_prefix: List[bool],
+    total_padding: int,
+    groups: int,
+):
+    """Per-request torch reference for the fused prefill conv.
+
+    Deliberately the naive formulation -- one ``F.conv1d`` per request with an
+    explicitly built left pad -- rather than a copy of ``cca_extend``, so the two
+    agree only if the varlen indexing is right.
+    """
+    qk_out = torch.empty_like(qk)
+    v2_out = torch.empty_like(hidden_states)
+    new_conv_state = conv_state.clone()
+    new_prev_hs = prev_hs_state.clone()
+
+    start = 0
+    for i, seq_len in enumerate(seq_lens):
+        end = start + seq_len
+        slot = slot_ids[i]
+        cur = qk[start:end].transpose(0, 1).unsqueeze(0)  # [1, C, S]
+        if has_prefix[i]:
+            left = conv_state[slot].unsqueeze(0).to(cur.dtype)
+        else:
+            left = cur.new_zeros((1, cur.shape[1], total_padding))
+        padded = torch.cat([left, cur], dim=-1)
+        out = torch.nn.functional.conv1d(padded, weight, bias, groups=groups)
+        qk_out[start:end] = out.squeeze(0).transpose(0, 1)
+        new_conv_state[slot] = (
+            padded[..., -total_padding:].squeeze(0).to(conv_state.dtype)
+        )
+
+        hs_cur = hidden_states[start:end]
+        if has_prefix[i]:
+            first = prev_hs_state[slot].squeeze(-1).to(hs_cur.dtype).unsqueeze(0)
+        else:
+            first = hs_cur.new_zeros((1, hs_cur.shape[-1]))
+        v2_out[start:end] = torch.cat([first, hs_cur[:-1]], dim=0)
+        new_prev_hs[slot] = hs_cur[-1].unsqueeze(-1).to(prev_hs_state.dtype)
+        start = end
+
+    return qk_out, v2_out, new_conv_state, new_prev_hs
+
+
+class TestCCAFusedPrefillConv(CustomTestCase):
+    """Fused varlen prefill conv vs the per-request torch reference.
+
+    The fused kernel resolves each token's request, start offset, pool slot and
+    prefix flag from device tensors instead of a host loop. Every one of those is a
+    silent-corruption path: a token attributed to the wrong request reads another
+    request's conv history, and nothing downstream notices.
+    """
+
+    GROUPS = 3
+    CG = 16  # tl.dot needs a tile at least 16 wide
+    HIDDEN = 8
+    TOTAL_PADDING = 2
+
+    def _inputs(self, seq_lens: List[int], has_prefix: List[bool], seed: int = 0):
+        torch.manual_seed(seed)
+        channels = self.GROUPS * self.CG
+        taps = self.TOTAL_PADDING + 1
+        total = sum(seq_lens)
+        num_slots = len(seq_lens) + 2
+        dev = "cuda"
+        dt = torch.bfloat16
+        return dict(
+            qk=torch.randn(total, channels, device=dev, dtype=dt),
+            hidden_states=torch.randn(total, self.HIDDEN, device=dev, dtype=dt),
+            weight=torch.randn(channels, self.CG, taps, device=dev, dtype=dt) * 0.1,
+            bias=torch.randn(channels, device=dev, dtype=dt) * 0.1,
+            conv_state=torch.randn(
+                num_slots, channels, self.TOTAL_PADDING, device=dev, dtype=dt
+            ),
+            prev_hs_state=torch.randn(num_slots, self.HIDDEN, 1, device=dev, dtype=dt),
+            seq_lens=seq_lens,
+            has_prefix=has_prefix,
+        )
+
+    def _run(self, seq_lens, has_prefix, slot_ids=None, seed=0):
+        from sglang.kernels.ops.attention import cca_conv1d
+
+        args = self._inputs(seq_lens, has_prefix, seed)
+        slot_ids = slot_ids or list(range(len(seq_lens)))
+        offsets = [0]
+        for s_len in seq_lens:
+            offsets.append(offsets[-1] + s_len)
+        cu = torch.tensor(offsets, dtype=torch.int32, device="cuda")
+        slots = torch.tensor(slot_ids, dtype=torch.int64, device="cuda")
+        prefix = torch.tensor(has_prefix, dtype=torch.bool, device="cuda")
+
+        ref_qk, ref_v2, ref_cs, ref_ph = _reference_extend_conv(
+            args["qk"],
+            args["hidden_states"],
+            args["weight"],
+            args["bias"],
+            args["conv_state"],
+            args["prev_hs_state"],
+            seq_lens,
+            slot_ids,
+            has_prefix,
+            self.TOTAL_PADDING,
+            self.GROUPS,
+        )
+
+        conv_state = args["conv_state"].clone()
+        prev_hs_state = args["prev_hs_state"].clone()
+        self.assertTrue(
+            cca_conv1d.covered(
+                args["qk"],
+                args["hidden_states"],
+                args["weight"],
+                args["bias"],
+                conv_state,
+                prev_hs_state,
+                cu,
+                prefix,
+                slots,
+                self.TOTAL_PADDING,
+                self.GROUPS,
+            )
+        )
+        got_qk, got_v2 = cca_conv1d.cca_conv1d_fn(
+            args["qk"],
+            args["hidden_states"],
+            args["weight"],
+            args["bias"],
+            conv_state,
+            prev_hs_state,
+            cu,
+            prefix,
+            slots,
+            self.TOTAL_PADDING,
+            self.GROUPS,
+        )
+        return (got_qk, got_v2, conv_state, prev_hs_state), (
+            ref_qk,
+            ref_v2,
+            ref_cs,
+            ref_ph,
+        )
+
+    def _assert_matches(self, got, ref):
+        names = ("qk_out", "v2_input", "conv_state", "prev_hs_state")
+        for name, g, r in zip(names, got, ref):
+            torch.testing.assert_close(
+                g.float(), r.float(), rtol=2e-2, atol=2e-2, msg=f"{name} mismatch"
+            )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused conv is a GPU kernel")
+    def test_fresh_prefill_multi_request(self):
+        got, ref = self._run([5, 3, 8], [False, False, False])
+        self._assert_matches(got, ref)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused conv is a GPU kernel")
+    def test_resumed_prefix_reads_carried_state(self):
+        """Mixed prefix flags: the halo taps must come from each slot's history."""
+        got, ref = self._run([6, 4, 7], [True, False, True])
+        self._assert_matches(got, ref)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused conv is a GPU kernel")
+    def test_chunk_shorter_than_the_conv_window(self):
+        """A 1-token chunk with a prefix: the outgoing window is mostly carried.
+
+        This is the branch where the new conv_state is not fully determined by the
+        current chunk, so the tail write has to shift the incoming history rather
+        than just copy the last tokens.
+        """
+        got, ref = self._run([1, 2, 1], [True, True, True])
+        self._assert_matches(got, ref)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused conv is a GPU kernel")
+    def test_non_identity_slot_mapping(self):
+        """Slots are pool indices, not request indices, and need not be ordered."""
+        got, ref = self._run([4, 4, 4], [True, True, True], slot_ids=[3, 0, 2])
+        self._assert_matches(got, ref)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused conv is a GPU kernel")
+    def test_request_longer_than_one_token_tile(self):
+        """Tokens are tiled in blocks of 64; a request must span tiles correctly."""
+        got, ref = self._run([200, 17], [True, False])
+        self._assert_matches(got, ref)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused conv is a GPU kernel")
+    def test_single_request(self):
+        """One request exercises the degenerate binary search (a single step)."""
+        got, ref = self._run([37], [True])
+        self._assert_matches(got, ref)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused conv is a GPU kernel")
+    def test_covered_rejects_the_unfolded_two_stage_conv(self):
+        """Without the folded weight there is nothing for this kernel to apply."""
+        from sglang.kernels.ops.attention import cca_conv1d
+
+        args = self._inputs([4], [False])
+        cu = torch.tensor([0, 4], dtype=torch.int32, device="cuda")
+        self.assertFalse(
+            cca_conv1d.covered(
+                args["qk"],
+                args["hidden_states"],
+                None,
+                args["bias"],
+                args["conv_state"],
+                args["prev_hs_state"],
+                cu,
+                torch.zeros(1, dtype=torch.bool, device="cuda"),
+                torch.zeros(1, dtype=torch.int64, device="cuda"),
+                self.TOTAL_PADDING,
+                self.GROUPS,
+            )
+        )
+
+
+class TestCCAFusedDecodeConv(CustomTestCase):
+    """Fused decode conv (window + shift + matmul) vs the existing two-launch path.
+
+    The reference here is the unfused chain the model runs today, so this pins the
+    claim that folding the grouped matmul into the window build changes nothing
+    numerically -- and that the in-place history shift still reads each tap before
+    it is overwritten.
+    """
+
+    GROUPS = 3
+    CG = 16
+    HIDDEN = 8
+    TOTAL_PADDING = 2
+
+    def _run(self, num_tokens: int, slot_ids: List[int]):
+        from sglang.kernels.ops.attention import cca_conv1d_update
 
         torch.manual_seed(0)
-        tp_size, dp_size, dp_rank = 8, 4, 2
-        local_rows, hidden, num_experts = 8, 6, 5
-        global_rows = local_rows * dp_size
+        channels = self.GROUPS * self.CG
+        taps = self.TOTAL_PADDING + 1
+        dev, dt = "cuda", torch.bfloat16
+        num_slots = max(s for s in slot_ids) + 2
 
-        # Per-rank partial expert outputs over the gathered token set, plus the
-        # global router state every rank holds identically.
-        partials = [torch.randn(global_rows, hidden) for _ in range(tp_size)]
-        hidden_states = torch.randn(global_rows, hidden)
-        probs = torch.rand(global_rows, 1)
-        indices = torch.randint(0, num_experts + 1, (global_rows, 1))
-
-        combine = DPCombine(local_start=dp_rank * local_rows, local_rows=local_rows)
-        rows = slice(combine.local_start, combine.local_start + combine.local_rows)
-
-        # Reference: premask, all-reduce, blend globally, then scatter.
-        masks_and_masked = [
-            mod_premask_experts(p, indices, num_experts) for p in partials
-        ]
-        mod_mask = masks_and_masked[0][0]
-        all_reduced = sum(m for _, m in masks_and_masked)
-        reference = mod_blend(all_reduced, mod_mask, hidden_states * probs)[rows]
-
-        # Under test: premask, reduce-scatter (== summing the same partials but
-        # keeping only this replica's rows), blend on the narrowed operands.
-        reduce_scattered = sum(m[rows] for _, m in masks_and_masked)
-        local_mask, local_hidden, local_probs = _slice_combined_rows(
-            combine, mod_mask, hidden_states, probs
+        qk = torch.randn(num_tokens, channels, device=dev, dtype=dt)
+        hs = torch.randn(num_tokens, self.HIDDEN, device=dev, dtype=dt)
+        weight = (
+            torch.randn(self.GROUPS, self.CG, self.CG * taps, device=dev, dtype=dt)
+            * 0.1
         )
-        got = mod_blend(reduce_scattered, local_mask, local_hidden * local_probs)
+        bias = torch.randn(self.GROUPS, self.CG, device=dev, dtype=dt) * 0.1
+        conv_state = torch.randn(
+            num_slots, channels, self.TOTAL_PADDING, device=dev, dtype=dt
+        )
+        prev_hs = torch.randn(num_slots, self.HIDDEN, 1, device=dev, dtype=dt)
+        slots = torch.tensor(slot_ids, dtype=torch.int64, device=dev)
 
-        self.assertEqual(got.shape, (local_rows, hidden))
-        torch.testing.assert_close(got, reference)
+        # Reference: build the window, apply the einsum, shift the pools.
+        live = [s for s in slot_ids if s >= 0]
+        ref_cs, ref_ph = conv_state.clone(), prev_hs.clone()
+        left = conv_state.index_select(0, slots.clamp(min=0))
+        window = torch.cat([left, qk.unsqueeze(-1)], dim=-1)
+        grouped = window.reshape(num_tokens, self.GROUPS, -1)
+        ref_qk = (
+            torch.einsum("tgk,gok->tgo", grouped.float(), weight.float()) + bias.float()
+        ).reshape(num_tokens, -1)
+        ref_prev = prev_hs.index_select(0, slots.clamp(min=0)).squeeze(-1)
+        for i, s in enumerate(slot_ids):
+            if s >= 0:
+                ref_cs[s] = window[i, :, -self.TOTAL_PADDING :]
+                ref_ph[s] = hs[i].unsqueeze(-1)
+
+        got_cs, got_ph = conv_state.clone(), prev_hs.clone()
+        self.assertTrue(
+            cca_conv1d_update.covered(
+                qk,
+                hs,
+                weight,
+                bias,
+                got_cs,
+                got_ph,
+                slots,
+                self.TOTAL_PADDING,
+                self.GROUPS,
+            )
+        )
+        got_qk, got_prev = cca_conv1d_update.cca_conv1d_update(
+            qk,
+            hs,
+            weight,
+            bias,
+            got_cs,
+            got_ph,
+            slots,
+            self.TOTAL_PADDING,
+            self.GROUPS,
+        )
+        torch.testing.assert_close(got_qk.float(), ref_qk.float(), rtol=2e-2, atol=2e-2)
+        if live:
+            idx = torch.tensor(live, device=dev)
+            torch.testing.assert_close(
+                got_cs.index_select(0, idx).float(),
+                ref_cs.index_select(0, idx).float(),
+            )
+            torch.testing.assert_close(
+                got_ph.index_select(0, idx).float(),
+                ref_ph.index_select(0, idx).float(),
+            )
+        return got_prev, ref_prev
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused conv is a GPU kernel")
+    def test_matches_the_unfused_chain(self):
+        got, ref = self._run(24, list(range(24)))
+        torch.testing.assert_close(got.float(), ref.float())
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused conv is a GPU kernel")
+    def test_spans_multiple_token_tiles(self):
+        got, ref = self._run(80, list(range(80)))
+        torch.testing.assert_close(got.float(), ref.float())
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused conv is a GPU kernel")
+    def test_padded_rows_leave_the_pool_untouched(self):
+        """Batch padding writes negative slot ids; those rows must touch no state."""
+        from sglang.kernels.ops.attention import cca_conv1d_update
+
+        torch.manual_seed(1)
+        channels = self.GROUPS * self.CG
+        taps = self.TOTAL_PADDING + 1
+        dev, dt = "cuda", torch.bfloat16
+        qk = torch.randn(4, channels, device=dev, dtype=dt)
+        hs = torch.randn(4, self.HIDDEN, device=dev, dtype=dt)
+        weight = (
+            torch.randn(self.GROUPS, self.CG, self.CG * taps, device=dev, dtype=dt)
+            * 0.1
+        )
+        bias = torch.randn(self.GROUPS, self.CG, device=dev, dtype=dt) * 0.1
+        conv_state = torch.randn(3, channels, self.TOTAL_PADDING, device=dev, dtype=dt)
+        prev_hs = torch.randn(3, self.HIDDEN, 1, device=dev, dtype=dt)
+        before_cs, before_ph = conv_state.clone(), prev_hs.clone()
+        slots = torch.tensor([-1, -1, -1, -1], dtype=torch.int64, device=dev)
+
+        cca_conv1d_update.cca_conv1d_update(
+            qk,
+            hs,
+            weight,
+            bias,
+            conv_state,
+            prev_hs,
+            slots,
+            self.TOTAL_PADDING,
+            self.GROUPS,
+        )
+        self.assertTrue(torch.equal(conv_state, before_cs))
+        self.assertTrue(torch.equal(prev_hs, before_ph))
 
 
 if __name__ == "__main__":

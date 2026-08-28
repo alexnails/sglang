@@ -1222,10 +1222,7 @@ class Envs:
     # raising max_running_requests. Off = original locking + ratio (escape hatch).
     SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
 
-    # ===================================================================
-    # CUDA graphs and execution buffers
-    # ===================================================================
-    SGLANG_USE_BREAKABLE_CUDA_GRAPH = EnvBool(False)
+    #     SGLANG_USE_BREAKABLE_CUDA_GRAPH = EnvBool(False)
     # Guards CUDA graph executable dedup via cudaGraphExecUpdate.
     SGLANG_ENABLE_CUDA_GRAPH_DEDUP = EnvBool(False)
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
@@ -1520,19 +1517,29 @@ class Envs:
     # ZAYA1
     # ===================================================================
     # A tp=8/dp=4 ZAYA1-74B decode step spends most of its GPU time in
-    # collectives, so these knobs A/B the two ways to attack that: send fewer
-    # bytes, or hide the bytes behind compute. Both measured LOSSES on MI350X
-    # (throughput tracks collective op count, not payload bytes) and kept only
-    # so the refutation stays reproducible.
-    #
-    # Combine each MoE layer's partial expert outputs with a reduce-scatter
-    # instead of an all-reduce followed by a scatter that discards most of it.
-    # Ring traffic per layer drops ~1.75x on the largest collective of the step.
-    # Falls back to the all-reduce when the buffer layout cannot support it.
-    SGLANG_OPT_ZAYA_MOE_REDUCE_SCATTER = EnvBool(False)
-    # Run each MoE layer's DP all-gather on the shared comm stream so it overlaps
-    # the router prologue instead of blocking the compute stream on it.
-    SGLANG_OPT_ZAYA_OVERLAP_DP_GATHER = EnvBool(False)
+    # collectives, and throughput tracks collective OP COUNT, not payload bytes:
+    # cutting bytes 40% while raising op count 67% lost 1-3% at every
+    # concurrency, and a side-stream gather cost a flat ~58us/layer barrier.
+    # Cutting op count is the direction that works, which is what the global
+    # residual below does.
+    # Hold the residual stream in the global DP layout instead of the DP-local
+    # one. One partial gather of the o_proj partials then does the work of both
+    # the attention-TP all-reduce and the DP gather, cutting an attention+MoE
+    # layer pair from three collectives to two and dropping the MoE scatter, at
+    # the cost of running each norm over every replica's rows. Measured +6.3% to
+    # +7.6% tok/s on MI350X tp=8/dp=4, greedy ids bit-identical.
+    SGLANG_OPT_ZAYA_GLOBAL_RESIDUAL = EnvBool(False)
+    # Run the prefill CCA conv as one varlen Triton kernel pair instead of the
+    # per-request host loop in cca_extend. The loop issues O(batch) launches per
+    # layer and reads CPU sequence lengths; the fused path is driven entirely by
+    # device tensors. Not compatible with a captured prefill graph -- CCA
+    # resolves that conflict in the graph's favour and logs it.
+    SGLANG_OPT_ZAYA_FUSED_CCA_PREFILL = EnvBool(False)
+    # Fold the decode conv's grouped matmul into the window build instead of
+    # materializing the [T, C, taps] window for a separate batched GEMM.
+    # Launch-neutral by construction and measured a LOSS (TPOT +2.4% at C=32);
+    # kept so the refutation stays reproducible.
+    SGLANG_OPT_ZAYA_FUSED_CCA_DECODE = EnvBool(False)
 
     # ===================================================================
     # Symmetric memory

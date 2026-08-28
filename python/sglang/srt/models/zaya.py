@@ -45,7 +45,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Iterable
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import msgspec
 import torch
@@ -62,17 +62,14 @@ from sglang.srt.distributed import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
+    dp_gather_partial,
     dp_gather_replicate,
-    dp_gather_replicate_async,
-    dp_reduce_scatter_tensor,
     dp_scatter,
     get_attention_dp_rank,
+    get_dp_global_num_tokens,
     get_global_dp_buffer,
-    get_global_dp_buffer_len,
     get_local_dp_buffer,
     is_dp_attention_enabled,
-    is_dp_max_padding,
-    prewarm_dp_gather_async,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -221,7 +218,7 @@ def _apply_norm_with_fp32_residual(
 def cca_extend(
     qk: torch.Tensor,
     hidden_states: torch.Tensor,
-    conv_qk: nn.Module,
+    conv_fn: Callable[[torch.Tensor], torch.Tensor],
     conv_state: torch.Tensor,
     prev_hs_state: torch.Tensor,
     slot_ids: List[int],
@@ -231,15 +228,22 @@ def cca_extend(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Prefill / extend conv-state step (v1, pure torch).
 
-    Walks each request in the batch, applies ``conv_qk`` with the request's own
+    Walks each request in the batch, applies ``conv_fn`` with the request's own
     initial state (zeros on a fresh first chunk, the cached ``conv_state`` slot
     otherwise), writes the updated ``conv_state`` / ``prev_hs_state`` back, and
     returns the concatenated ``(qk_out, v2_input)`` in the original token layout.
 
+    ``conv_fn`` maps ``[N, C, S + total_padding] -> [N, C, S]``; callers pass
+    :meth:`CCA._conv_qk_run` so the folded single grouped conv is used when it is
+    available.
+
     ``slot_ids`` is the host mirror of the per-request MambaPool slot indices and
     ``has_prefix[i]`` is ``True`` when request ``i`` resumes a cached prefix.
 
-    The Triton swap (:func:`cca_conv1d_fn`) removes this per-request loop.
+    The launch count here grows with the batch and the loop trip count comes from
+    ``extend_seq_lens_cpu``, which is also what blocks the prefill CUDA graph;
+    :func:`cca_conv1d_fn <sglang.kernels.ops.attention.cca_conv1d.cca_conv1d_fn>`
+    is the device-driven replacement.
     """
     dtype = hidden_states.dtype
     if total_padding is None:
@@ -270,7 +274,7 @@ def cca_extend(
             ].transpose(0, 1)
             start = end
 
-        packed_out = conv_qk(packed)  # [1, C, offsets_in[-1] - pad]
+        packed_out = conv_fn(packed)  # [1, C, offsets_in[-1] - pad]
 
         start = 0
         for i, s in enumerate(seq_lens):
@@ -301,7 +305,7 @@ def cca_extend(
                 left_pad = qk_cur.new_zeros((1, in_out_ch, total_padding))
             padded = torch.cat([left_pad, qk_cur], dim=-1)
 
-            out = conv_qk(padded)  # [1, C, S_cur]
+            out = conv_fn(padded)  # [1, C, S_cur]
             qk_out[start:end] = out.squeeze(0).transpose(0, 1)
 
             new_state = padded[..., -total_padding:]
@@ -350,7 +354,32 @@ def cca_decode(
     if total_padding is None:
         total_padding = conv_state.shape[-1]
 
+    from sglang.kernels.ops.attention import cca_conv1d_update as _fused_update
     from sglang.kernels.ops.attention import cca_state_step as _state_step
+
+    if envs.SGLANG_OPT_ZAYA_FUSED_CCA_DECODE.get() and _fused_update.covered(
+        qk,
+        hidden_states,
+        decode_conv_weight,
+        decode_conv_bias,
+        conv_state,
+        prev_hs_state,
+        mamba_indices,
+        total_padding,
+        decode_conv_groups or 0,
+    ):
+        # One kernel for the window, the history shift and the grouped matmul.
+        return _fused_update.cca_conv1d_update(
+            qk,
+            hidden_states,
+            decode_conv_weight,
+            decode_conv_bias,
+            conv_state,
+            prev_hs_state,
+            mamba_indices,
+            total_padding,
+            decode_conv_groups,
+        )
 
     if _state_step.covered(
         qk, hidden_states, conv_state, prev_hs_state, mamba_indices, total_padding
@@ -402,20 +431,19 @@ def cca_decode(
 
 
 def cca_conv1d_fn(*args, **kwargs):
-    raise NotImplementedError(
-        "Fused CCA prefill conv-with-state kernel not implemented yet; "
-        "the model uses cca_extend (v1 torch) in the meantime."
-    )
+    """Fused varlen prefill conv-with-state; see the kernel module for the contract."""
+    from sglang.kernels.ops.attention.cca_conv1d import cca_conv1d_fn as _fused
+
+    return _fused(*args, **kwargs)
 
 
 def cca_conv1d_update(*args, **kwargs):
-    raise NotImplementedError(
-        "Fused CCA decode conv-with-state kernel not implemented yet; "
-        "the model uses cca_decode (v1 torch) in the meantime. The state "
-        "plumbing around the conv is already fused -- see "
-        "sglang.kernels.ops.attention.cca_state_step -- so what remains here is "
-        "folding the grouped matmul itself into that kernel."
+    """Fused decode conv-with-state (window + grouped matmul in one kernel)."""
+    from sglang.kernels.ops.attention.cca_conv1d_update import (
+        cca_conv1d_update as _fused,
     )
+
+    return _fused(*args, **kwargs)
 
 
 def _cca_decode_conv(
@@ -679,6 +707,10 @@ class CCA(nn.Module):
         # lazily in ``forward``, because a lazy fold would execute inside CUDA
         # graph capture and bake stale constants into the replayed graph.
         self._decode_conv_folded = False
+
+        # Tri-state cache for ``_fused_prefill_conv_allowed``; None == not yet
+        # resolved (it reads server args, which do not exist this early).
+        self._fused_prefill_conv_ok: Optional[bool] = None
 
         # Per-K-head learnable temperature scalar (per-rank slice).
         self.temp = nn.Parameter(torch.zeros(self.num_k_heads))
@@ -960,6 +992,105 @@ class CCA(nn.Module):
         )
         self._decode_conv_folded = True
 
+    def _fused_prefill_conv_allowed(self) -> bool:
+        """Whether the fused varlen prefill conv may run, resolved once.
+
+        The fused conv and the prefill CUDA graph are each correct alone and
+        corrupt together: under capture the fused path yields all-zero logits,
+        meaning the conv state it writes is wrong, and the cause is not yet
+        understood. The graph is the larger win and works with the reference host
+        loop, so it takes precedence.
+
+        Resolved lazily rather than in ``__init__`` because the server args it
+        reads do not exist that early, and reached only once the env flag is on so
+        a module built outside a server (a CPU unit test) never touches them.
+        """
+        if self._fused_prefill_conv_ok is None:
+            from sglang.srt.model_executor.cuda_graph_config import Backend
+
+            prefill_graph_on = (
+                get_global_server_args().cuda_graph_config.prefill.backend
+                != Backend.DISABLED
+            )
+            self._fused_prefill_conv_ok = not prefill_graph_on
+            if prefill_graph_on:
+                _log_dataflow_decision(
+                    "cca prefill: fused kernel disabled because the prefill CUDA "
+                    "graph is enabled; the two are not yet compatible (the fused "
+                    "conv under capture produces zero logits)"
+                )
+        return self._fused_prefill_conv_ok
+
+    def _run_extend_conv(
+        self,
+        qk: torch.Tensor,
+        hidden_states: torch.Tensor,
+        meta,
+        conv_state: torch.Tensor,
+        prev_hs_state: torch.Tensor,
+        extend_seq_lens_cpu: List[int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the prefill conv-with-state, preferring the fused varlen kernel.
+
+        The fused path needs the folded single grouped weight and the backend's
+        device-side request metadata; when either is missing it falls back to the
+        reference host loop in :func:`cca_extend`.
+        """
+        from sglang.kernels.ops.attention import cca_conv1d as _conv1d
+
+        if (
+            envs.SGLANG_OPT_ZAYA_FUSED_CCA_PREFILL.get()
+            and self._fused_prefill_conv_allowed()
+        ):
+            bias = self.decode_conv_bias.reshape(-1)
+            weight = self.fold_conv1d_weight if self._decode_conv_folded else None
+            if _conv1d.covered(
+                qk,
+                hidden_states,
+                weight,
+                bias,
+                conv_state,
+                prev_hs_state,
+                meta.query_start_loc,
+                meta.has_initial_state,
+                meta.cache_indices,
+                self.total_padding,
+                self.decode_conv_groups,
+            ):
+                _log_dataflow_decision(
+                    f"cca prefill: fused varlen kernel, {qk.shape[0]} tokens over "
+                    f"{meta.query_start_loc.shape[0] - 1} requests"
+                )
+                return _conv1d.cca_conv1d_fn(
+                    qk,
+                    hidden_states,
+                    weight,
+                    bias,
+                    conv_state,
+                    prev_hs_state,
+                    meta.query_start_loc,
+                    meta.has_initial_state,
+                    meta.cache_indices,
+                    self.total_padding,
+                    self.decode_conv_groups,
+                )
+            _log_dataflow_decision(
+                "cca prefill: fused kernel declined by covered(), running the "
+                f"per-request host loop (folded={self._decode_conv_folded})"
+            )
+
+        return cca_extend(
+            qk,
+            hidden_states,
+            self._conv_qk_run,
+            conv_state,
+            prev_hs_state,
+            meta.slot_ids_cpu,
+            meta.has_prefix_cpu,
+            extend_seq_lens_cpu,
+            self.total_padding,
+        )
+
     def _conv_qk_run(self, padded: torch.Tensor) -> torch.Tensor:
         """Run the conv on ``[N, C, S + total_padding]`` -> ``[N, C, S]``.
 
@@ -1152,16 +1283,13 @@ class CCA(nn.Module):
                 decode_conv_groups=self.decode_conv_groups,
             )
         else:
-            qk_out, v2_input = cca_extend(
+            qk_out, v2_input = self._run_extend_conv(
                 qk,
                 hidden_states,
-                self.conv_qk,
+                meta,
                 conv_state,
                 prev_hs_state,
-                meta.slot_ids_cpu,
-                meta.has_prefix_cpu,
                 forward_batch.extend_seq_lens_cpu,
-                self.total_padding,
             )
 
         query_conv = qk_out[:, : self.latent_q_dim].view(
@@ -1323,6 +1451,7 @@ class ZayaAttention(nn.Module):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        reduce_output: bool = True,
     ) -> torch.Tensor:
         # Idle forward: under DP attention a replica with no requests this step
         # still runs a forward (to join the MoE layers' gather/scatter) with T=0.
@@ -1362,7 +1491,14 @@ class ZayaAttention(nn.Module):
         # o_proj is RowParallel with ``reduce_results=False``; reduce the partial
         # sums across the attention-TP group (equals the global TP group unless
         # DP attention is enabled). A size-1 group makes this a no-op.
-        if self.tp_size > 1:
+        #
+        # ``reduce_output=False`` returns the per-rank partial instead. The
+        # global-residual dataflow uses it to fold this reduction into the DP
+        # gather: ``dp_gather_partial`` has every attention-TP rank memcpy its
+        # partial into the *same* slot of the global buffer, so the all-reduce
+        # that gathers across replicas sums the partials within each replica as a
+        # side effect -- one collective doing both jobs.
+        if reduce_output and self.tp_size > 1:
             output = attn_tp_all_reduce(output)
         return output
 
@@ -1474,29 +1610,15 @@ class ZayaRouter(nn.Module):
         self,
         hidden_states: torch.Tensor,
         prev_router_hidden_states: Optional[torch.Tensor] = None,
-        gather_event: Optional[torch.cuda.Event] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # ``hidden_states`` is ``[T, H]``.
-        use_eda = (
+        hs, _ = self.down_proj(hidden_states)
+        if (
             self.use_eda
             and prev_router_hidden_states is not None
             and hasattr(self, "router_states_scale")
-        )
-        # The EDA term reads only ``prev_router_hidden_states``, which the previous
-        # MoE layer already left in the gathered layout, so it is the one piece of
-        # router work that does not depend on this layer's gather. Compute it
-        # first, then wait -- with ``gather_event`` set it runs while the gather is
-        # still in flight on the comm stream. Same operands in the same order as
-        # the un-overlapped form, so the arithmetic is unchanged.
-        eda_term = (
-            prev_router_hidden_states * self.router_states_scale if use_eda else None
-        )
-        if gather_event is not None:
-            torch.cuda.current_stream().wait_event(gather_event)
-
-        hs, _ = self.down_proj(hidden_states)
-        if eda_term is not None:
-            hs = hs + eda_term
+        ):
+            hs = hs + prev_router_hidden_states * self.router_states_scale
 
         # ``hs`` is a freshly-allocated tensor (output of ``down_proj`` or the
         # EDA add above) and ``rmsnorm_eda`` is non-residual / out-of-place,
@@ -1588,67 +1710,6 @@ def mod_blend(
     return torch.addcmul(masked_experts_reduced, 1.0 - mod_mask, mod_out)
 
 
-class DPCombine(msgspec.Struct, frozen=True):
-    """Where this rank's slice of the DP-gathered token set lives.
-
-    Passed to :class:`ZayaBlock` when the experts ran on the gathered (global)
-    tokens and the partial outputs should be combined with a reduce-scatter that
-    lands only this DP replica's rows, instead of an all-reduce that replicates
-    all of them and a scatter that then drops the rest.
-    """
-
-    local_start: int
-    local_rows: int
-
-
-def dp_combine_for(*, global_rows: int, local_rows: int) -> Optional[DPCombine]:
-    """Describe the reduce-scatter combine for a gather of ``local_rows`` rows per
-    replica into a ``global_rows``-row buffer, or ``None`` when the layout cannot
-    support one.
-
-    Three preconditions, all properties of the gathered buffer rather than of the
-    model:
-
-    * MAX_LEN padding -- every replica occupies an equal, contiguous block, so
-      this rank's rows start at ``dp_rank * local_rows``. Under SUM_LEN the blocks
-      are ragged and the even ``tensor_split`` inside ``dp_reduce_scatter_tensor``
-      would straddle replica boundaries.
-    * The blocks tile the buffer exactly (``local_rows * dp_size == global_rows``).
-      MAX_LEN pads every replica to the batch's longest, so this holds whenever
-      that padding was applied to the tensor we are handed -- but the check is
-      cheap and a mismatch would silently return the wrong number of rows.
-    * ``global_rows`` divisible by the TP size -- the reduce-scatter splits the
-      global buffer into ``tp_size`` equal chunks, and each replica's block must be
-      a whole number of them. A tp=8/dp=4 decode of one token per replica gathers
-      4 rows and cannot be split 8 ways, so it keeps the all-reduce.
-    """
-    parallel = get_parallel()
-    if not is_dp_max_padding():
-        return None
-    if local_rows * parallel.attn_dp_size != global_rows:
-        return None
-    if global_rows % parallel.tp_size != 0:
-        return None
-    return DPCombine(
-        local_start=get_attention_dp_rank() * local_rows, local_rows=local_rows
-    )
-
-
-def _slice_combined_rows(
-    dp_combine: Optional[DPCombine], *tensors: torch.Tensor
-) -> tuple[torch.Tensor, ...]:
-    """Narrow global per-token tensors to the rows a reduce-scatter combine kept.
-
-    A no-op without ``dp_combine`` (the combine was an all-reduce, so every rank
-    still holds all rows). Row slices of a row-major tensor stay contiguous, so
-    the fused MOD kernels' coverage checks still pass.
-    """
-    if dp_combine is None:
-        return tensors
-    rows = slice(dp_combine.local_start, dp_combine.local_start + dp_combine.local_rows)
-    return tuple(t[rows] for t in tensors)
-
-
 class ZayaBlock(nn.Module):
     """ZAYA1 MoE mixer: ZayaRouter feeding FusedMoE, with optional MOD residual blend."""
 
@@ -1713,14 +1774,12 @@ class ZayaBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         prev_router_hidden_states: Optional[torch.Tensor] = None,
-        dp_combine: Optional[DPCombine] = None,
-        gather_event: Optional[torch.cuda.Event] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if hidden_states.shape[0] == 0:
             return hidden_states, hidden_states.new_zeros((0, self.mlp_expansion))
 
         probs, indices, router_hs_next = self.router(
-            hidden_states, prev_router_hidden_states, gather_event
+            hidden_states, prev_router_hidden_states
         )
 
         topk_out = StandardTopKOutput(
@@ -1758,14 +1817,7 @@ class ZayaBlock(nn.Module):
                 masked_experts = _mod.mod_premask(
                     experts_out, indices, self.num_moe_experts
                 )
-                masked_experts = self._combine_experts(masked_experts, dp_combine)
-                # The blend is per-token elementwise, so it is equally valid on
-                # the global rows (after an all-reduce) or on just this replica's
-                # rows (after a reduce-scatter) -- as long as its other operands
-                # are narrowed to the same rows.
-                indices, hidden_states, probs = _slice_combined_rows(
-                    dp_combine, indices, hidden_states, probs
-                )
+                masked_experts = self._reduce_experts(masked_experts)
                 hidden_out = _mod.mod_blend(
                     masked_experts,
                     indices,
@@ -1774,39 +1826,16 @@ class ZayaBlock(nn.Module):
                     self.num_moe_experts,
                 )
             else:
+                mod_out = hidden_states * probs
                 mod_mask, masked_experts = mod_premask_experts(
                     experts_out, indices, self.num_moe_experts
                 )
-                masked_experts = self._combine_experts(masked_experts, dp_combine)
-                mod_mask, hidden_states, probs = _slice_combined_rows(
-                    dp_combine, mod_mask, hidden_states, probs
-                )
-                hidden_out = mod_blend(masked_experts, mod_mask, hidden_states * probs)
+                masked_experts = self._reduce_experts(masked_experts)
+                hidden_out = mod_blend(masked_experts, mod_mask, mod_out)
         else:
-            hidden_out = self._combine_experts(
-                self.experts(hidden_states, topk_out), dp_combine
-            )
+            hidden_out = self._reduce_experts(self.experts(hidden_states, topk_out))
 
         return hidden_out, router_hs_next
-
-    def _combine_experts(
-        self, experts_out: torch.Tensor, dp_combine: Optional[DPCombine]
-    ) -> torch.Tensor:
-        """Combine per-rank partial expert outputs, keeping only what is needed.
-
-        With ``dp_combine`` the reduce and the DP scatter collapse into a single
-        reduce-scatter that delivers just this replica's rows; without it, the
-        caller reduces globally and scatters afterwards.
-        """
-        if dp_combine is None:
-            return self._reduce_experts(experts_out)
-        local = torch.empty(
-            (dp_combine.local_rows, experts_out.shape[1]),
-            dtype=experts_out.dtype,
-            device=experts_out.device,
-        )
-        dp_reduce_scatter_tensor(local, experts_out)
-        return local
 
     def _reduce_experts(self, experts_out: torch.Tensor) -> torch.Tensor:
         """Combine partial expert outputs over the MoE parallel groups.
@@ -1827,6 +1856,104 @@ class ZayaBlock(nn.Module):
 # ---------------------------------------------------------------------------
 # Decoder layers
 # ---------------------------------------------------------------------------
+
+
+def dp_gather_required() -> bool:
+    """Whether the MoE layers need to see the *global* token set.
+
+    A token must be visible to every rank the expert reduce spans, so the gather
+    is needed exactly when that reduce is wider than the attention-TP group, i.e.
+    when it crosses DP replicas. When ``moe_tp == attn_tp`` (e.g. --moe-dp-size
+    equal to the attention DP size) each replica owns a self-contained MoE over
+    its own ranks, the token is already replicated across them by
+    ``attn_tp_all_reduce``, and the gather/scatter pair is pure overhead.
+
+    Compare against the width of the group ``ZayaBlock._reduce_experts`` actually
+    reduces over -- expert-parallel AND MoE-tensor-parallel -- not moe_tp alone.
+    Under EP (``--ep-size 8``) moe_tp collapses to 1 while the reduce still spans
+    all 8 ranks, so keying off moe_tp alone would skip a gather that is required
+    and silently drop every token the rank does not own.
+    """
+    parallel = get_parallel()
+    moe_reduce_width = parallel.moe_ep_size * parallel.moe_tp_size
+    return (
+        parallel.attn_dp_size > 1
+        and moe_reduce_width > parallel.attn_tp_size
+        and get_moe_a2a_backend().is_none()
+    )
+
+
+class GlobalResidualLayout(msgspec.Struct, frozen=True):
+    """Where this DP replica's rows sit inside the global DP buffer.
+
+    Present only on the global-residual dataflow (see
+    ``SGLANG_OPT_ZAYA_GLOBAL_RESIDUAL``), where the fp32 residual stream and the
+    normed hidden states are held in the global layout -- every rank holds every
+    replica's rows -- rather than the DP-local one. That lets a single
+    ``dp_gather_partial`` of the o_proj partials do the work of both the
+    attention-TP all-reduce and the MoE layer's separate gather, and removes the
+    MoE scatter: three collectives per attention+MoE layer pair become two, and
+    the norms pay for it by running over every replica's rows.
+    """
+
+    local_start: int
+    local_len: int
+
+    def local_view(self, global_rows: torch.Tensor) -> torch.Tensor:
+        """This replica's rows of a global-layout tensor, as a view.
+
+        A row slice of a contiguous 2D tensor is itself contiguous, which the
+        attention kernels and the gather's ``local_tokens`` assert require.
+        """
+        return global_rows[self.local_start : self.local_start + self.local_len]
+
+
+_logged_dataflow_decisions: set[str] = set()
+
+
+def _log_dataflow_decision(message: str) -> None:
+    """Log a dataflow decision once per distinct message.
+
+    Deduping on the *whole* message, shapes included, is deliberate: an earlier
+    A/B in this campaign was declined by a layout precondition and produced
+    baseline-identical numbers that read as a clean null result. A per-reason
+    dedupe would not have caught it either, because the decline happened first at
+    prefill and would have masked the decode decision behind it.
+    """
+    if message not in _logged_dataflow_decisions:
+        _logged_dataflow_decisions.add(message)
+        logger.info(message)
+
+
+def global_residual_layout() -> Optional[GlobalResidualLayout]:
+    """Layout for this forward, or None to run the DP-local dataflow."""
+    if not envs.SGLANG_OPT_ZAYA_GLOBAL_RESIDUAL.get():
+        return None
+    if not dp_gather_required():
+        _log_dataflow_decision(
+            "zaya global residual: declined, the expert reduce does not span DP "
+            "replicas so there is no gather to fold into"
+        )
+        return None
+    # The padded per-rank token counts: the same list that sized the global
+    # buffer (``set_dp_buffer_len``) and that ``get_dp_local_info`` cumsums on
+    # the device to place the gather's memcpy. Deriving the CPU row arithmetic
+    # from that one source is what keeps it from drifting out of agreement with
+    # where the gather actually writes -- including inside a captured CUDA graph,
+    # where every rank is padded to the bucket's token count.
+    sizes = get_dp_global_num_tokens()
+    if sizes is None:
+        _log_dataflow_decision(
+            "zaya global residual: declined, DP buffer metadata is unset"
+        )
+        return None
+    rank = get_attention_dp_rank()
+    layout = GlobalResidualLayout(local_start=sum(sizes[:rank]), local_len=sizes[rank])
+    _log_dataflow_decision(
+        f"zaya global residual: active, rows per rank {sizes}, this rank "
+        f"[{layout.local_start}, {layout.local_start + layout.local_len})"
+    )
+    return layout
 
 
 def _residual_scale_norm(
@@ -1917,6 +2044,7 @@ class ZayaDecoderATTLayer(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         prev_router_hidden_states: Optional[torch.Tensor] = None,
+        global_residual: Optional[GlobalResidualLayout] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         target_dtype = (
             self.input_norm.weight.dtype
@@ -1926,7 +2054,30 @@ class ZayaDecoderATTLayer(nn.Module):
         hidden_states, residual = _residual_scale_norm(
             self.res_scale, self.input_norm, residual, hidden_states, target_dtype
         )
-        hidden_states = self.self_attn(hidden_states, positions, forward_batch)
+        if global_residual is None:
+            hidden_states = self.self_attn(hidden_states, positions, forward_batch)
+            return hidden_states, residual, prev_router_hidden_states
+
+        # Global-residual dataflow: the residual stream -- and so the normed
+        # hidden states just computed -- cover every replica's rows, but attention
+        # is DP-local, so it runs on this replica's slice against its own
+        # positions and conv state. The partial gather then both sums the
+        # attention-TP partials and lifts the result back to the global layout,
+        # which is what the next (MoE) layer needs, so it needs no gather of its
+        # own and no scatter afterwards.
+        #
+        # The gather sits here rather than inside ``ZayaAttention.forward``
+        # deliberately: a replica idle this step returns early from that function
+        # before o_proj, and it must still take part in the collective or the
+        # ranks that are busy hang.
+        partial = self.self_attn(
+            global_residual.local_view(hidden_states),
+            positions,
+            forward_batch,
+            reduce_output=False,
+        )
+        hidden_states = get_global_dp_buffer(get_tp_group())
+        dp_gather_partial(hidden_states, partial, forward_batch)
         return hidden_states, residual, prev_router_hidden_states
 
 
@@ -1956,15 +2107,6 @@ class ZayaDecoderMLPLayer(nn.Module):
         else:
             self.res_scale = None
 
-        self.gather_event_key = ("zaya_gather", layer_id)
-        if envs.SGLANG_OPT_ZAYA_OVERLAP_DP_GATHER.get():
-            prewarm_dp_gather_async(self.gather_event_key)
-
-        # Odd layer ids are the MoE layers (see _build_layer), so layer 1 is the
-        # first; it reports which combine the run settled on, once.
-        self.first_moe_layer_id = 1
-        self._logged_combines: set[str] = set()
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1972,6 +2114,7 @@ class ZayaDecoderMLPLayer(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         prev_router_hidden_states: Optional[torch.Tensor] = None,
+        global_residual: Optional[GlobalResidualLayout] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         target_dtype = (
             self.input_norm.weight.dtype
@@ -1981,6 +2124,17 @@ class ZayaDecoderMLPLayer(nn.Module):
         hidden_states, residual = _residual_scale_norm(
             self.res_scale, self.input_norm, residual, hidden_states, target_dtype
         )
+        if global_residual is not None:
+            # Global-residual dataflow: the preceding attention layer's partial
+            # gather already left the hidden states in the global layout, so the
+            # experts can run on them directly. This is where that dataflow pays
+            # off -- no gather here, and no scatter after, because the residual
+            # this feeds back into is global too.
+            hidden_states, prev_router_hidden_states = self.zaya_block(
+                hidden_states, prev_router_hidden_states
+            )
+            return hidden_states, residual, prev_router_hidden_states
+
         # DP attention: the attention layers kept each DP replica's tokens
         # local, but the experts (and their EP / MoE-TP all-reduce) must run over
         # the *full* token set. Gather the DP-local normed hidden states into the
@@ -2000,90 +2154,21 @@ class ZayaDecoderMLPLayer(nn.Module):
         # multiplies the tokens by ``attn_tp_size`` -- a no-op at attn_tp=1 (so
         # tp=2/dp=2 was correct) but corrupting every value once attn_tp>1 (e.g.
         # tp=4/dp=2 on 74B doubled them, producing garbage output).
-        # The gather is needed only when the MoE-TP group is *wider* than the
-        # attention-TP group, i.e. when it spans DP replicas: then a token must be
-        # visible to every MoE rank for the expert shards to see it. When
-        # ``moe_tp == attn_tp`` (e.g. --moe-dp-size equal to the attention DP size)
-        # each replica owns a self-contained MoE over its own ranks, the token is
-        # already replicated across them by ``attn_tp_all_reduce``, and the
-        # gather/scatter pair is pure overhead.
-        #
-        # This matters a lot: profiling tp=8/dp=4 on the 74B put ~83% of decode GPU
-        # time in collectives, of which the per-MoE-layer all-gather alone was
-        # 29%. Skipping it when the groups coincide removes 60 all-gathers and 60
-        # scatters per step.
-        # Compare against the width of the group ``_reduce_experts`` actually
-        # reduces over -- expert-parallel AND MoE-tensor-parallel -- not moe_tp
-        # alone. Under EP (``--ep-size 8``) moe_tp collapses to 1 while the reduce
-        # still spans all 8 ranks, so keying off moe_tp alone would skip a gather
-        # that is required and silently drop every token the rank does not own.
-        parallel = get_parallel()
-        moe_reduce_width = parallel.moe_ep_size * parallel.moe_tp_size
-        use_dp_gather = (
-            parallel.attn_dp_size > 1
-            and moe_reduce_width > parallel.attn_tp_size
-            and get_moe_a2a_backend().is_none()
-        )
-        # The reduce-scatter combine subsumes the scatter below, but only when the
-        # MoE reduce spans exactly the TP group -- that is the group
-        # ``dp_reduce_scatter_tensor`` reduces over. A narrower MoE reduce (e.g.
-        # --moe-dp-size) must keep the group-scoped all-reduce in
-        # ``_reduce_experts``.
-        dp_combine = None
-        if (
-            use_dp_gather
-            and moe_reduce_width == parallel.tp_size
-            and envs.SGLANG_OPT_ZAYA_MOE_REDUCE_SCATTER.get()
-        ):
-            dp_combine = dp_combine_for(
-                global_rows=get_global_dp_buffer_len(),
-                local_rows=hidden_states.shape[0],
-            )
-            if self.layer_id == self.first_moe_layer_id:
-                # The combine declines itself on layouts it cannot serve, so report
-                # which path a run actually took, not which one was requested, and
-                # spell out each precondition -- otherwise a decline is
-                # indistinguishable from the flag not being read at all.
-                #
-                # Deduplicate on the whole message, not just the verdict: prefill
-                # runs under SUM_LEN and always declines, so keying on the verdict
-                # alone would let that first line mask every later decode shape.
-                global_rows = get_global_dp_buffer_len()
-                local_rows = hidden_states.shape[0]
-                msg = (
-                    f"ZAYA1 MoE combine: "
-                    f"{'reduce-scatter' if dp_combine else 'all-reduce'} "
-                    f"global_rows={global_rows} local_rows={local_rows} "
-                    f"max_pad={is_dp_max_padding()} "
-                    f"tiles={local_rows * parallel.attn_dp_size == global_rows} "
-                    f"div_tp={global_rows % parallel.tp_size == 0}"
-                )
-                if msg not in self._logged_combines:
-                    self._logged_combines.add(msg)
-                    logger.info("%s", msg)
-
-        gather_event = None
+        # Whether the gather is needed at all is ``dp_gather_required``; skipping
+        # it when the MoE and attention groups coincide matters a lot, because
+        # profiling tp=8/dp=4 on the 74B put ~83% of decode GPU time in
+        # collectives, of which the per-MoE-layer all-gather alone was 29%.
+        use_dp_gather = dp_gather_required()
         if use_dp_gather:
             hidden_states, local_hidden_states = (
                 get_global_dp_buffer(get_tp_group()),
                 hidden_states,
             )
-            if envs.SGLANG_OPT_ZAYA_OVERLAP_DP_GATHER.get():
-                # Key the persistent event by layer: a fresh torch.cuda.Event per
-                # layer per forward exhausts the HSA signal pool within a few
-                # hundred steps (see _tbo_event).
-                gather_event = dp_gather_replicate_async(
-                    hidden_states,
-                    local_hidden_states,
-                    forward_batch,
-                    event_key=self.gather_event_key,
-                )
-            else:
-                dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
+            dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
         hidden_states, prev_router_hidden_states = self.zaya_block(
-            hidden_states, prev_router_hidden_states, dp_combine, gather_event
+            hidden_states, prev_router_hidden_states
         )
-        if use_dp_gather and dp_combine is None:
+        if use_dp_gather:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_tp_group()),
                 hidden_states,
@@ -2183,12 +2268,24 @@ class ZayaModel(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
+        global_residual = global_residual_layout()
+
         if self.pp_group.is_first_rank:
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_tokens(input_ids)
             residual = None
+            if global_residual is not None:
+                # Seed the stream in the global layout. Layer 0 has no incoming
+                # residual, so its residual *is* these embeddings -- gathering
+                # them once here is what makes the residual global, and from then
+                # on each attention layer's partial gather keeps it that way at no
+                # extra cost. This is the one collective the dataflow adds, against
+                # the 60 attention-TP all-reduces it removes.
+                global_hidden = get_global_dp_buffer(get_tp_group())
+                dp_gather_replicate(global_hidden, hidden_states, forward_batch)
+                hidden_states = global_hidden
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
@@ -2203,15 +2300,26 @@ class ZayaModel(nn.Module):
                 positions=positions,
                 forward_batch=forward_batch,
                 prev_router_hidden_states=prev_router_hidden_states,
+                global_residual=global_residual,
             )
 
         if not self.pp_group.is_last_rank:
+            # Both streams stay global across the PP boundary; the next stage
+            # derives the same layout and carries on.
             return PPProxyTensors(
                 {
                     "hidden_states": hidden_states,
                     "residual": residual,
                 }
             )
+
+        if global_residual is not None:
+            # Back to DP-local for the final norm and the logits: this replica
+            # only produces logits for its own tokens, so narrowing here also
+            # keeps the last norm off the other replicas' rows.
+            hidden_states = global_residual.local_view(hidden_states)
+            if residual is not None:
+                residual = global_residual.local_view(residual)
 
         if self.res_scale is not None:
             residual, hidden_states = self.res_scale(residual, hidden_states)
