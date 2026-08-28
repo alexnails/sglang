@@ -1621,11 +1621,24 @@ class ZayaRouter(nn.Module):
             and prev_router_hidden_states is not None
             and hasattr(self, "router_states_scale")
         ):
-            hs = hs + prev_router_hidden_states * self.router_states_scale
+            # One fused multiply-add instead of a separate mul and add: 2
+            # launches become 1 on all but the first MoE layer (59 of 60 on the
+            # 74B, since the first has no previous router state). In-place is
+            # safe because ``hs`` is the freshly-allocated ``down_proj`` output
+            # that nothing else aliases, and it drops the temporary as well.
+            #
+            # NOT bit-identical: ``a + b * c`` rounds the product before the
+            # add, ``addcmul`` fuses them and rounds once. At bf16 that is up to
+            # one ULP on the EDA term, which then threads through the whole
+            # 60-layer recursion. Verified with assert_close, not assert_equal.
+            hs.addcmul_(prev_router_hidden_states, self.router_states_scale)
 
-        # ``hs`` is a freshly-allocated tensor (output of ``down_proj`` or the
-        # EDA add above) and ``rmsnorm_eda`` is non-residual / out-of-place,
-        # so we can hand the same buffer to the next layer without cloning.
+        # ``hs`` is a freshly-allocated tensor (output of ``down_proj``, updated
+        # in place by the EDA add above) and ``rmsnorm_eda`` is non-residual /
+        # out-of-place, so we can hand the same buffer to the next layer without
+        # cloning. This is the POST-EDA, PRE-NORM tensor: the EDA recursion is
+        # defined on the un-normalized state, so publishing ``hs_norm`` here
+        # instead would silently change routing in every downstream MoE layer.
         router_hidden_states_next = hs
 
         hs_norm = self.rmsnorm_eda(hs)
@@ -1860,7 +1873,9 @@ class ZayaBlock(nn.Module):
             is_tp_path=False
         ):
             experts_out = moe_expert_parallel_all_reduce(experts_out)
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(is_tp_path=True):
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True
+        ):
             experts_out = moe_tensor_model_parallel_all_reduce(experts_out)
         return experts_out
 
