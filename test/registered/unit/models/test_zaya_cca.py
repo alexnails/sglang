@@ -2469,7 +2469,76 @@ def _make_tiny_router(
     return router, config
 
 
-class TestZayaRouterTailKernel(CustomTestCase):
+# Exactly representable in fp32 and bf16 (mantissa 1.0), so it round-trips
+# through a tensor and back to a Python float unchanged. 1e30 does NOT: float32
+# stores it as 1.0000000150474662e+30, and assertEqual against the literal 1e30
+# then fails. That is not a hypothetical -- it is the second of two setup bugs
+# that made the probes below go red on hardware and read, both times, as a
+# kernel fault.
+_POISON = 2.0**100
+
+
+def _poisoned_row_view(num_rows, num_cols, padded_cols, device, dtype, seed=0):
+    """A ``num_cols``-wide view of a ``padded_cols``-wide poisoned buffer.
+
+    Returns ``(view, backing)``. The view is what the kernel is handed: unit
+    innermost stride and exactly ``num_cols`` wide, but with a row stride that
+    steps over ``padded_cols``, so the columns a padded lane would reach are
+    real, mapped, and unmistakable.
+    """
+    torch.manual_seed(seed)
+    backing = torch.empty(num_rows, padded_cols, device=device, dtype=dtype)
+    backing[:, num_cols:] = _POISON
+    backing[:, :num_cols] = torch.randn(num_rows, num_cols, device=device).to(dtype)
+    return backing[:, :num_cols], backing
+
+
+def _poisoned_bias_view(num_experts, padded, device):
+    """A contiguous ``num_experts`` prefix of a wider, poisoned bias vector.
+
+    The real values go in AFTER the poison, and they are a per-index ramp so
+    that smearing one lane onto another changes the answer rather than
+    cancelling out. Index ``num_experts - 1`` carries the MOD skip slot's -1,
+    which is the value the first version of this fixture clobbered by writing
+    ``backing[-1]`` -- the last element of the *backing* buffer, not of the view.
+    """
+    backing = torch.empty(padded, dtype=torch.float32, device=device)
+    backing[num_experts:] = _POISON
+    real = torch.arange(num_experts, dtype=torch.float32, device=device) * 0.001
+    real[-1] = -1.0
+    backing[:num_experts] = real
+    return backing[:num_experts], backing
+
+
+class _SyncEachTest:
+    """Synchronise the device on both sides of every test in the class.
+
+    Attribution scaffolding, not a behavioural check. A HIP fault is reported
+    asynchronously and aborts the process wherever the CPU thread happens to be,
+    so without a sync bracketing each test body the abort surfaces in an
+    unrelated test -- which is how the first report of this fault came in
+    pointing at ReplicatedLinear.__init__ inside a CPU-only test.
+
+    Syncing in BOTH setUp and tearDown is what makes it airtight: between any two
+    consecutive syncs there is exactly one test body. An abort in tearDown blames
+    that test; an abort in setUp blames the window since the previous sync. A
+    mixin rather than a copied method so a class cannot silently be left out --
+    which is the first thing to suspect when an abort seems to cross a class
+    boundary.
+    """
+
+    def setUp(self):
+        super().setUp()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    def tearDown(self):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        super().tearDown()
+
+
+class TestZayaRouterTailKernel(_SyncEachTest, CustomTestCase):
     """``zaya_router_tail`` on its own, with no sglang module anywhere near it.
 
     Deliberately first in the file and deliberately module-free: every tensor
@@ -2484,16 +2553,6 @@ class TestZayaRouterTailKernel(CustomTestCase):
     the model path pulls in; if this class aborts, it is the tail kernel. Keep it
     module-free.
     """
-
-    def tearDown(self):
-        # Force any asynchronous device fault to surface HERE, attributed to the
-        # test that launched it. Without this a bad launch aborts the process at
-        # some later, unrelated synchronisation point -- which is exactly what
-        # made the first gfx950 report point at ReplicatedLinear.__init__ inside
-        # a CPU-only test several tests downstream of the real culprit.
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        super().tearDown()
 
     # ZAYA1-74B: 24 experts plus the MOD skip slot. BLOCK pads to 32, so 7 of
     # 32 column lanes are padding -- the configuration a power-of-two-padded
@@ -2551,6 +2610,11 @@ class TestZayaRouterTailKernel(CustomTestCase):
             softmax_fp32=True,
             out_dtype=out_dtype,
         )
+        # Sync on the launch itself, before any other kernel runs, so a fault
+        # is attributed to this call and -- inside a subTest loop -- to this
+        # subtest's shape rather than to whatever ran next.
+        torch.cuda.synchronize()
+
         ref_weight, ref_choice = self._reference(logits, biases)
 
         # Bounds first: an id outside the expert range leaves this kernel
@@ -2589,38 +2653,58 @@ class TestZayaRouterTailKernel(CustomTestCase):
                         out_dtype=dtype,
                     )
 
+    def test_poison_fixtures_are_built_correctly(self):
+        """CPU-checkable: the probe fixtures themselves.
+
+        The two GPU probes below have gone red on hardware twice, and both times
+        the cause was entirely in these few lines of arithmetic -- first ``[-1]``
+        indexing the backing buffer instead of the view, then a float32
+        round-trip of 1e30 compared against the Python literal. Both times the
+        red test read as a kernel fault and cost a hardware round trip to
+        disprove. Constructing the fixtures needs no GPU, so validating them
+        should not either. This test is the reason a third one cannot happen.
+        """
+        logits, backing = _poisoned_row_view(4, 25, 32, "cpu", torch.float32, seed=1)
+        self.assertEqual(tuple(logits.shape), (4, 25))
+        self.assertEqual(logits.stride(), (32, 1))
+        self.assertEqual(float(backing[0, 25]), _POISON)
+        self.assertTrue(bool(torch.isfinite(logits).all()))
+        self.assertLess(float(logits.abs().max()), 100.0)
+
+        biases, bias_backing = _poisoned_bias_view(25, 32, "cpu")
+        self.assertTrue(biases.is_contiguous())
+        self.assertEqual(biases.numel(), 25)
+        # The view's last element is the MOD skip slot, not the buffer's last.
+        self.assertEqual(float(biases[-1]), -1.0)
+        self.assertEqual(float(bias_backing[25]), _POISON)
+        self.assertEqual(float(bias_backing[-1]), _POISON)
+        # Distinct per index, so a smear between lanes cannot cancel out.
+        self.assertEqual(len({float(v) for v in biases}), 25)
+        # And the sentinel survives a float32 round trip exactly, which is the
+        # whole reason it is a power of two rather than 1e30.
+        stored = torch.tensor([_POISON], dtype=torch.float32)
+        self.assertEqual(float(stored[0]), _POISON)
+
     @unittest.skipUnless(torch.cuda.is_available(), "fused tail is a GPU kernel")
     def test_padding_columns_cannot_influence_the_result(self):
         """A padded-mask overread shows up here as a wrong answer, not a crash.
 
         BLOCK pads 25 up to 32, so 7 column lanes are padding. Hand the kernel a
-        25-column *view* of a 32-column buffer whose tail columns hold a huge
-        sentinel. Every address those padding lanes could form is mapped memory,
-        so a dropped or mis-vectorized mask corrupts the softmax instead of
-        faulting -- which is the only way to probe for it without a device fault
-        taking the whole suite down with it.
-
-        ``covered()`` accepts the view: its innermost stride is 1 and its width
-        is exactly ``num_experts``. Only ``stride(0)`` is wider, which is the
-        general case the kernel already handles.
+        25-column view of a 32-column buffer whose tail columns hold a sentinel.
+        Every address those padding lanes could form is mapped memory, so a
+        dropped or mis-vectorized mask corrupts the softmax instead of faulting
+        -- the only way to probe for it without taking the suite down.
         """
-        num_tokens = 8
-        torch.manual_seed(3)
-        wide = torch.empty(num_tokens, 32, device="cuda", dtype=torch.float32)
-        wide[:, : self.NUM_EXPERTS] = torch.randn(
-            num_tokens, self.NUM_EXPERTS, device="cuda"
+        poisoned, _ = _poisoned_row_view(
+            8, self.NUM_EXPERTS, 32, "cuda", torch.float32, seed=3
         )
-        wide[:, self.NUM_EXPERTS :] = 1e30
-        poisoned = wide[:, : self.NUM_EXPERTS]
-        self.assertEqual(poisoned.stride(0), 32)
-        self.assertEqual(poisoned.stride(1), 1)
+        self.assertEqual(poisoned.stride(), (32, 1))
 
         biases = self._biases(self.NUM_EXPERTS)
         weight_poisoned, ids_poisoned, _, _ = self._check(
             poisoned, biases, self.NUM_MOE_EXPERTS - 1
         )
-
-        # And the same values in a tight buffer must give the identical answer.
+        # The same values in a tight buffer must give the identical answer.
         weight_clean, ids_clean, _, _ = self._check(
             poisoned.contiguous(), biases, self.NUM_MOE_EXPERTS - 1
         )
@@ -2631,53 +2715,26 @@ class TestZayaRouterTailKernel(CustomTestCase):
     def test_padding_bias_lanes_cannot_influence_the_result(self):
         """The bias vector is 25 floats read through a 32-wide block.
 
-        Poison elements 25..31 of a 32-element buffer and hand the kernel a
-        contiguous 25-element prefix view of it.
-
-        The real per-index values are written AFTER the poison. Writing them
-        first is what made the first version of this test fail, and the failure
-        was mine, not the kernel's: ``wide_bias[-1]`` addresses element 31 of the
-        32-element buffer, not the last of the 25 the kernel sees, so the poison
-        line overwrote it and the *setup* assertion two lines later failed. The
-        kernel was never reached. Every assertion below that belongs to the setup
-        now says so in its message.
-
         Scope, stated honestly. The poison can only reach the output if BOTH the
         masked load AND the ``tl.where`` that forces every padding lane's biased
         score to -inf fail; a padding bias on its own has no path to the answer.
-        So this is a guard on the combination rather than a probe of the load,
-        and it could not have detected a load-mask failure by itself. It earns
-        its place as a regression guard: remove either mask later and it goes
-        red.
+        So this guards the combination rather than probing the load, and it could
+        never have detected a load-mask failure by itself. It earns its place as
+        a regression guard: remove either mask later and it goes red.
+
+        The fixture is built by ``_poisoned_bias_view`` and checked on CPU by
+        ``test_poison_fixtures_are_built_correctly``, so a failure here is the
+        kernel.
         """
-        num_tokens = 6
         torch.manual_seed(4)
-        logits = torch.randn(num_tokens, self.NUM_EXPERTS, device="cuda")
-
-        wide_bias = torch.empty(32, dtype=torch.float32, device="cuda")
-        wide_bias[self.NUM_EXPERTS :] = 1e30  # poison the padding lanes first
-        # Then the real vector: distinct per index, so smearing one lane's value
-        # onto another changes the answer, plus the MOD skip slot's own -1.
-        real = torch.arange(self.NUM_EXPERTS, dtype=torch.float32, device="cuda")
-        real = real * 0.01
-        real[-1] = -1.0
-        wide_bias[: self.NUM_EXPERTS] = real
-        biases = wide_bias[: self.NUM_EXPERTS]
-
-        self.assertTrue(biases.is_contiguous(), "setup: the view must be contiguous")
-        self.assertEqual(biases.numel(), self.NUM_EXPERTS, "setup: wrong length")
-        self.assertEqual(
-            float(biases[-1]), -1.0, "setup: the skip-slot bias was clobbered"
-        )
-        self.assertEqual(
-            float(wide_bias[self.NUM_EXPERTS]), 1e30, "setup: the poison is missing"
-        )
+        logits = torch.randn(6, self.NUM_EXPERTS, device="cuda")
+        biases, _ = _poisoned_bias_view(self.NUM_EXPERTS, 32, "cuda")
 
         weight_poisoned, ids_poisoned, _, _ = self._check(
             logits, biases, self.NUM_MOE_EXPERTS - 1
         )
-        # Kernel against kernel as well as against torch: the same 25 values in a
-        # tight buffer must give bit-identical results.
+        # Kernel against kernel as well as against torch: the same 25 values in
+        # a tight buffer must give bit-identical results.
         weight_clean, ids_clean, _, _ = self._check(
             logits, biases.clone(), self.NUM_MOE_EXPERTS - 1
         )
@@ -2808,7 +2865,7 @@ class TestZayaRouterTailKernel(CustomTestCase):
                 self._check(logits, self._biases(num_experts), num_experts - 2)
 
 
-class TestZayaRouterFusedTail(CustomTestCase):
+class TestZayaRouterFusedTail(_SyncEachTest, CustomTestCase):
     """The fused router tail must reproduce the torch chain it replaces.
 
     Derived property. ``zaya_router_tail`` collapses nine launches -- softmax,
@@ -2825,16 +2882,6 @@ class TestZayaRouterFusedTail(CustomTestCase):
     probabilities are only ``assert_close``: the fp32 max/sum reduction order
     here does not match torch's tree reduction, so ~1 ULP of drift is expected.
     """
-
-    def tearDown(self):
-        # Force any asynchronous device fault to surface HERE, attributed to the
-        # test that launched it. Without this a bad launch aborts the process at
-        # some later, unrelated synchronisation point -- which is exactly what
-        # made the first gfx950 report point at ReplicatedLinear.__init__ inside
-        # a CPU-only test several tests downstream of the real culprit.
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        super().tearDown()
 
     def _router(self, **kwargs):
         """A CUDA router whose only fused kernel is the tail under test.
@@ -3161,7 +3208,7 @@ class TestZayaRouterFusedTail(CustomTestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestZayaRouterFusedMLP(CustomTestCase):
+class TestZayaRouterFusedMLP(_SyncEachTest, CustomTestCase):
     """The fused router MLP must reproduce the ``nn.Sequential`` it replaces.
 
     Derived property. Five launches (Linear, GELU, Linear, GELU, Linear) become
@@ -3173,16 +3220,6 @@ class TestZayaRouterFusedMLP(CustomTestCase):
     layers of the 74B. So the erf-vs-tanh guard gets tests of its own, on CPU,
     where they run on every commit rather than only on GPU hardware.
     """
-
-    def tearDown(self):
-        # Force any asynchronous device fault to surface HERE, attributed to the
-        # test that launched it. Without this a bad launch aborts the process at
-        # some later, unrelated synchronisation point -- which is exactly what
-        # made the first gfx950 report point at ReplicatedLinear.__init__ inside
-        # a CPU-only test several tests downstream of the real culprit.
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        super().tearDown()
 
     def test_structural_guard_accepts_the_real_router(self):
         from sglang.srt.models.zaya import fusable_router_mlp
