@@ -3,19 +3,20 @@
 Replaces the per-request host loop in :func:`cca_extend
 <sglang.srt.models.zaya.cca_extend>`. That loop walks the batch on the CPU and
 issues, per request, a pack copy, an unpack copy, a conv-state write, a
-``torch.cat`` and a ``prev_hs`` write -- so its launch count grows with the batch
+``torch.cat`` and a lag-slot write -- so its launch count grows with the batch
 and its trip count comes from ``extend_seq_lens_cpu``. Reading CPU sequence
 lengths is also what keeps the prefill CUDA graph uncapturable.
 
-This path is four launches per layer whatever the batch size, and every bound it
-needs (request of a token, that request's start, its pool slot, whether it
-resumes a prefix) is read from device tensors the backend already publishes
-(``query_start_loc``, ``cache_indices``, ``has_initial_state``):
+This path is four launches per layer whatever the batch size -- two on a rank
+that carries no lag stream, see below -- and every bound it needs (request of a
+token, that request's start, its pool slot, whether it resumes a prefix) is read
+from device tensors the backend already publishes (``query_start_loc``,
+``cache_indices``, ``has_initial_state``):
 
-1. a plain shifted copy for ``v2_input[1:] = hidden_states[:-1]``,
-2. :func:`_boundary_state_kernel` -- fixes the ``v2_input`` row at each request
-   start from that request's cached ``prev_hs`` slot, and carries the request's
-   last hidden state into the slot for the next chunk,
+1. a plain shifted copy for ``lag_prev[1:] = lag_now[:-1]``,
+2. :func:`_boundary_state_kernel` -- fixes the ``lag_prev`` row at each request
+   start from that request's cached lag slot, and carries the request's last lag
+   row into the slot for the next chunk,
 3. :func:`_cca_conv1d_varlen_kernel` -- the conv itself, tiled over tokens,
 4. :func:`_cca_conv_state_tail_kernel` -- writes each request's trailing window
    back to its ``conv_state`` slot.
@@ -24,6 +25,18 @@ Order matters and is load-bearing. Step 2 reads a slot it then overwrites within
 one program, so the read/write pair on a row is safe. Step 4 must follow step 3,
 because step 3 reads the *incoming* ``conv_state`` for the halo taps of the first
 tokens of a resumed request; writing the outgoing window first would corrupt it.
+
+The lag stream carries the *projected* ``val_proj2`` value ``W_v2 . hs``, not the
+raw hidden state: the projection is linear and bias-free, so shifting before or
+after it is the same function, and the stream is ``latent_k_dim / 2`` wide rather
+than ``hidden_size`` -- 128 instead of 4096 on ZAYA1-74B. Step 1 is where that
+matters most: it was a full ``[T, 4096]`` copy per layer (2.0 GB per prefill step
+at T=2048 over 60 layers) and is now ``[T, 128]`` (63 MB). Passing ``lag_now`` /
+``lag_state`` as ``None`` drops steps 1 and 2 altogether, leaving two launches --
+what a rank whose K heads all come from ``val_proj1`` wants, since it never reads
+the lag. The boundary row it parks is therefore also the projected value; storing
+the raw hidden state there would leave a resumed prefix reading the wrong v2,
+with no shape or dtype error to catch it.
 
 The conv consumes the single folded grouped weight (``CCA.fold_conv1d_weight``,
 see :meth:`CCA.fold_decode_conv`), not the two-stage ``conv_qk`` -- the fold is
@@ -50,21 +63,21 @@ import triton.language as tl
 
 @triton.jit
 def _boundary_state_kernel(
-    hs_ptr,  # [T, H]      this chunk's hidden states
-    prev_hs_ptr,  # [S, H, 1]   per-slot previous hidden state
-    v2_ptr,  # [T, H]      in/out: already holds the shifted copy
+    lag_ptr,  # [T, D]      this chunk's val_proj2 values
+    lag_state_ptr,  # [S, D, 1]   per-slot carried val_proj2 value
+    out_ptr,  # [T, D]      in/out: already holds the shifted copy
     cu_ptr,  # [B+1]       request token offsets
     slots_ptr,  # [B]         pool slot per request
     prefix_ptr,  # [B]         request resumes a cached prefix
-    s_hs_t,
-    s_ph_s,
-    s_v2_t,
-    hidden_size,
-    BLOCK_H: tl.constexpr,
+    s_lag_t,
+    s_ls_s,
+    s_out_t,
+    lag_dim,
+    BLOCK_D: tl.constexpr,
 ):
     b = tl.program_id(0)
-    h = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
-    hmask = h < hidden_size
+    d = tl.program_id(1) * BLOCK_D + tl.arange(0, BLOCK_D)
+    dmask = d < lag_dim
 
     start = tl.load(cu_ptr + b)
     end = tl.load(cu_ptr + b + 1)
@@ -74,14 +87,19 @@ def _boundary_state_kernel(
         slot = tl.load(slots_ptr + b)
         prefix = tl.load(prefix_ptr + b)
 
-        # The first token's val_proj2 input is the request's carried hidden
-        # state, or zero on a fresh chunk. Read it before the store below
-        # overwrites the same row.
-        prev = tl.load(prev_hs_ptr + slot * s_ph_s + h, mask=hmask & prefix, other=0.0)
-        tl.store(v2_ptr + start * s_v2_t + h, prev, mask=hmask)
+        # The first token's val_proj2 value is the one the request carried over
+        # from its previous chunk, or zero on a fresh chunk (which is what the
+        # zeroed pool slot holds, since val_proj2 is bias-free). Read it before
+        # the store below overwrites the same row.
+        prev = tl.load(
+            lag_state_ptr + slot * s_ls_s + d, mask=dmask & prefix, other=0.0
+        )
+        tl.store(out_ptr + start * s_out_t + d, prev, mask=dmask)
 
-        last = tl.load(hs_ptr + (end - 1) * s_hs_t + h, mask=hmask, other=0.0)
-        tl.store(prev_hs_ptr + slot * s_ph_s + h, last, mask=hmask)
+        # Carry this chunk's last PROJECTED value, not the raw hidden state --
+        # the read side above expects the projection already applied.
+        last = tl.load(lag_ptr + (end - 1) * s_lag_t + d, mask=dmask, other=0.0)
+        tl.store(lag_state_ptr + slot * s_ls_s + d, last, mask=dmask)
 
 
 @triton.jit
@@ -224,11 +242,11 @@ def _cca_conv_state_tail_kernel(
 
 def covered(
     qk: torch.Tensor,
-    hidden_states: torch.Tensor,
+    lag_now: Optional[torch.Tensor],
     weight: Optional[torch.Tensor],
     bias: Optional[torch.Tensor],
     conv_state: torch.Tensor,
-    prev_hs_state: torch.Tensor,
+    lag_state: Optional[torch.Tensor],
     query_start_loc: Optional[torch.Tensor],
     has_prefix: Optional[torch.Tensor],
     slots: Optional[torch.Tensor],
@@ -241,6 +259,12 @@ def covered(
     expressible here), the backend's device-side request metadata, everything on
     one accelerator with unit innermost strides, and a channels-per-group that
     ``tl.dot`` can take as a tile width.
+
+    ``lag_now`` / ``lag_state`` must be both present or both ``None``. ``None``
+    drops the two lag launches for a rank that never reads the stream; a
+    half-specified pair is refused rather than guessed at, because guessing "no
+    lag" silently skips the chunk-boundary carry and the next chunk then resumes
+    from a stale slot.
     """
     if weight is None or bias is None:
         return False
@@ -248,26 +272,31 @@ def covered(
         return False
     if total_padding < 1 or groups < 1:
         return False
+    if (lag_now is None) != (lag_state is None):
+        return False
 
-    tensors = (
+    tensors = [
         qk,
-        hidden_states,
         weight,
         bias,
         conv_state,
-        prev_hs_state,
         query_start_loc,
         has_prefix,
         slots,
-    )
+    ]
+    if lag_now is not None:
+        tensors += [lag_now, lag_state]
     if not all(t.is_cuda for t in tensors):
         return False
-    if qk.ndim != 2 or hidden_states.ndim != 2:
+    if qk.ndim != 2:
         return False
-    if conv_state.ndim != 3 or prev_hs_state.ndim != 3:
+    if conv_state.ndim != 3:
         return False
-    if qk.shape[0] != hidden_states.shape[0]:
-        return False
+    if lag_now is not None:
+        if lag_now.ndim != 2 or lag_state.ndim != 3:
+            return False
+        if qk.shape[0] != lag_now.shape[0]:
+            return False
 
     num_channels = qk.shape[-1]
     if num_channels % groups != 0:
@@ -284,10 +313,16 @@ def covered(
         return False
     if conv_state.shape[-1] != total_padding or conv_state.shape[-2] != num_channels:
         return False
-    if prev_hs_state.shape[-2] != hidden_states.shape[-1]:
-        return False
-    if prev_hs_state.shape[-1] != 1:
-        return False
+    if lag_now is not None:
+        # The lag pool row is addressed as ``slot * stride(0) + d``, so its
+        # feature axis must be unit-strided; a narrowed view of a wider pool
+        # entry (a rank owning only part of val_proj2's output) still is.
+        if lag_state.shape[-2] != lag_now.shape[-1]:
+            return False
+        if lag_state.shape[-1] != 1:
+            return False
+        if lag_state.stride(-2) != 1:
+            return False
 
     num_requests = query_start_loc.shape[0] - 1
     if num_requests < 1:
@@ -301,72 +336,76 @@ def covered(
     ):
         return False
 
-    # The kernels store qk straight into the conv pool and hidden_states into the
-    # prev_hs pool, and read the weight at the activation dtype, so no dtype
-    # conversion is modelled.
-    if conv_state.dtype != qk.dtype or prev_hs_state.dtype != hidden_states.dtype:
+    # The kernels store qk straight into the conv pool and lag_now into the lag
+    # pool, and read the weight at the activation dtype, so no dtype conversion
+    # is modelled.
+    if conv_state.dtype != qk.dtype:
         return False
     if weight.dtype != qk.dtype or bias.dtype != qk.dtype:
         return False
-
-    return (
-        qk.stride(-1) == 1
-        and hidden_states.stride(-1) == 1
-        and conv_state.stride(-1) == 1
-        and prev_hs_state.stride(-1) == 1
-        and weight.stride(-1) == 1
-    )
+    if not (
+        qk.stride(-1) == 1 and conv_state.stride(-1) == 1 and weight.stride(-1) == 1
+    ):
+        return False
+    if lag_now is None:
+        return True
+    if lag_state.dtype != lag_now.dtype:
+        return False
+    return lag_now.stride(-1) == 1 and lag_state.stride(-1) == 1
 
 
 def cca_conv1d_fn(
     qk: torch.Tensor,
-    hidden_states: torch.Tensor,
+    lag_now: Optional[torch.Tensor],
     weight: torch.Tensor,
     bias: torch.Tensor,
     conv_state: torch.Tensor,
-    prev_hs_state: torch.Tensor,
+    lag_state: Optional[torch.Tensor],
     query_start_loc: torch.Tensor,
     has_prefix: torch.Tensor,
     slots: torch.Tensor,
     total_padding: int,
     groups: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return ``(qk_out, v2_input)``, updating both pool slots in place.
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Return ``(qk_out, lag_prev)``, updating both pool slots in place.
 
-    ``qk_out`` is the conv output ``[T, C]`` and ``v2_input`` the shifted
-    ``val_proj2`` input ``[T, H]``, both in the activation dtype. Caller must have
+    ``qk_out`` is the conv output ``[T, C]`` and ``lag_prev`` the right-shifted
+    ``val_proj2`` value stream ``[T, D]``, both in the activation dtype;
+    ``lag_prev`` is ``None`` when the lag stream is switched off. Caller must have
     checked :func:`covered`.
     """
     num_tokens, num_channels = qk.shape
-    hidden_size = hidden_states.shape[-1]
     num_requests = query_start_loc.shape[0] - 1
     ch_per_group = num_channels // groups
     taps = total_padding + 1
+    has_lag = lag_now is not None
 
     qk_out = torch.empty_like(qk)
-    v2_input = torch.empty_like(hidden_states)
+    lag_prev = torch.empty_like(lag_now) if has_lag else None
     if num_tokens == 0:
-        return qk_out, v2_input
+        return qk_out, lag_prev
 
-    # val_proj2 reads the previous token. Inside a request that is a plain shift;
-    # the row at each request start is wrong here and is fixed next.
-    v2_input[1:].copy_(hidden_states[:-1])
+    if has_lag:
+        # val_proj2 reads the previous token. Inside a request that is a plain
+        # shift of the PROJECTED stream (128 wide, not the 4096-wide hidden
+        # state); the row at each request start is wrong here and is fixed next.
+        lag_prev[1:].copy_(lag_now[:-1])
 
-    grid_h = triton.cdiv(hidden_size, 512)
-    _boundary_state_kernel[(num_requests, grid_h)](
-        hidden_states,
-        prev_hs_state,
-        v2_input,
-        query_start_loc,
-        slots,
-        has_prefix,
-        hidden_states.stride(0),
-        prev_hs_state.stride(0),
-        v2_input.stride(0),
-        hidden_size,
-        BLOCK_H=512,
-        num_warps=4,
-    )
+        lag_dim = lag_now.shape[-1]
+        _boundary_state_kernel[(num_requests, triton.cdiv(lag_dim, 512))](
+            lag_now,
+            lag_state,
+            lag_prev,
+            query_start_loc,
+            slots,
+            has_prefix,
+            lag_now.stride(0),
+            lag_state.stride(0),
+            lag_prev.stride(0),
+            lag_dim,
+            BLOCK_D=512,
+            num_warps=4,
+        )
 
     block_t = 64
     search_steps = max(1, (num_requests - 1).bit_length())
@@ -410,4 +449,4 @@ def cca_conv1d_fn(
         BLOCK_C=256,
         num_warps=4,
     )
-    return qk_out, v2_input
+    return qk_out, lag_prev

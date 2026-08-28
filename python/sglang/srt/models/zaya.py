@@ -31,8 +31,8 @@ for the full design notes):
   averaging across MoE layers) and MOD (mixture-of-depths skip expert).
 - Per-layer :class:`ResidualScaling` keeps the residual stream in fp32 with
   affine scale/bias both on the residual and on the post-mixer hidden states.
-- Per-request CCA state (``conv_state`` + ``prev_hs``) lives in SGLang's
-  centralized ``MambaPool`` inside ``HybridReqToTokenPool``. The per-request
+- Per-request CCA state (``conv_state`` + the ``val_proj2`` lag) lives in
+  SGLang's centralized ``MambaPool`` inside ``HybridReqToTokenPool``. The
   state plumbing (slot indices, prefix mask, cuda-graph buffers) is owned by
   ``ShortConvAttnBackend`` and reached via
   ``get_attn_backend().conv_state_metadata()``, so the model holds no pool
@@ -208,33 +208,77 @@ def _apply_norm_with_fp32_residual(
 # CCA conv-state kernels (v1 torch)
 #
 # ZAYA1-specific conv step: the CCA conv is a causal two-stage conv over
-# ``qk = [W_q hs || W_k hs]`` plus a one-token ``prev_hs`` lag for val_proj2.
-# The per-request conv state lives in the centralized MambaPool; the backend
-# (ShortConvAttnBackend) hands out the slot indices + prefix flags and CCA runs
-# these functions against them. ``conv_qk`` is the module's two-stage conv;
-# both functions mutate ``conv_state`` / ``prev_hs_state`` in place and return
-# ``(qk_out, v2_input)`` -- the conv output ``[T, in_out_ch]`` and the (shifted)
-# ``val_proj2`` input ``[T, hidden_size]``.
+# ``qk = [W_q hs || W_k hs]`` plus a one-token lag for the ``val_proj2`` value
+# stream. The per-request conv state lives in the centralized MambaPool; the
+# backend (ShortConvAttnBackend) hands out the slot indices + prefix flags and
+# CCA runs these functions against them. ``conv_qk`` is the module's two-stage
+# conv; both functions mutate ``conv_state`` / ``lag_state`` in place and return
+# ``(qk_out, lag_prev)`` -- the conv output ``[T, in_out_ch]`` and the
+# right-shifted lag stream ``[T, lag_dim]``.
+#
+# The lag stream carries the *projected* value ``W_v2 . hs`` rather than the raw
+# hidden state. ``val_proj2`` is linear and bias-free, so ``W_v2 . shift(hs) ==
+# shift(W_v2 . hs)``: projecting before the state write is the same function and
+# the cached quantity shrinks from ``hidden_size`` to ``latent_k_dim / 2`` (4096
+# -> 128 on ZAYA1-74B). See ``CCA.__init__`` for the gate and
+# ``ZayaConfig.cca_cache_projected_v2`` for the pool-shape side of it.
+#
+# ``lag_now`` / ``lag_state`` are ``None`` on a rank whose K heads all come from
+# ``val_proj1``: it never reads the lag, so it neither computes nor stores it.
 # ---------------------------------------------------------------------------
+
+
+def _shift_lag_into(
+    lag_prev: torch.Tensor,
+    lag_now: torch.Tensor,
+    start: int,
+    end: int,
+    prefix: bool,
+    lag_state: torch.Tensor,
+    slot: int,
+) -> None:
+    """Right-shift one request's lag segment and park its last row in the pool.
+
+    ``lag_prev[t] = lag_now[t - 1]``, with the row before the segment taken from
+    the request's cached slot when it resumes a prefix and from zero when it does
+    not (a fresh request's first ``val_proj2`` input is defined to be zero, which
+    is exactly what MambaPool's zeroed slot holds).
+
+    Two slice copies rather than ``cat`` + one copy: the same launch count with
+    half the bytes, since the concatenate's temporary is never materialized.
+    """
+    if end <= start:
+        return
+    if prefix:
+        lag_prev[start : start + 1] = lag_state[slot].squeeze(-1).to(lag_now.dtype)
+    else:
+        lag_prev[start : start + 1].zero_()
+    if end - start > 1:
+        lag_prev[start + 1 : end] = lag_now[start : end - 1]
+    lag_state[slot] = lag_now[end - 1].unsqueeze(-1).to(lag_state.dtype)
 
 
 def cca_extend(
     qk: torch.Tensor,
-    hidden_states: torch.Tensor,
+    lag_now: Optional[torch.Tensor],
     conv_fn: Callable[[torch.Tensor], torch.Tensor],
     conv_state: torch.Tensor,
-    prev_hs_state: torch.Tensor,
+    lag_state: Optional[torch.Tensor],
     slot_ids: List[int],
     has_prefix: List[bool],
     extend_seq_lens_cpu: List[int],
     total_padding: Optional[int] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Prefill / extend conv-state step (v1, pure torch).
 
     Walks each request in the batch, applies ``conv_fn`` with the request's own
     initial state (zeros on a fresh first chunk, the cached ``conv_state`` slot
-    otherwise), writes the updated ``conv_state`` / ``prev_hs_state`` back, and
-    returns the concatenated ``(qk_out, v2_input)`` in the original token layout.
+    otherwise), writes the updated ``conv_state`` / ``lag_state`` back, and
+    returns ``(qk_out, lag_prev)`` in the original token layout.
+
+    ``lag_now`` is this chunk's ``val_proj2`` value at each token and ``lag_prev``
+    is that stream shifted right by one, sourced across a chunk boundary from the
+    cached slot. Both are ``None`` when the rank does not use the lag.
 
     ``conv_fn`` maps ``[N, C, S + total_padding] -> [N, C, S]``; callers pass
     :meth:`CCA._conv_qk_run` so the folded single grouped conv is used when it is
@@ -248,14 +292,13 @@ def cca_extend(
     :func:`cca_conv1d_fn <sglang.kernels.ops.attention.cca_conv1d.cca_conv1d_fn>`
     is the device-driven replacement.
     """
-    dtype = hidden_states.dtype
+    dtype = qk.dtype
     if total_padding is None:
         total_padding = conv_state.shape[-1]
     in_out_ch = qk.shape[-1]
-    hidden_size = hidden_states.shape[-1]
 
     qk_out = torch.empty_like(qk)
-    v2_input = torch.empty_like(hidden_states)
+    lag_prev = None if lag_now is None else torch.empty_like(lag_now)
 
     # Fresh-prefill fast path: when no request has a cached prefix the per-request
     # convs can be coalesced into a single packed convolution. Each request's
@@ -287,12 +330,12 @@ def cca_extend(
             new_state = packed[0, :, a_i + s : a_i + s + pad]
             conv_state[slot_ids[i]] = new_state.to(conv_state.dtype)
 
-            hs_cur = hidden_states[start:end]
-            first = hidden_states.new_zeros((1, hidden_size))
-            v2_input[start:end] = torch.cat([first, hs_cur[:-1]], dim=0)
-            prev_hs_state[slot_ids[i]] = (
-                hs_cur[-1].unsqueeze(-1).to(prev_hs_state.dtype)
-            )
+            if lag_now is not None:
+                # Fresh request: the first token's val_proj2 value is 0 by
+                # definition, matching the zeroed slot MambaPool hands out.
+                _shift_lag_into(
+                    lag_prev, lag_now, start, end, False, lag_state, slot_ids[i]
+                )
             start = end
     else:
         start = 0
@@ -314,46 +357,45 @@ def cca_extend(
             new_state = padded[..., -total_padding:]
             conv_state[slot] = new_state.squeeze(0).to(conv_state.dtype)
 
-            hs_cur = hidden_states[start:end]
-            if prefix:
-                first = prev_hs_state[slot].squeeze(-1).to(dtype).unsqueeze(0)
-            else:
-                first = hidden_states.new_zeros((1, hidden_size))
-            v2_input[start:end] = torch.cat([first, hs_cur[:-1]], dim=0)
-
-            prev_hs_state[slot] = hs_cur[-1].unsqueeze(-1).to(prev_hs_state.dtype)
+            if lag_now is not None:
+                # Chunked prefill: the boundary row carries the PROJECTED value
+                # the previous chunk left behind, so a resumed prefix reads the
+                # same v2 it would have seen in a single-chunk run. Writing the
+                # raw hidden state here instead would silently degrade the
+                # resumed tokens with no shape or dtype error to catch it.
+                _shift_lag_into(lag_prev, lag_now, start, end, prefix, lag_state, slot)
             start = end
 
-    return qk_out, v2_input
+    return qk_out, lag_prev
 
 
 def cca_decode(
     qk: torch.Tensor,
-    hidden_states: torch.Tensor,
+    lag_now: Optional[torch.Tensor],
     conv_qk: nn.Module,
     conv_state: torch.Tensor,
-    prev_hs_state: torch.Tensor,
+    lag_state: Optional[torch.Tensor],
     mamba_indices: torch.Tensor,
     total_padding: Optional[int] = None,
     decode_conv_weight: Optional[torch.Tensor] = None,
     decode_conv_bias: Optional[torch.Tensor] = None,
     decode_conv_groups: Optional[int] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Single-token decode conv-state step (v1, pure torch).
 
-    Gathers each request's cached ``conv_state`` / ``prev_hs_state`` via
+    Gathers each request's cached ``conv_state`` / ``lag_state`` via
     ``index_select``, applies the conv over the ``[T, C, total_padding + 1]``
     window, and scatters the updated state back with ``index_copy_``. All ops are
     on-device (``mamba_indices`` is a device ``long`` tensor), so this stays
-    CUDA-graph capturable. Returns ``(qk_out, prev_hs)`` where ``prev_hs`` is the
-    previous hidden state feeding ``val_proj2``.
+    CUDA-graph capturable. Returns ``(qk_out, lag_prev)`` where ``lag_prev`` is
+    the previous step's ``val_proj2`` value (``None`` when unused by this rank).
 
     When ``decode_conv_weight`` / ``_bias`` / ``_groups`` are supplied (see
     :meth:`CCA.fold_decode_conv`) the two conv stages are evaluated as a single
     grouped matmul; otherwise ``conv_qk`` is run as-is. The Triton swap is
     :func:`cca_conv1d_update`.
     """
-    dtype = hidden_states.dtype
+    dtype = qk.dtype
     if total_padding is None:
         total_padding = conv_state.shape[-1]
 
@@ -362,11 +404,11 @@ def cca_decode(
 
     if envs.SGLANG_OPT_ZAYA_FUSED_CCA_DECODE.get() and _fused_update.covered(
         qk,
-        hidden_states,
+        lag_now,
         decode_conv_weight,
         decode_conv_bias,
         conv_state,
-        prev_hs_state,
+        lag_state,
         mamba_indices,
         total_padding,
         decode_conv_groups or 0,
@@ -374,27 +416,32 @@ def cca_decode(
         # One kernel for the window, the history shift and the grouped matmul.
         return _fused_update.cca_conv1d_update(
             qk,
-            hidden_states,
+            lag_now,
             decode_conv_weight,
             decode_conv_bias,
             conv_state,
-            prev_hs_state,
+            lag_state,
             mamba_indices,
             total_padding,
             decode_conv_groups,
         )
 
     if _state_step.covered(
-        qk, hidden_states, conv_state, prev_hs_state, mamba_indices, total_padding
+        qk, lag_now, conv_state, lag_state, mamba_indices, total_padding
     ):
-        # One kernel for the two gathers, the concat and the two scatters.
-        padded, prev_hs = _state_step.cca_state_step(
+        # One kernel for the gathers, the concat and the scatters. When the
+        # folded weight is available it carries the conv bias in a trailing
+        # column, so ask for the matching constant-1.0 tap and let the bias land
+        # in the matmul accumulator instead of a separate add (see
+        # ``fold_decode_conv``).
+        padded, lag_prev = _state_step.cca_state_step(
             qk,
-            hidden_states,
+            lag_now,
             conv_state,
-            prev_hs_state,
+            lag_state,
             mamba_indices,
             total_padding,
+            ones_column=decode_conv_weight is not None,
         )
         qk_out = _cca_decode_conv(
             padded,
@@ -403,7 +450,7 @@ def cca_decode(
             decode_conv_bias,
             decode_conv_groups,
         )
-        return qk_out, prev_hs
+        return qk_out, lag_prev
 
     left_pad = conv_state.index_select(0, mamba_indices).to(dtype)
     cur = qk.unsqueeze(-1)  # [T, C, 1]
@@ -415,13 +462,14 @@ def cca_decode(
     new_state = padded[..., -total_padding:]
     conv_state.index_copy_(0, mamba_indices, new_state.to(conv_state.dtype))
 
-    # Read the previous hidden state (val_proj2 input) BEFORE overwriting the
-    # slot with the current token.
-    prev_hs = prev_hs_state.index_select(0, mamba_indices).squeeze(-1).to(dtype)
-    prev_hs_state.index_copy_(
-        0, mamba_indices, hidden_states.unsqueeze(-1).to(prev_hs_state.dtype)
-    )
-    return qk_out, prev_hs
+    if lag_now is None:
+        return qk_out, None
+
+    # Read the previous step's val_proj2 value BEFORE overwriting the slot with
+    # this token's.
+    lag_prev = lag_state.index_select(0, mamba_indices).squeeze(-1).to(lag_now.dtype)
+    lag_state.index_copy_(0, mamba_indices, lag_now.unsqueeze(-1).to(lag_state.dtype))
+    return qk_out, lag_prev
 
 
 # Fused kernel seam (TODO) -- perf swap for the v1 torch paths above. These
@@ -430,7 +478,7 @@ def cca_decode(
 # per-head), which the stock depthwise ``causal_conv1d`` cannot express. Once
 # implemented they replace the per-request loop in ``cca_extend`` and the
 # separate gather/conv/scatter launches in ``cca_decode`` with a single
-# index-driven kernel. Same ``(qk_out, v2_input)`` return contract.
+# index-driven kernel. Same ``(qk_out, lag_prev)`` return contract.
 
 
 def cca_conv1d_fn(*args, **kwargs):
@@ -461,16 +509,26 @@ def _cca_decode_conv(
     Prefers the load-time-folded single grouped matmul (see
     :meth:`CCA.fold_decode_conv`) and falls back to running the real two-stage
     ``conv_qk``, which is what an unfolded module (e.g. a CPU unit test) gets.
+
+    The folded weight spans ``taps + 1`` inputs per channel: the extra one is the
+    bias, activated by a constant-1.0 column in the window. ``cca_state_step``
+    writes that column for free; a window that arrives without it (the unfused
+    gather/concat fallback) gets it appended here, which is one extra op on a
+    path that is already off the fast one.
     """
     if decode_conv_weight is not None:
-        # [T, C, taps] -> [T, G, Cg*taps] (the trailing (Cg, taps) dims flatten
-        # in place, matching how fold_decode_conv laid out the weight) -> one
-        # grouped matmul -> [T, C].
-        num_tokens = padded.shape[0]
+        num_tokens, num_channels = padded.shape[0], padded.shape[1]
+        taps_ext = decode_conv_weight.shape[-1] // (num_channels // decode_conv_groups)
+        if padded.shape[-1] != taps_ext:
+            padded = F.pad(padded, (0, taps_ext - padded.shape[-1]), value=1.0)
+        # [T, C, taps_ext] -> [T, G, Cg*taps_ext] (the trailing (Cg, taps_ext)
+        # dims flatten in place, matching how fold_decode_conv laid out the
+        # weight) -> one grouped matmul -> [T, C]. The bias is already inside the
+        # accumulator, so there is nothing to add afterwards.
         grouped = padded.reshape(num_tokens, decode_conv_groups, -1)
-        return (
-            torch.einsum("tgk,gok->tgo", grouped, decode_conv_weight) + decode_conv_bias
-        ).reshape(num_tokens, -1)
+        return torch.einsum("tgk,gok->tgo", grouped, decode_conv_weight).reshape(
+            num_tokens, -1
+        )
     return conv_qk(padded).squeeze(-1)
 
 
@@ -647,6 +705,52 @@ class CCA(nn.Module):
         self.k_head_start = self.tp_rank * self.num_k_heads
         self.k_head_end = self.k_head_start + self.num_k_heads
 
+        # ----- v2 lag stream (conv[1]) ------------------------------------
+        # ``val_proj2`` consumes the PREVIOUS token's hidden state, which is why
+        # CCA carries a second per-request state entry at all.
+        #
+        # Which of the two V projections this rank actually reads. ``val_proj1``
+        # supplies K heads ``[0, v1_heads)`` and ``val_proj2`` the rest, so a
+        # rank's contiguous K-head range can fall entirely inside one of them --
+        # the common ZAYA1 case, where ``num_query_groups`` is 2 and attn_tp is
+        # 2, giving rank 0 only val_proj1 and rank 1 only val_proj2. A rank that
+        # does not read val_proj2 needs no lag stream at all: no projection, no
+        # pool read, no pool write.
+        v1_heads = self.num_k_heads_full // 2
+        v_head_aligned = self.num_k_heads_full % 2 == 0
+        self.v_uses_val1 = (not v_head_aligned) or self.k_head_start < v1_heads
+        self.v_uses_val2 = (not v_head_aligned) or self.k_head_end > v1_heads
+
+        # ``val_proj2`` is linear, so ``W_v2 . shift(hs) == shift(W_v2 . hs)``:
+        # applying it before the state write caches ``latent_k_dim / 2`` channels
+        # (128 on ZAYA1-74B) instead of ``hidden_size`` (4096) with no change to
+        # the function computed. Two conditions gate it, mirrored by
+        # ``ZayaConfig.cca_cache_projected_v2``, which sizes the pool entry:
+        #
+        #  * no bias -- a freshly allocated slot is zero and the first token's
+        #    val_proj2 input is defined to be zero, and only ``W . 0 == 0``
+        #    reproduces that. With a bias the cached zero would have to stand
+        #    for ``b``, so a biased checkpoint keeps caching the raw hidden
+        #    state and re-projecting after the read.
+        #  * an even K-head count -- otherwise val_proj1 / val_proj2 split
+        #    inside a head and the per-rank slice below is not head-aligned.
+        #
+        # Read the bias off the constructed module rather than the config flag:
+        # it is the thing the forward pass would actually add.
+        self.cache_projected_v2 = (
+            getattr(self.val_proj2, "bias", None) is None and v_head_aligned
+        )
+        # Which slice of ``val_proj2``'s (replicated, ``latent_k_dim/2`` wide)
+        # output this rank owns, in head units, when caching the projection.
+        self.v2_head_lo = max(0, self.k_head_start - v1_heads)
+        self.v2_head_hi = max(self.v2_head_lo, self.k_head_end - v1_heads)
+        if not self.v_uses_val2:
+            self.v2_lag_dim = 0
+        elif self.cache_projected_v2:
+            self.v2_lag_dim = (self.v2_head_hi - self.v2_head_lo) * self.head_dim
+        else:
+            self.v2_lag_dim = self.hidden_size
+
         # Two-stage depthwise + grouped conv along the time axis, sized for
         # this rank's head subset. Wrapping the two nn.Conv1d modules in
         # nn.Sequential makes the HF checkpoint keys ``conv_qk.{0,1}.weight``
@@ -678,16 +782,27 @@ class CCA(nn.Module):
         # fold is automatically per-rank correct).
         self.decode_conv_groups = self.num_q_heads + self.num_k_heads
         self.decode_conv_taps = self.total_padding + 1
+        # The matmul's window carries one extra constant-1.0 tap per channel so
+        # the conv bias can ride in the weight instead of a separate add -- see
+        # ``fold_decode_conv``. Only the last of those columns holds the bias;
+        # the other ``ch_per_group - 1`` are zero, which costs a wider K on a
+        # GEMM that is launch-bound anyway and buys back one launch per
+        # attention layer (60 per decode step on ZAYA1-74B).
+        self.decode_conv_taps_ext = self.decode_conv_taps + 1
         ch_per_group = self.in_out_ch // self.decode_conv_groups
         self.register_buffer(
             "decode_conv_weight",
             torch.zeros(
                 self.decode_conv_groups,
                 ch_per_group,
-                ch_per_group * self.decode_conv_taps,
+                ch_per_group * self.decode_conv_taps_ext,
             ),
             persistent=False,
         )
+        # Kept alongside the folded weight even though the einsum path no longer
+        # adds it: ``_conv_qk_run`` hands it to ``F.conv1d`` and the fused prefill
+        # conv takes it as a kernel argument, both of which absorb a bias for
+        # free.
         self.register_buffer(
             "decode_conv_bias",
             torch.zeros(self.decode_conv_groups, ch_per_group),
@@ -961,6 +1076,16 @@ class CCA(nn.Module):
         MIOpen grouped convs into one einsum: measured 1.9x (T=1) to 4.6x (T=32)
         on MI350X under graph replay. Extend still uses the real two-stage conv,
         which produces many timesteps and cannot be folded this way.
+
+        ``decode_conv_weight`` additionally carries that bias as a trailing
+        column, matched by the constant-1.0 tap ``cca_state_step`` appends to the
+        window. The affine map becomes a pure linear one over ``taps + 1`` inputs,
+        so the bias is summed inside the matmul's fp32 accumulator instead of
+        being added to an already-rounded bf16 output. That removes a launch per
+        attention layer AND drops a rounding step, so the decode conv output is
+        *closer* to the fp32 reference than before, not bit-identical to it. The
+        column lands at ``ci == ch_per_group - 1`` and the other ``ci`` slots of
+        that tap are zero, so each output gets the bias exactly once.
         """
         t0, t1 = self.cca_time0, self.cca_time1
         groups = self.decode_conv_groups
@@ -981,14 +1106,24 @@ class CCA(nn.Module):
                 # itself reads input tap j + k.
                 folded[..., j + k] += w1[..., j] * w0[:, None, :, k]
 
-        self.decode_conv_weight.copy_(
-            folded.reshape(groups, cg, cg * taps).to(self.decode_conv_weight.dtype)
+        bias = b1 + (w1.sum(dim=3) * b0[:, None, :]).sum(dim=2)  # [G, Cg]
+
+        # [G, Co_g, Ci_g, taps] -> [G, Co_g, Ci_g, taps + 1], the extra tap
+        # holding the bias on the last input channel and zero on the rest. The
+        # window's matching column is a constant 1.0, so the matmul contracts to
+        # ``sum_ci sum_m A[co,ci,m] x[ci,m] + b[co]`` with the bias inside the
+        # fp32 accumulator.
+        folded_ext = torch.zeros(
+            groups, cg, cg, taps + 1, device=w0.device, dtype=torch.float32
         )
-        self.decode_conv_bias.copy_(
-            (b1 + (w1.sum(dim=3) * b0[:, None, :]).sum(dim=2)).to(
-                self.decode_conv_bias.dtype
+        folded_ext[..., :taps] = folded
+        folded_ext[:, :, cg - 1, taps] = bias
+        self.decode_conv_weight.copy_(
+            folded_ext.reshape(groups, cg, cg * (taps + 1)).to(
+                self.decode_conv_weight.dtype
             )
         )
+        self.decode_conv_bias.copy_(bias.to(self.decode_conv_bias.dtype))
         # [G, Co_g, Ci_g, taps] -> [G*Co_g, Ci_g, taps] == [C, C/groups, kernel]
         self.fold_conv1d_weight.copy_(
             folded.reshape(groups * cg, cg, taps).to(self.fold_conv1d_weight.dtype)
@@ -1031,17 +1166,22 @@ class CCA(nn.Module):
     def _run_extend_conv(
         self,
         qk: torch.Tensor,
-        hidden_states: torch.Tensor,
+        lag_now: Optional[torch.Tensor],
         meta,
         conv_state: torch.Tensor,
-        prev_hs_state: torch.Tensor,
+        lag_state: Optional[torch.Tensor],
         extend_seq_lens_cpu: List[int],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Run the prefill conv-with-state, preferring the fused varlen kernel.
 
         The fused path needs the folded single grouped weight and the backend's
         device-side request metadata; when either is missing it falls back to the
         reference host loop in :func:`cca_extend`.
+
+        ``lag_now`` is the projected ``val_proj2`` value stream (or the raw hidden
+        state on a checkpoint that cannot cache the projection), and ``None`` on a
+        rank that never reads the lag. Both paths carry it at whatever width they
+        are handed, so the 32x narrowing is entirely in what the caller passes.
         """
         from sglang.kernels.ops.attention import cca_conv1d as _conv1d
 
@@ -1053,11 +1193,11 @@ class CCA(nn.Module):
             weight = self.fold_conv1d_weight if self._decode_conv_folded else None
             if _conv1d.covered(
                 qk,
-                hidden_states,
+                lag_now,
                 weight,
                 bias,
                 conv_state,
-                prev_hs_state,
+                lag_state,
                 meta.query_start_loc,
                 meta.has_initial_state,
                 meta.cache_indices,
@@ -1070,11 +1210,11 @@ class CCA(nn.Module):
                 )
                 return _conv1d.cca_conv1d_fn(
                     qk,
-                    hidden_states,
+                    lag_now,
                     weight,
                     bias,
                     conv_state,
-                    prev_hs_state,
+                    lag_state,
                     meta.query_start_loc,
                     meta.has_initial_state,
                     meta.cache_indices,
@@ -1088,10 +1228,10 @@ class CCA(nn.Module):
 
         return cca_extend(
             qk,
-            hidden_states,
+            lag_now,
             self._conv_qk_run,
             conv_state,
-            prev_hs_state,
+            lag_state,
             meta.slot_ids_cpu,
             meta.has_prefix_cpu,
             extend_seq_lens_cpu,
@@ -1131,8 +1271,45 @@ class CCA(nn.Module):
             return value_full
         return value_full[:, self.k_head_start : self.k_head_end, :].contiguous()
 
+    def _lag_now(self, hidden_states: torch.Tensor) -> Optional[torch.Tensor]:
+        """The quantity this rank parks in the conv[1] pool slot this step.
+
+        ``None`` when the rank's K heads all come from ``val_proj1`` -- it never
+        reads the lag, so it neither projects nor stores anything. Otherwise the
+        rank's slice of ``val_proj2(hidden_states)`` when the projection is
+        cached, and the raw hidden state when it is not (biased or
+        non-head-aligned checkpoint).
+
+        Note the argument: ``val_proj2`` runs on the CURRENT hidden state here,
+        not the shifted one. The shift is what the pool slot provides.
+        """
+        if not self.v_uses_val2:
+            return None
+        if not self.cache_projected_v2:
+            return hidden_states
+        v2, _ = self.val_proj2(hidden_states)
+        lo, hi = self.v2_head_lo * self.head_dim, self.v2_head_hi * self.head_dim
+        if lo == 0 and hi == v2.shape[-1]:
+            return v2
+        return v2[:, lo:hi]
+
+    def _lag_state(self, pool_entry: torch.Tensor) -> Optional[torch.Tensor]:
+        """This rank's view of the conv[1] pool entry, or ``None`` if unused.
+
+        The pool entry is rank-uniform (``val_proj2`` is replicated, and an
+        asymmetric per-slot size would desync ``max_mamba_cache_size`` across the
+        attention-TP group). A rank that owns only part of ``val_proj2``'s output
+        uses a leading sub-slice; the offset convention only has to be
+        self-consistent because nothing else reads the entry.
+        """
+        if self.v2_lag_dim == 0:
+            return None
+        if pool_entry.shape[-2] == self.v2_lag_dim:
+            return pool_entry
+        return pool_entry.narrow(-2, 0, self.v2_lag_dim)
+
     def _compute_value_per_rank(
-        self, hidden_states: torch.Tensor, v2_input: torch.Tensor
+        self, hidden_states: torch.Tensor, lag_prev: Optional[torch.Tensor]
     ) -> torch.Tensor:
         """This rank's V heads, running only the projections that feed them.
 
@@ -1144,34 +1321,55 @@ class CCA(nn.Module):
         the common case for ZAYA1 -- ``num_query_groups`` is 2, so at
         ``attn_tp == 2`` each rank owns exactly one projection's output.
 
+        ``lag_prev`` is what came back from the state step. Under
+        ``cache_projected_v2`` it is already this rank's slice of the previous
+        token's ``val_proj2`` output and goes straight through; otherwise it is
+        the previous raw hidden state and still has to be projected here.
+
         Falls back to computing both and slicing when the range straddles the
         boundary (or the split is not head-aligned), which is also the tp=1 path.
         """
         head_dim = self.head_dim
         start, end = self.k_head_start, self.k_head_end
         v1_heads = self.num_k_heads_full // 2
-        aligned = self.num_k_heads_full % 2 == 0
 
-        if aligned and end <= v1_heads:
+        if not self.v_uses_val2:
             value, _ = self.val_proj1(hidden_states)
             value = value[:, start * head_dim : end * head_dim]
-        elif aligned and start >= v1_heads:
-            value, _ = self.val_proj2(v2_input)
-            value = value[
-                :, (start - v1_heads) * head_dim : (end - v1_heads) * head_dim
-            ]
+        elif not self.v_uses_val1:
+            value = self._project_lag(lag_prev)
+            if not self.cache_projected_v2:
+                value = value[
+                    :, (start - v1_heads) * head_dim : (end - v1_heads) * head_dim
+                ]
         else:
             v1, _ = self.val_proj1(hidden_states)
-            v2, _ = self.val_proj2(v2_input)
-            value = torch.cat([v1, v2], dim=-1)[:, start * head_dim : end * head_dim]
+            v2 = self._project_lag(lag_prev)
+            if self.cache_projected_v2:
+                # v2 already covers K heads [v1_heads, end); v1 supplies
+                # [start, v1_heads). start < v1_heads holds on this branch.
+                value = torch.cat(
+                    [v1[:, start * head_dim : v1_heads * head_dim], v2], dim=-1
+                )
+            else:
+                value = torch.cat([v1, v2], dim=-1)[
+                    :, start * head_dim : end * head_dim
+                ]
 
         return value.reshape(value.shape[0], self.num_k_heads, head_dim)
+
+    def _project_lag(self, lag_prev: torch.Tensor) -> torch.Tensor:
+        """``val_proj2`` applied to the lag, or the lag itself when precomputed."""
+        if self.cache_projected_v2:
+            return lag_prev
+        v2, _ = self.val_proj2(lag_prev)
+        return v2
 
     def _forward_no_state(
         self, hs: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Reference path: process the entire ``hs`` of shape ``[S, H]`` with
-        a zero initial conv state and a zero ``prev_hs``.
+        a zero initial conv state and a zero ``val_proj2`` lag.
 
         Exercised by the CCA unit tests so the prefill / decode paths can be
         compared against a single-shot torch reference, and used as a fallback
@@ -1234,9 +1432,9 @@ class CCA(nn.Module):
         reached via ``get_attn_backend().conv_state_metadata``; CCA runs its own
         two-stage grouped conv (:func:`cca_extend` / :func:`cca_decode`) against
         that handle, so this module holds no pool access. Those functions return
-        the conv output ``qk_out`` and the ``val_proj2`` input ``v2_input`` (the
-        shifted / previous hidden state), updating the ``conv_state`` /
-        ``prev_hs`` pool slots in place.
+        the conv output ``qk_out`` and the one-token-lagged ``val_proj2`` value
+        stream ``lag_prev``, updating the ``conv_state`` / lag pool slots in
+        place.
 
         ``q`` / ``k`` / ``v`` are all returned in ``hidden_states``' dtype. The
         blend and normalize still accumulate in fp32 internally, but the result is
@@ -1269,18 +1467,19 @@ class CCA(nn.Module):
 
         # The backend hands out the per-request conv-state handle (slot indices,
         # prefix mask, cuda-graph buffers); CCA runs its own two-stage grouped
-        # conv against it and gets back the conv output + val_proj2 input, with
-        # the conv_state / prev_hs pool slots updated in place.
+        # conv against it and gets back the conv output + the lagged val_proj2
+        # value, with the conv_state / lag pool slots updated in place.
         meta = get_attn_backend().conv_state_metadata(self.layer_id, forward_batch)
         conv_state = meta.layer_cache.conv[0]
-        prev_hs_state = meta.layer_cache.conv[1]
+        lag_state = self._lag_state(meta.layer_cache.conv[1])
+        lag_now = self._lag_now(hidden_states)
         if forward_batch.forward_mode.is_decode_or_idle():
-            qk_out, v2_input = cca_decode(
+            qk_out, lag_prev = cca_decode(
                 qk,
-                hidden_states,
+                lag_now,
                 self.conv_qk,
                 conv_state,
-                prev_hs_state,
+                lag_state,
                 meta.cache_indices,
                 self.total_padding,
                 decode_conv_weight=(
@@ -1290,12 +1489,12 @@ class CCA(nn.Module):
                 decode_conv_groups=self.decode_conv_groups,
             )
         else:
-            qk_out, v2_input = self._run_extend_conv(
+            qk_out, lag_prev = self._run_extend_conv(
                 qk,
-                hidden_states,
+                lag_now,
                 meta,
                 conv_state,
-                prev_hs_state,
+                lag_state,
                 forward_batch.extend_seq_lens_cpu,
             )
 
@@ -1320,7 +1519,7 @@ class CCA(nn.Module):
             out_dtype=hidden_states.dtype,
         )
 
-        value = self._compute_value_per_rank(hidden_states, v2_input)
+        value = self._compute_value_per_rank(hidden_states, lag_prev)
         return query, key, value
 
 
