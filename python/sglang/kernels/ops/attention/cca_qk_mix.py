@@ -1,4 +1,4 @@
-"""Fused ZAYA1 CCA q/k head-mix + normalize.
+"""Fused ZAYA1 CCA q/k head-mix + normalize (+ partial-rotary RoPE).
 
 One kernel replaces the ~26-launch elementwise tail of the CCA projection --
 ``_add_grouped_qk_means`` followed by ``_normalize_qk`` in
@@ -19,6 +19,45 @@ one serial ``tl.sum`` per head, and ``mean_j(pre_q)`` for the k blend is a
 reduction along ``axis=0`` of that same tile rather than a separate running
 accumulator -- so ``pre_q`` is read once and the group's ``G + 1`` reductions
 collapse to two.
+
+Rotary
+------
+``ROT_D > 0`` folds the neox partial-rotary RoPE in as well, removing the
+separate ``sgl_kernel.rotary_embedding`` launch that ran immediately after this
+kernel (one per attention layer, 60 per decode step on ZAYA1-74B). The head is
+already in registers, so the rotation is free arithmetic on values that would
+otherwise be stored, re-read and stored again.
+
+The shared fused rope path (``models/utils.create_fused_set_kv_buffer_arg`` ->
+``fused_qk_rope_reshape_and_cache``) cannot serve ZAYA1: it derives
+``d_freq = cos_sin.shape[-1] // 2`` and asserts ``d_freq in (d // 2, d)``. With
+``partial_rotary_factor=0.5`` the cache is ``[max_pos, 64]`` against
+``head_dim=128``, so ``d_freq == 32`` and the assert fires -- that kernel has no
+partial-rotary mode. Hence the rotation lives here instead.
+
+Under ``ROT_D`` the head is loaded as three register tiles rather than one:
+``lo = d[0:ROT_D/2]``, ``hi = d[ROT_D/2:ROT_D]`` and ``pass = d[ROT_D:HD]``.
+Splitting on load is what makes the neox rotation
+
+    lo' = lo*cos - hi*sin        hi' = hi*cos + lo*sin
+
+pure lane-local arithmetic: ``lo`` and ``hi`` sit in the *same* lane of two
+different tiles, so no cross-lane shuffle (``tl.flip`` / ``tl.reshape``, as
+``rope_cache._get_neox_rotated_x`` needs) is required. Each element is still
+loaded exactly once; only the address arithmetic is split.
+
+ORDERING: the RMS sum runs over all ``HD`` dims and the k temperature is applied
+*before* the rotation, matching today's ``_normalize_qk`` -> ``rotary_emb``
+order. The rotation is norm-preserving on the rotated half so the two do not
+interact numerically, but the order is pinned anyway rather than relied upon.
+
+NOT bit-identical to the unfused chain: on ROCm the cos/sin cache is stored in
+the model dtype (``RotaryEmbedding.__init__`` casts it whenever the platform is
+not CUDA/XPU and ``SGLANG_ROPE_CACHE_FP32`` is off), and the separate rotary
+kernel also receives ``q``/``k`` already rounded to bf16. This kernel keeps the
+normalized head in fp32 across the rotation and rounds once, at the store, so
+its result is *closer* to the fp64 reference than the chain it replaces -- but
+it differs from it in the last bf16 bits.
 
 Follows the structure of ``kda_fused_decode`` (a ``covered()`` predicate gates
 supported inputs, everything else falls back to the unfused chain), but is
@@ -50,6 +89,22 @@ _MAX_GQA_GROUPS = 16
 
 _RMS_EPS = 1e-12
 
+_INT_DTYPES = (torch.int32, torch.int64)
+_FLOAT_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+
+
+@triton.jit
+def _blend(conv_row, pre_row, half_base_k, off, mask):
+    """``conv + 0.5*pre + 0.5*base_k`` for one offset tile, in fp32.
+
+    ``conv_row`` / ``pre_row`` are already advanced to the token's row, and
+    ``half_base_k`` is broadcast-compatible with ``off``. Returns the blend and
+    the raw ``pre`` load, which the k blend reduces over the group.
+    """
+    pre = tl.load(pre_row + off, mask=mask, other=0.0).to(tl.float32)
+    conv = tl.load(conv_row + off, mask=mask, other=0.0).to(tl.float32)
+    return conv + 0.5 * pre + half_base_k, pre
+
 
 @triton.jit
 def _cca_qk_mix_kernel(
@@ -57,6 +112,8 @@ def _cca_qk_mix_kernel(
     pre_q_ptr,  # [T, latent_q]  raw W_q hidden_states
     base_k_ptr,  # [T, latent_k]  raw W_k hidden_states
     k_scale_ptr,  # [NK] sqrt(head_dim) * per-k-head temperature
+    positions_ptr,  # [T] int, or None when ROT_D == 0
+    cos_sin_ptr,  # [max_pos, ROT_D] cos half then sin half, or None
     q_out_ptr,  # [T, NQ, HD] fp32
     k_out_ptr,  # [T, NK, HD] fp32
     s_conv_t,
@@ -64,6 +121,7 @@ def _cca_qk_mix_kernel(
     s_base_t,
     s_qout_t,
     s_kout_t,
+    s_cos_t,
     latent_q,
     q_scale,  # sqrt(head_dim)
     eps,
@@ -72,51 +130,121 @@ def _cca_qk_mix_kernel(
     HD: tl.constexpr,
     BLOCK: tl.constexpr,
     BLOCK_G: tl.constexpr,  # next_power_of_2(G)
+    ROT_D: tl.constexpr,  # rotary_dim, 0 to skip the rotation
+    ROT_HALF: tl.constexpr,  # ROT_D // 2
+    BLOCK_H: tl.constexpr,  # next_power_of_2(ROT_HALF), 1 when ROT_D == 0
+    BLOCK_P: tl.constexpr,  # next_power_of_2(HD - ROT_D), 1 when ROT_D == 0
 ):
     pid = tl.program_id(0)
     t = pid // NK
     g = pid % NK
 
-    d = tl.arange(0, BLOCK)
-    mask = d < HD
+    conv_row = conv_qk_ptr + t * s_conv_t
+    pre_row = pre_q_ptr + t * s_pre_t
+    base_row = base_k_ptr + t * s_base_t + g * HD
+    conv_k_row = conv_row + latent_q + g * HD
 
-    # base_k for this group, reused by every q head in the group and by k.
-    base_k = tl.load(base_k_ptr + t * s_base_t + g * HD + d, mask=mask, other=0.0).to(
-        tl.float32
-    )
-    half_base_k = 0.5 * base_k
-
-    # The group's q heads as one [BLOCK_G, BLOCK] tile: their RMS sums then reduce
-    # together along the head dim instead of one serial tl.sum per head, and the
-    # k blend's mean over j becomes a reduction along the other axis of the same
-    # tile -- no separate accumulator, and pre_q is loaded once.
+    # The group's q heads reduce together: one [BLOCK_G, ...] tile whose rows are
+    # the group's q heads, so the G RMS sums collapse to one axis=1 reduction and
+    # mean_j(pre_q) to one axis=0 reduction of the same tile.
     j = tl.arange(0, BLOCK_G)[:, None]
-    dd = d[None, :]
-    qmask = (j < G) & (dd < HD)
-    q_off = (g * G + j) * HD + dd
+    jmask = j < G
+    q_row = (g * G + j) * HD  # [BLOCK_G, 1]
 
-    pre_q = tl.load(pre_q_ptr + t * s_pre_t + q_off, mask=qmask, other=0.0).to(
-        tl.float32
-    )
-    conv_q = tl.load(conv_qk_ptr + t * s_conv_t + q_off, mask=qmask, other=0.0).to(
-        tl.float32
-    )
-
-    q = conv_q + 0.5 * pre_q + half_base_k[None, :]
-    # Masked lanes carry 0, so they add nothing to their row's sum, and the row
-    # itself is never stored.
-    inv = tl.rsqrt(tl.sum(q * q, axis=1) + eps) * q_scale
-    tl.store(q_out_ptr + t * s_qout_t + q_off, q * inv[:, None], mask=qmask)
-
-    pre_q_sum = tl.sum(pre_q, axis=0)
-
-    conv_k = tl.load(
-        conv_qk_ptr + t * s_conv_t + latent_q + g * HD + d, mask=mask, other=0.0
-    ).to(tl.float32)
-    k = conv_k + (0.5 / G) * pre_q_sum + half_base_k
     k_scale = tl.load(k_scale_ptr + g).to(tl.float32)
-    inv_k = tl.rsqrt(tl.sum(k * k, axis=0) + eps) * k_scale
-    tl.store(k_out_ptr + t * s_kout_t + g * HD + d, k * inv_k, mask=mask)
+    inv_g_half = 0.5 / G
+
+    if ROT_D == 0:
+        d = tl.arange(0, BLOCK)
+        dmask = d < HD
+
+        base_k = tl.load(base_row + d, mask=dmask, other=0.0).to(tl.float32)
+        half_base_k = 0.5 * base_k
+
+        off = q_row + d[None, :]
+        qmask = jmask & (d[None, :] < HD)
+        q, pre_q = _blend(conv_row, pre_row, half_base_k[None, :], off, qmask)
+        # Masked lanes carry 0, so they add nothing to their row's sum, and the
+        # row itself is never stored.
+        inv = tl.rsqrt(tl.sum(q * q, axis=1) + eps) * q_scale
+        tl.store(q_out_ptr + t * s_qout_t + off, q * inv[:, None], mask=qmask)
+
+        conv_k = tl.load(conv_k_row + d, mask=dmask, other=0.0).to(tl.float32)
+        k = conv_k + inv_g_half * tl.sum(pre_q, axis=0) + half_base_k
+        inv_k = tl.rsqrt(tl.sum(k * k, axis=0) + eps) * k_scale
+        tl.store(k_out_ptr + t * s_kout_t + g * HD + d, k * inv_k, mask=dmask)
+    else:
+        # Three tiles: the two rotated halves and the pass-through tail. lo and
+        # hi share a lane index, which is what keeps the rotation shuffle-free.
+        i = tl.arange(0, BLOCK_H)
+        imask = i < ROT_HALF
+        p = tl.arange(0, BLOCK_P)
+        pmask = p < (HD - ROT_D)
+
+        hb_lo = 0.5 * tl.load(base_row + i, mask=imask, other=0.0).to(tl.float32)
+        hb_hi = 0.5 * tl.load(base_row + ROT_HALF + i, mask=imask, other=0.0).to(
+            tl.float32
+        )
+        hb_pa = 0.5 * tl.load(base_row + ROT_D + p, mask=pmask, other=0.0).to(
+            tl.float32
+        )
+
+        off_lo = q_row + i[None, :]
+        off_hi = q_row + ROT_HALF + i[None, :]
+        off_pa = q_row + ROT_D + p[None, :]
+        qm_h = jmask & imask[None, :]
+        qm_p = jmask & pmask[None, :]
+
+        q_lo, pre_lo = _blend(conv_row, pre_row, hb_lo[None, :], off_lo, qm_h)
+        q_hi, pre_hi = _blend(conv_row, pre_row, hb_hi[None, :], off_hi, qm_h)
+        q_pa, pre_pa = _blend(conv_row, pre_row, hb_pa[None, :], off_pa, qm_p)
+
+        # RMS over the WHOLE head (all three tiles) and before the rotation --
+        # the order the unfused chain uses.
+        ssq = (
+            tl.sum(q_lo * q_lo, axis=1)
+            + tl.sum(q_hi * q_hi, axis=1)
+            + tl.sum(q_pa * q_pa, axis=1)
+        )
+        inv = tl.rsqrt(ssq + eps) * q_scale
+        q_lo = q_lo * inv[:, None]
+        q_hi = q_hi * inv[:, None]
+        q_pa = q_pa * inv[:, None]
+
+        pos = tl.load(positions_ptr + t).to(tl.int64)
+        cos_row = cos_sin_ptr + pos * s_cos_t
+        cos = tl.load(cos_row + i, mask=imask, other=0.0).to(tl.float32)
+        sin = tl.load(cos_row + ROT_HALF + i, mask=imask, other=0.0).to(tl.float32)
+
+        q_out_row = q_out_ptr + t * s_qout_t
+        cos2 = cos[None, :]
+        sin2 = sin[None, :]
+        tl.store(q_out_row + off_lo, q_lo * cos2 - q_hi * sin2, mask=qm_h)
+        tl.store(q_out_row + off_hi, q_hi * cos2 + q_lo * sin2, mask=qm_h)
+        tl.store(q_out_row + off_pa, q_pa, mask=qm_p)
+
+        ck_lo = tl.load(conv_k_row + i, mask=imask, other=0.0).to(tl.float32)
+        ck_hi = tl.load(conv_k_row + ROT_HALF + i, mask=imask, other=0.0)
+        ck_hi = ck_hi.to(tl.float32)
+        ck_pa = tl.load(conv_k_row + ROT_D + p, mask=pmask, other=0.0).to(tl.float32)
+        k_lo = ck_lo + inv_g_half * tl.sum(pre_lo, axis=0) + hb_lo
+        k_hi = ck_hi + inv_g_half * tl.sum(pre_hi, axis=0) + hb_hi
+        k_pa = ck_pa + inv_g_half * tl.sum(pre_pa, axis=0) + hb_pa
+
+        ssq_k = (
+            tl.sum(k_lo * k_lo, axis=0)
+            + tl.sum(k_hi * k_hi, axis=0)
+            + tl.sum(k_pa * k_pa, axis=0)
+        )
+        inv_k = tl.rsqrt(ssq_k + eps) * k_scale
+        k_lo = k_lo * inv_k
+        k_hi = k_hi * inv_k
+        k_pa = k_pa * inv_k
+
+        k_out_row = k_out_ptr + t * s_kout_t + g * HD
+        tl.store(k_out_row + i, k_lo * cos - k_hi * sin, mask=imask)
+        tl.store(k_out_row + ROT_HALF + i, k_hi * cos + k_lo * sin, mask=imask)
+        tl.store(k_out_row + ROT_D + p, k_pa, mask=pmask)
 
 
 def covered(
@@ -135,6 +263,9 @@ def covered(
     that fits one Triton block, row-major 2-D inputs with a unit innermost
     stride, and float inputs on an accelerator. ``k_scale`` is the folded
     ``sqrt(head_dim) * temperature`` vector, absent until weights load.
+
+    Says nothing about the rotary fusion -- see :func:`rope_covered`, which is a
+    strictly additional gate. The mix can fuse while the rotation falls back.
     """
     if k_scale is None:
         return False
@@ -160,10 +291,76 @@ def covered(
         return False
     if k_scale.numel() != num_k_heads or not k_scale.is_contiguous():
         return False
-    return all(
-        t.dtype in (torch.float32, torch.float16, torch.bfloat16)
-        for t in (conv_qk, pre_q, base_k)
-    )
+    return all(t.dtype in _FLOAT_DTYPES for t in (conv_qk, pre_q, base_k))
+
+
+def rope_geometry_covered(
+    rotary_dim: int, head_dim: int, is_neox_style: bool = True
+) -> bool:
+    """The device-independent half of :func:`rope_covered`: is this head shape one
+    the three-tile split can express?
+
+    * ``rotary_dim == head_dim // 2`` -- ZAYA1's ``partial_rotary_factor=0.5``.
+      Any other split changes the tile geometry (the pass-through tail stops
+      being the same width as the rotated part) and is rejected rather than
+      guessed at.
+    * ``rotary_dim // 2`` even -- ``lo`` and ``hi`` are addressed as two tiles of
+      ``rotary_dim // 2`` lanes and the cos/sin cache is read at the same
+      granularity, so an odd half is refused instead of relying on the mask to
+      paper over a half-lane.
+    * neox layout. GPT-J interleaves the rotated pair *within* a lane, which is
+      exactly the cross-lane case this kernel avoids by splitting on load.
+
+    Split out from ``rope_covered`` so the geometry can be pinned without a GPU.
+    """
+    if not is_neox_style:
+        return False
+    if rotary_dim <= 0 or head_dim <= 0:
+        return False
+    if rotary_dim != head_dim // 2:
+        return False
+    return (rotary_dim // 2) % 2 == 0
+
+
+def rope_covered(
+    positions: Optional[torch.Tensor],
+    cos_sin_cache: Optional[torch.Tensor],
+    rotary_dim: int,
+    *,
+    head_dim: int,
+    num_tokens: int,
+    is_neox_style: bool = True,
+    device: Optional[torch.device] = None,
+) -> bool:
+    """Whether the neox partial rotary can be folded into the mix kernel.
+
+    Deliberately narrow: :func:`rope_geometry_covered` for the head shape, plus a
+    ``[max_pos, rotary_dim]`` cache (cos half then sin half) with a unit
+    innermost stride and a 1-D integer ``positions``, both on the inputs' device.
+
+    Everything it rejects still gets the fused mix plus a separate rotary
+    launch, i.e. today's behavior.
+    """
+    if positions is None or cos_sin_cache is None:
+        return False
+    if not rope_geometry_covered(rotary_dim, head_dim, is_neox_style):
+        return False
+    if cos_sin_cache.ndim != 2 or cos_sin_cache.shape[-1] != rotary_dim:
+        return False
+    if cos_sin_cache.stride(-1) != 1:
+        return False
+    if cos_sin_cache.dtype not in _FLOAT_DTYPES:
+        return False
+    if positions.ndim != 1 or positions.numel() != num_tokens:
+        return False
+    if positions.dtype not in _INT_DTYPES or not positions.is_contiguous():
+        return False
+    if not (positions.is_cuda and cos_sin_cache.is_cuda):
+        return False
+    if device is not None:
+        if positions.device != device or cos_sin_cache.device != device:
+            return False
+    return True
 
 
 def cca_qk_mix(
@@ -178,13 +375,21 @@ def cca_qk_mix(
     q_scale: float,
     eps: float = _RMS_EPS,
     out_dtype: torch.dtype = torch.float32,
+    positions: Optional[torch.Tensor] = None,
+    cos_sin_cache: Optional[torch.Tensor] = None,
+    rotary_dim: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return ``(q, k)`` as ``[T, heads, head_dim]`` in ``out_dtype``.
 
     Accumulation is always fp32 inside the kernel; ``out_dtype`` only picks the
     store precision. Writing the model dtype directly saves the caller a cast --
     and the cast is all it was, since the fp32 result was rounded to the model
-    dtype immediately afterwards. Caller must have checked :func:`covered`.
+    dtype immediately afterwards.
+
+    Passing ``positions`` / ``cos_sin_cache`` / ``rotary_dim`` also applies the
+    neox partial rotary to both outputs, removing the separate rotary launch.
+    Caller must have checked :func:`covered`, and :func:`rope_covered` too when
+    it passes the rotary arguments.
     """
     num_tokens = conv_qk.shape[0]
     q_out = torch.empty(
@@ -196,11 +401,22 @@ def cca_qk_mix(
     if num_tokens == 0:
         return q_out, k_out
 
+    rot_d = int(rotary_dim) if positions is not None else 0
+    if rot_d:
+        rot_half = rot_d // 2
+        block_h = triton.next_power_of_2(rot_half)
+        block_p = triton.next_power_of_2(head_dim - rot_d)
+        s_cos_t = cos_sin_cache.stride(0)
+    else:
+        rot_half, block_h, block_p, s_cos_t = 0, 1, 1, 0
+
     _cca_qk_mix_kernel[(num_tokens * num_k_heads,)](
         conv_qk,
         pre_q,
         base_k,
         k_scale,
+        positions if rot_d else None,
+        cos_sin_cache if rot_d else None,
         q_out,
         k_out,
         conv_qk.stride(0),
@@ -208,6 +424,7 @@ def cca_qk_mix(
         base_k.stride(0),
         q_out.stride(0),
         k_out.stride(0),
+        s_cos_t,
         num_q_heads * head_dim,
         float(q_scale),
         float(eps),
@@ -216,6 +433,10 @@ def cca_qk_mix(
         HD=head_dim,
         BLOCK=triton.next_power_of_2(head_dim),
         BLOCK_G=triton.next_power_of_2(num_q_heads // num_k_heads),
+        ROT_D=rot_d,
+        ROT_HALF=rot_half,
+        BLOCK_H=block_h,
+        BLOCK_P=block_p,
         # One warp, not four. The reductions are over the head dim (ZAYA1: 128
         # elements), so 4 warps is 256 ROCm lanes per 128-element row: half of
         # them idle, and each ``tl.sum`` becomes a cross-wavefront LDS reduction

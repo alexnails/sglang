@@ -86,7 +86,7 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding import RotaryEmbedding, get_rope
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -532,6 +532,67 @@ def _cca_decode_conv(
     return conv_qk(padded).squeeze(-1)
 
 
+class CCARope(NamedTuple):
+    """The layer's rotary inputs, handed to ``CCA.forward`` for in-kernel RoPE.
+
+    ZAYA1-74B builds TWO rotary caches -- a full-attention one keyed on
+    ``rope_theta`` (1e7) and a sliding-window one keyed on ``swa_rotary_base``
+    (10000) -- and picks per layer, so the fused path must read *this* layer's
+    buffer rather than a model-wide one. ``get_rope`` keys its process-wide cache
+    on ``base`` among other things, so the two are distinct modules with distinct
+    buffers (pinned by ``TestZayaSlidingWindowAttention``'s
+    ``test_attention_selects_window_and_rope_base_per_layer``).
+
+    CUDA-graph safety: ``cos_sin_cache`` is a plain ``register_buffer`` allocated
+    once in ``RotaryEmbedding.__init__`` at ``max_position_embeddings`` rows. The
+    only thing that can move it is ``_ensure_cos_sin_cache_length``, whose sole
+    caller is ``reserve_rope_cache_for_long_sequences``, which ``ModelRunner``
+    runs *before* ``init_cuda_graphs`` -- so no reallocation can happen after
+    capture. ``forward_cuda``'s ``self.cos_sin_cache.to(device, dtype)`` is a
+    no-op on ROCm (the cache is already stored in the model dtype) and returns
+    the same tensor, so the baseline rotary launch relies on exactly the same
+    guarantee. The pointer is read fresh from the module on every forward, so an
+    eager run picks up any move regardless.
+    """
+
+    positions: torch.Tensor
+    cos_sin_cache: torch.Tensor
+    rotary_dim: int
+    is_neox_style: bool
+
+    @classmethod
+    def of(cls, rotary_emb: nn.Module, positions: torch.Tensor) -> Optional[CCARope]:
+        """Snapshot a ``RotaryEmbedding``, or ``None`` if it is not the plain kind.
+
+        Exact-type, not isinstance: every subclass changes something the fused
+        kernel does not model -- a per-scaling-factor cache offset
+        (``LinearScalingRotaryEmbedding``), a second cache
+        (``DualChunkRotaryEmbedding``), a 2-D position layout
+        (``MRotaryEmbedding``). ZAYA1 passes no ``rope_scaling``, so ``get_rope``
+        always hands it the base class; anything else falls back to a separate
+        rotary launch rather than to a guess.
+
+        ``_force_native`` (deterministic RL replay) also declines: that mode
+        deliberately pins the eager torch rotary, and this kernel is not
+        bit-identical to it.
+        """
+        if type(rotary_emb) is not RotaryEmbedding:
+            return None
+        if getattr(rotary_emb, "_force_native", False):
+            return None
+        cache = getattr(rotary_emb, "cos_sin_cache", None)
+        if cache is None or hasattr(rotary_emb, "sin_cos_cache"):
+            return None
+        if positions is None or positions.ndim != 1:
+            return None
+        return cls(
+            positions=positions,
+            cos_sin_cache=cache,
+            rotary_dim=int(rotary_emb.rotary_dim),
+            is_neox_style=bool(rotary_emb.is_neox_style),
+        )
+
+
 # ---------------------------------------------------------------------------
 # CCA: Compressed Convolutional Attention QKV projection
 # ---------------------------------------------------------------------------
@@ -843,6 +904,13 @@ class CCA(nn.Module):
         )
         self._qk_scales_folded = False
 
+        # Set by every ``_mix_and_normalize_qk``: True when the fused kernel also
+        # applied the rotary, so ``ZayaAttention`` skips its own rotary launch.
+        # A python bool, like qwen3_moe's ``_used_fused_qk_norm_rope_last_call``:
+        # it is decided from static properties (shapes, dtypes, devices) so it is
+        # stable across a CUDA-graph capture and its replays.
+        self.rope_fused = False
+
         # Attach TP-aware weight loaders to conv_qk weights/biases and ``temp``
         # so the existing ``load_weights`` dispatch (``getattr(param,
         # "weight_loader", default_weight_loader)``) automatically slices the
@@ -1020,15 +1088,23 @@ class CCA(nn.Module):
         query_pre: torch.Tensor,
         key_base: torch.Tensor,
         out_dtype: torch.dtype,
+        rope: Optional[CCARope] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Blend post-conv q/k with the grouped pre-conv means, then RMS-normalize.
 
         Prefers the fused Triton kernel and falls back to the two torch helpers
         when it cannot serve the shapes (see ``cca_qk_mix.covered``) -- notably
         before ``fold_qk_scales`` has run, so CPU unit tests keep the torch path.
+
+        ``rope`` additionally folds the neox partial rotary into the same kernel.
+        It is a strictly extra gate on top of ``covered()``: an input the mix can
+        serve but the rotary cannot still gets the fused mix, and
+        ``self.rope_fused`` tells the caller whether it still owes a rotary
+        launch.
         """
         from sglang.kernels.ops.attention import cca_qk_mix as _cca_qk_mix
 
+        self.rope_fused = False
         scale = self.qk_k_scale if self._qk_scales_folded else None
         if _cca_qk_mix.covered(
             qk_out,
@@ -1039,6 +1115,22 @@ class CCA(nn.Module):
             num_k_heads=self.num_k_heads,
             head_dim=self.head_dim,
         ):
+            rope_args = {}
+            if rope is not None and _cca_qk_mix.rope_covered(
+                rope.positions,
+                rope.cos_sin_cache,
+                rope.rotary_dim,
+                head_dim=self.head_dim,
+                num_tokens=qk_out.shape[0],
+                is_neox_style=rope.is_neox_style,
+                device=qk_out.device,
+            ):
+                rope_args = {
+                    "positions": rope.positions,
+                    "cos_sin_cache": rope.cos_sin_cache,
+                    "rotary_dim": rope.rotary_dim,
+                }
+                self.rope_fused = True
             return _cca_qk_mix.cca_qk_mix(
                 qk_out,
                 query_pre_flat,
@@ -1049,6 +1141,7 @@ class CCA(nn.Module):
                 head_dim=self.head_dim,
                 q_scale=float(self.sqrt_head_dim),
                 out_dtype=out_dtype,
+                **rope_args,
             )
 
         query, key = self._add_grouped_qk_means(
@@ -1423,6 +1516,7 @@ class CCA(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        rope: Optional[CCARope] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Project ``hidden_states`` into ``(q, k, v)`` honoring per-request state.
 
@@ -1441,6 +1535,13 @@ class CCA(nn.Module):
         stored at model precision: the caller rounded it there immediately anyway,
         so materializing an fp32 copy first only cost a per-layer ``copy_``.
 
+        ``rope`` (this layer's :class:`CCARope`) additionally folds the neox
+        partial rotary into the same kernel, so ``q`` / ``k`` come back already
+        rotated. ``self.rope_fused`` reports whether that happened; when it is
+        False the caller still owes a rotary launch. Under the global-residual
+        dataflow ``rope.positions`` is already the replica-local view, matching
+        ``hidden_states``.
+
         Shapes::
 
             q : [T, num_q_heads, head_dim]
@@ -1448,6 +1549,9 @@ class CCA(nn.Module):
             v : [T, num_k_heads, head_dim]
         """
         if hidden_states.shape[0] == 0:
+            # Nothing was rotated, so an idle replica reports no fused rope --
+            # its caller returns before the rotary anyway.
+            self.rope_fused = False
             zero = hidden_states.new_zeros((0,))
             return (
                 zero.view(0, self.num_q_heads, self.head_dim),
@@ -1524,6 +1628,7 @@ class CCA(nn.Module):
             query_pre,
             key_base,
             out_dtype=hidden_states.dtype,
+            rope=rope,
         )
 
         value = self._compute_value_per_rank(hidden_states, lag_prev)
@@ -1681,7 +1786,19 @@ class ZayaAttention(nn.Module):
         # CCA returns fp32 q/k and input-dtype v as ``[T, heads, head_dim]``
         # tensors; flatten the head dim and cast all to the model dtype before
         # rotary + RadixAttention.
-        q, k, v = self.qkv(hidden_states, forward_batch)
+        #
+        # The rotary is handed *into* CCA rather than run after it: the fused
+        # head-mix kernel already holds the whole head in registers, so the
+        # rotation is free arithmetic there and the separate
+        # ``sgl_kernel.rotary_embedding`` launch (one per attention layer, 60 per
+        # decode step) disappears. ``qkv.rope_fused`` says whether it took the
+        # offer -- everything the fused path cannot serve (see
+        # ``cca_qk_mix.rope_covered``) falls back to the launch below.
+        q, k, v = self.qkv(
+            hidden_states,
+            forward_batch,
+            rope=CCARope.of(self.rotary_emb, positions),
+        )
         target_dtype = hidden_states.dtype
         # ``flatten(1)`` rather than ``reshape(T, -1)``: under DP attention a
         # replica with no requests this step runs an idle forward with T=0, and
@@ -1692,10 +1809,13 @@ class ZayaAttention(nn.Module):
         k = k.flatten(1).to(target_dtype)
         v = v.flatten(1).to(target_dtype)
 
-        q, k = self.rotary_emb(positions, q, k)
+        if not self.qkv.rope_fused:
+            q, k = self.rotary_emb(positions, q, k)
         # Some rotary backends (notably AITER on ROCm) hand back tensors with
         # a different stride than the input. RadixAttention's KV-store kernel
         # asserts contiguous layout, so normalize q/k/v before the attention.
+        # The fused path already returns freshly-allocated contiguous tensors,
+        # so these are no-op views there, not copies.
         q = q.contiguous()
         k = k.contiguous()
         v = v.contiguous()

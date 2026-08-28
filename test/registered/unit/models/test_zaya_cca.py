@@ -1199,6 +1199,413 @@ class TestCCAQKMixKernel(CustomTestCase):
         self.assertFalse(kernel.covered(wide_conv, wide_q, base_k, scale, 64, 1, 32))
 
 
+class TestCCAQKMixRope(CustomTestCase):
+    """The fused partial-rotary RoPE inside ``cca_qk_mix``.
+
+    ZAYA1 runs ``partial_rotary_factor=0.5`` with ``head_dim=128``, so the cos/sin
+    cache is ``[max_pos, 64]``. That is the exact shape the shared fused rope
+    path refuses (``rope_cache`` derives ``d_freq = cos_sin.shape[-1] // 2 == 32``
+    and asserts it equals ``d`` or ``d // 2``), which is why the rotation lives in
+    ``cca_qk_mix`` instead. This class pins that it computes the same thing as the
+    ``_normalize_qk`` -> ``rotary_emb`` chain it replaces.
+
+    Not bit-identical, deliberately: the chain rounds q/k to bf16 before rotating
+    and (on ROCm) reads a bf16 cos/sin cache, while the fused kernel keeps the
+    normalized head in fp32 across the rotation and rounds once at the store. The
+    bf16 comparison is therefore ``allclose`` at bf16 tolerance, and a separate
+    fp64 reference shows which side the difference falls on: the fused result must
+    be at least as close to exact as the chain.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _ensure_dist_initialized()
+        from sglang.srt.runtime_context import get_context
+
+        cls._server_args_override = get_context().override_server_args(
+            model_path="dummy"
+        )
+        cls._server_args_override.install()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls._server_args_override.restore()
+
+    # -- reference chains ---------------------------------------------------
+
+    @staticmethod
+    def _reference_chain(cca, conv_qk, pre_q, base_k, rotary_emb, positions, dtype):
+        """``_add_grouped_qk_means`` -> ``_normalize_qk`` -> cast -> ``rotary_emb``.
+
+        Exactly what ``ZayaAttention.forward`` did before the fusion, driven
+        through the real module helpers so the test tracks them.
+        """
+        T = conv_qk.shape[0]
+        nq, nk, hd = cca.num_q_heads, cca.num_k_heads, cca.head_dim
+        with torch.no_grad():
+            q, k = cca._add_grouped_qk_means(
+                conv_qk[:, : nq * hd].view(T, nq, hd),
+                conv_qk[:, nq * hd :].view(T, nk, hd),
+                pre_q.view(T, nq, hd),
+                base_k.view(T, nk, hd),
+            )
+            q, k = cca._normalize_qk(q, k)
+            q = q.to(dtype).flatten(1).contiguous()
+            k = k.to(dtype).flatten(1).contiguous()
+            q, k = rotary_emb(positions, q, k)
+        return q.view(T, nq, hd), k.view(T, nk, hd)
+
+    @staticmethod
+    def _reference_fp64(cca, conv_qk, pre_q, base_k, cos_sin_cache, positions):
+        """The same function evaluated in fp64 from the stored cos/sin cache.
+
+        The cache is used as stored (bf16 on ROCm) because both the fused kernel
+        and the chain read that same table -- its quantization is common-mode and
+        is not what this reference measures.
+        """
+        T = conv_qk.shape[0]
+        nq, nk, hd = cca.num_q_heads, cca.num_k_heads, cca.head_dim
+        g = cca.gqa_groups
+        eps = 1e-12
+        cq = conv_qk[:, : nq * hd].reshape(T, nk, g, hd).double()
+        ck = conv_qk[:, nq * hd :].reshape(T, nk, hd).double()
+        pq = pre_q.reshape(T, nk, g, hd).double()
+        bk = base_k.reshape(T, nk, hd).double()
+
+        q = cq + 0.5 * pq + 0.5 * bk.unsqueeze(-2)
+        k = ck + 0.5 * pq.mean(dim=-2) + 0.5 * bk
+        sqrt_hd = float(cca.sqrt_head_dim)
+        q = q * torch.rsqrt(q.pow(2).sum(-1, keepdim=True) + eps) * sqrt_hd
+        k = k * torch.rsqrt(k.pow(2).sum(-1, keepdim=True) + eps) * sqrt_hd
+        temp = cca.temp.detach().double().view(1, nk, 1)
+        k = k * temp
+        q = q.reshape(T, nq, hd)
+
+        rot = cos_sin_cache.shape[-1]
+        half = rot // 2
+        cs = cos_sin_cache.double()[positions.long()]
+        cos, sin = cs[:, :half], cs[:, half:]
+
+        def _rot(x):
+            lo = x[..., :half]
+            hi = x[..., half:rot]
+            c = cos.unsqueeze(1)
+            s = sin.unsqueeze(1)
+            return torch.cat([lo * c - hi * s, hi * c + lo * s, x[..., rot:]], dim=-1)
+
+        return _rot(q), _rot(k)
+
+    # -- the fused run ------------------------------------------------------
+
+    def _run(self, *, rope_base: int, num_tokens: int, dtype=torch.bfloat16):
+        from sglang.kernels.ops.attention import cca_qk_mix as kernel
+        from sglang.srt.layers.rotary_embedding import get_rope
+        from sglang.srt.models.zaya import CCARope
+
+        dev = "cuda"
+        num_q_heads, num_k_heads, head_dim = 8, 1, 128
+        torch.manual_seed(7)
+
+        cca = _make_tiny_cca(seed=3)[0]
+        cca.num_q_heads = num_q_heads
+        cca.num_k_heads = num_k_heads
+        cca.gqa_groups = num_q_heads // num_k_heads
+        cca.head_dim = head_dim
+        cca.sqrt_head_dim = head_dim**0.5
+        cca.clamp_temp = False
+        cca.temp = torch.nn.Parameter(torch.rand(num_k_heads) + 0.5)
+
+        rotary_emb = get_rope(
+            head_size=head_dim,
+            rotary_dim=head_dim,
+            max_position=256,
+            base=rope_base,
+            is_neox_style=True,
+            partial_rotary_factor=0.5,
+        )
+        # ZAYA1's split: the cache is half the head dim wide, which is exactly
+        # what the shared fused-rope kernel cannot express.
+        self.assertEqual(rotary_emb.rotary_dim, head_dim // 2)
+        self.assertEqual(rotary_emb.cos_sin_cache.shape[-1], head_dim // 2)
+
+        conv_qk = (
+            torch.randn(num_tokens, (num_q_heads + num_k_heads) * head_dim, dtype=dtype)
+            * 0.3
+        )
+        pre_q = torch.randn(num_tokens, num_q_heads * head_dim, dtype=dtype) * 0.3
+        base_k = torch.randn(num_tokens, num_k_heads * head_dim, dtype=dtype) * 0.3
+        positions = torch.arange(num_tokens, dtype=torch.int64)
+
+        rotary_dev = rotary_emb.to(dev)
+        cache = rotary_dev.cos_sin_cache
+        q_ref, k_ref = self._reference_chain(
+            cca,
+            conv_qk.to(dev),
+            pre_q.to(dev),
+            base_k.to(dev),
+            rotary_dev,
+            positions.to(dev),
+            dtype,
+        )
+        q_f64, k_f64 = self._reference_fp64(
+            cca,
+            conv_qk.to(dev).float(),
+            pre_q.to(dev).float(),
+            base_k.to(dev).float(),
+            cache,
+            positions.to(dev),
+        )
+
+        rope = CCARope.of(rotary_dev, positions.to(dev))
+        self.assertIsNotNone(rope, "the plain RotaryEmbedding must be fusable")
+        self.assertTrue(
+            kernel.rope_covered(
+                rope.positions,
+                rope.cos_sin_cache,
+                rope.rotary_dim,
+                head_dim=head_dim,
+                num_tokens=num_tokens,
+                is_neox_style=rope.is_neox_style,
+                device=torch.device(dev),
+            )
+        )
+
+        k_scale = (cca.temp.detach().float() * cca.sqrt_head_dim).to(dev)
+        q_got, k_got = kernel.cca_qk_mix(
+            conv_qk.to(dev),
+            pre_q.to(dev),
+            base_k.to(dev),
+            k_scale,
+            num_q_heads=num_q_heads,
+            num_k_heads=num_k_heads,
+            head_dim=head_dim,
+            q_scale=cca.sqrt_head_dim,
+            out_dtype=dtype,
+            positions=rope.positions,
+            cos_sin_cache=rope.cos_sin_cache,
+            rotary_dim=rope.rotary_dim,
+        )
+
+        # bf16 equivalence with the chain. The elements are O(1) (RMS-normalized
+        # then scaled by sqrt(head_dim), so the per-element RMS is 1), and the
+        # chain rounds twice more than the fused path does, so the gap is a
+        # couple of bf16 ulps: 2 * 2^-8 ~= 8e-3 absolute.
+        tol = 8e-3 if dtype is torch.bfloat16 else 1e-5
+        torch.testing.assert_close(q_got, q_ref, rtol=tol, atol=tol)
+        torch.testing.assert_close(k_got, k_ref, rtol=tol, atol=tol)
+
+        # Direction of the error: the fused path must be at least as close to the
+        # fp64 evaluation as the chain it replaces, because it carries the
+        # rotation in fp32 and rounds once instead of three times.
+        for got, ref, exact, name in (
+            (q_got, q_ref, q_f64, "q"),
+            (k_got, k_ref, k_f64, "k"),
+        ):
+            err_fused = (got.double() - exact).abs().max().item()
+            err_chain = (ref.double() - exact).abs().max().item()
+            self.assertLessEqual(
+                err_fused,
+                err_chain * 1.05 + 1e-6,
+                f"fused {name} drifted further from fp64 than the chain "
+                f"({err_fused:.3e} vs {err_chain:.3e})",
+            )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused kernel requires a GPU")
+    def test_matches_the_unfused_chain_on_both_rope_bases(self):
+        # ZAYA1-74B builds two caches and picks per layer: rope_theta 1e7 for the
+        # full-attention layers, swa_rotary_base 10000 for the sliding ones. The
+        # fused path must read the layer's OWN cache, and a base mix-up is
+        # invisible at position 0 -- so exercise both, over several positions.
+        for rope_base in (10_000, 10_000_000):
+            for num_tokens in (1, 33):
+                with self.subTest(base=rope_base, t=num_tokens):
+                    self._run(rope_base=rope_base, num_tokens=num_tokens)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused kernel requires a GPU")
+    def test_fp32_output_matches_the_chain_tightly(self):
+        # With an fp32 store the only remaining difference from the chain is the
+        # intermediate rounding it does and this path does not, so the gap
+        # collapses by three orders of magnitude.
+        self._run(rope_base=10_000_000, num_tokens=17, dtype=torch.float32)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused kernel requires a GPU")
+    def test_the_two_layer_caches_give_distinct_results(self):
+        # Guard against the fused path latching a model-wide cache pointer: with
+        # different bases the same positions must produce different rotations.
+        from sglang.kernels.ops.attention import cca_qk_mix as kernel
+        from sglang.srt.layers.rotary_embedding import get_rope
+
+        head_dim, nq, nk, T = 128, 8, 1, 8
+        torch.manual_seed(5)
+        conv_qk = torch.randn(T, (nq + nk) * head_dim, dtype=torch.bfloat16).cuda()
+        pre_q = torch.randn(T, nq * head_dim, dtype=torch.bfloat16).cuda()
+        base_k = torch.randn(T, nk * head_dim, dtype=torch.bfloat16).cuda()
+        positions = torch.arange(1, T + 1, dtype=torch.int64).cuda()
+        scale = torch.ones(nk, device="cuda")
+
+        outs = []
+        for base in (10_000, 10_000_000):
+            rope = get_rope(
+                head_size=head_dim,
+                rotary_dim=head_dim,
+                max_position=256,
+                base=base,
+                is_neox_style=True,
+                partial_rotary_factor=0.5,
+            ).cuda()
+            outs.append(
+                kernel.cca_qk_mix(
+                    conv_qk,
+                    pre_q,
+                    base_k,
+                    scale,
+                    num_q_heads=nq,
+                    num_k_heads=nk,
+                    head_dim=head_dim,
+                    q_scale=head_dim**0.5,
+                    out_dtype=torch.bfloat16,
+                    positions=positions,
+                    cos_sin_cache=rope.cos_sin_cache,
+                    rotary_dim=rope.rotary_dim,
+                )
+            )
+        self.assertFalse(torch.equal(outs[0][0], outs[1][0]))
+        self.assertFalse(torch.equal(outs[0][1], outs[1][1]))
+
+
+class TestCCAQKMixRopeCoverage(CustomTestCase):
+    """``rope_covered`` is the only thing between an unsupported head shape and a
+    silently wrong rotation, so pin its negative branches.
+
+    These run without a GPU: the head-geometry half is split out as
+    ``rope_geometry_covered`` precisely so it can be checked on CPU, and the
+    device half is checked by handing ``rope_covered`` CPU tensors.
+    """
+
+    def test_geometry_rejects_a_non_half_rotary_dim(self):
+        from sglang.kernels.ops.attention import cca_qk_mix as kernel
+
+        # ZAYA1's shape: partial_rotary_factor 0.5 over head_dim 128.
+        self.assertTrue(kernel.rope_geometry_covered(64, 128))
+        # Full rotary (the common case for other models) is NOT covered: the
+        # pass-through tail would be empty and the tile widths no longer match.
+        self.assertFalse(kernel.rope_geometry_covered(128, 128))
+        # A quarter-rotary split leaves a 3/4-width tail.
+        self.assertFalse(kernel.rope_geometry_covered(32, 128))
+        # And a rotary wider than the head is nonsense.
+        self.assertFalse(kernel.rope_geometry_covered(192, 128))
+        self.assertFalse(kernel.rope_geometry_covered(0, 128))
+
+    def test_geometry_rejects_an_odd_half(self):
+        from sglang.kernels.ops.attention import cca_qk_mix as kernel
+
+        # head_dim 12 -> rotary_dim 6 -> half 3, an odd per-lane half.
+        self.assertFalse(kernel.rope_geometry_covered(6, 12))
+        # head_dim 20 -> rotary_dim 10 -> half 5.
+        self.assertFalse(kernel.rope_geometry_covered(10, 20))
+        # The neighbouring even halves are fine.
+        self.assertTrue(kernel.rope_geometry_covered(8, 16))
+        self.assertTrue(kernel.rope_geometry_covered(4, 8))
+
+    def test_geometry_rejects_gptj_layout(self):
+        from sglang.kernels.ops.attention import cca_qk_mix as kernel
+
+        # GPT-J interleaves the rotated pair inside a lane -- the cross-lane case
+        # the three-tile split exists to avoid.
+        self.assertFalse(kernel.rope_geometry_covered(64, 128, is_neox_style=False))
+
+    def test_rope_covered_rejects_cpu_and_malformed_inputs(self):
+        from sglang.kernels.ops.attention import cca_qk_mix as kernel
+
+        hd, rot, T = 128, 64, 4
+        pos = torch.arange(T, dtype=torch.int64)
+        cache = torch.randn(256, rot)
+        common = dict(head_dim=hd, num_tokens=T)
+
+        # Missing either argument (no rope offered at all).
+        self.assertFalse(kernel.rope_covered(None, cache, rot, **common))
+        self.assertFalse(kernel.rope_covered(pos, None, rot, **common))
+        # CPU tensors are not served by the Triton path.
+        self.assertFalse(kernel.rope_covered(pos, cache, rot, **common))
+        # A cache whose last dim is not rotary_dim (e.g. a full-rotary cache
+        # handed in with a partial rotary_dim) must be refused, not sliced.
+        self.assertFalse(kernel.rope_covered(pos, torch.randn(256, 128), rot, **common))
+        # Float positions, a token-count mismatch and a 2-D (mrope) position
+        # layout are all refused.
+        self.assertFalse(kernel.rope_covered(pos.float(), cache, rot, **common))
+        self.assertFalse(
+            kernel.rope_covered(pos[:2], cache, rot, head_dim=hd, num_tokens=T)
+        )
+        self.assertFalse(kernel.rope_covered(pos.view(2, 2), cache, rot, **common))
+
+    def test_cca_rope_snapshot_declines_non_plain_rotaries(self):
+        _ensure_dist_initialized()
+        from sglang.srt.layers.rotary_embedding import RotaryEmbedding
+        from sglang.srt.models.zaya import CCARope
+
+        pos = torch.arange(4, dtype=torch.int64)
+
+        # A stand-in for a scaled / mrope subclass: not the exact base class, so
+        # the snapshot declines rather than reading a cache it does not model.
+        class _Subclass(RotaryEmbedding):
+            pass
+
+        sub = _Subclass(128, 64, 64, 10000, True, torch.float32)
+        self.assertIsNone(CCARope.of(sub, pos))
+
+        base = RotaryEmbedding(128, 64, 64, 10000, True, torch.float32)
+        snap = CCARope.of(base, pos)
+        self.assertIsNotNone(snap)
+        self.assertEqual(snap.rotary_dim, 64)
+        self.assertTrue(snap.is_neox_style)
+        # The buffer is handed over by reference, not copied: the kernel must
+        # read whatever the module currently holds.
+        self.assertIs(snap.cos_sin_cache, base.cos_sin_cache)
+        # A 2-D (multimodal) position layout declines too.
+        self.assertIsNone(CCARope.of(base, pos.view(2, 2)))
+
+    def test_cpu_fallback_leaves_rope_to_the_caller(self):
+        # On the torch fallback (CPU, or before fold_qk_scales) nothing is
+        # rotated inside CCA, so ``rope_fused`` must stay False or
+        # ``ZayaAttention`` would skip the rotary entirely.
+        _ensure_dist_initialized()
+        from sglang.srt.layers.rotary_embedding import RotaryEmbedding
+        from sglang.srt.models.zaya import CCARope
+
+        cca = _make_tiny_cca(seed=1)[0]
+        T = 3
+        hd, nq, nk = cca.head_dim, cca.num_q_heads, cca.num_k_heads
+        qk_out = torch.randn(T, (nq + nk) * hd)
+        q_raw = torch.randn(T, nq * hd)
+        k_raw = torch.randn(T, nk * hd)
+        rope = CCARope.of(
+            RotaryEmbedding(hd, hd // 2, 64, 10000, True, torch.float32),
+            torch.arange(T, dtype=torch.int64),
+        )
+        query, key = cca._mix_and_normalize_qk(
+            qk_out,
+            q_raw,
+            k_raw,
+            qk_out[:, : nq * hd].view(T, nq, hd),
+            qk_out[:, nq * hd :].view(T, nk, hd),
+            q_raw.view(T, nq, hd),
+            k_raw.view(T, nk, hd),
+            out_dtype=torch.float32,
+            rope=rope,
+        )
+        self.assertFalse(cca.rope_fused)
+        # And the fallback still matches the two torch helpers exactly.
+        ref_q, ref_k = cca._add_grouped_qk_means(
+            qk_out[:, : nq * hd].view(T, nq, hd),
+            qk_out[:, nq * hd :].view(T, nk, hd),
+            q_raw.view(T, nq, hd),
+            k_raw.view(T, nk, hd),
+        )
+        ref_q, ref_k = cca._normalize_qk(ref_q, ref_k)
+        torch.testing.assert_close(query, ref_q)
+        torch.testing.assert_close(key, ref_k)
+
+
 class TestCCADecodeConvFold(CustomTestCase):
     """``CCA.fold_decode_conv`` must reproduce the two-stage conv exactly.
 
