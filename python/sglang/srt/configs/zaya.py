@@ -263,6 +263,42 @@ class ZayaConfig(PretrainedConfig):
     def mamba_chunk_size(self) -> int:
         return 1
 
+    # -- CCA v2 lag state (conv[1]) ------------------------------------------
+
+    @property
+    def cca_cache_projected_v2(self) -> bool:
+        """Whether conv[1] caches ``W_v2 . hs`` instead of the raw ``hs``.
+
+        CCA's second state entry exists only to feed ``val_proj2`` with the
+        previous token's hidden state. That projection is linear, so caching its
+        *output* is the same function as caching its input and re-projecting --
+        and the output is ``latent_k_dim / 2`` wide instead of ``hidden_size``
+        (128 vs 4096 on ZAYA1-74B). Two conditions gate it:
+
+        * ``attention_bias`` must be off. MambaPool zeroes a freshly allocated
+          slot, and the first token's ``val_proj2`` input is defined to be zero;
+          ``W . 0 == 0`` only reproduces that with no bias term.
+        * ``num_query_groups`` must be even, so ``val_proj1`` / ``val_proj2``
+          split the K heads on a head boundary (the HF layout maps val_proj1 to
+          the first half of the K heads). An odd count makes the split fall
+          inside a head and the per-rank slicing is then channel-, not
+          head-aligned -- see ``CCA._compute_value_per_rank``.
+
+        ``CCA.__init__`` derives the same predicate from its own constructor
+        arguments; both must agree or the pool entry and the value written into
+        it disagree in width (which raises, loudly, on the first prefill).
+        """
+        return (not bool(getattr(self, "attention_bias", False))) and (
+            self.num_query_groups % 2 == 0
+        )
+
+    @property
+    def cca_v2_state_dim(self) -> int:
+        """Feature width of the CCA conv[1] pool entry."""
+        if self.cca_cache_projected_v2:
+            return (self.num_query_groups * self.head_dim) // 2
+        return self.hidden_size
+
     # -- Sliding-window attention (ZAYA1-74B) -------------------------------
 
     def sliding_window_for_layer(self, layer_id: int) -> int:
@@ -359,9 +395,16 @@ class ZayaConfig(PretrainedConfig):
             return None
 
         # ``conv[0]`` (conv_qk left padding) is sized per TP rank because CCA
-        # is head-parallel. ``conv[1]`` (prev_hs) carries the full hidden_state
-        # and feeds the replicated val_proj1 / val_proj2, so it stays at full
-        # ``hidden_size`` on every rank.
+        # is head-parallel. ``conv[1]`` is the one-token ``val_proj2`` lag; it
+        # holds the *projected* value ``W_v2 . hs`` rather than the raw hidden
+        # state (see ``cca_cache_projected_v2``), which is ``latent_k_dim / 2``
+        # wide -- 128 instead of 4096 on ZAYA1-74B, a 32x cut in the dominant
+        # term of the per-request state. ``val_proj2`` is replicated, so this
+        # entry stays the same width on every rank (a rank whose K heads all
+        # come from ``val_proj1`` simply leaves it untouched); keeping it
+        # rank-uniform is what keeps ``max_mamba_cache_size`` -- and therefore
+        # the replicated scheduler's slot accounting -- identical across the
+        # attention-TP group.
         #
         # Use the *attention* TP world size -- the same accessor that
         # ``ZayaAttention`` / ``CCA`` use to split heads and over which
@@ -389,7 +432,7 @@ class ZayaConfig(PretrainedConfig):
         shape = Mamba2StateShape(
             conv=[
                 (in_out_ch_per_rank, total_padding),
-                (self.hidden_size, 1),
+                (self.cca_v2_state_dim, 1),
             ],
             temporal=(1, 1, 0),
             intermediate_size=in_out_ch_per_rank,

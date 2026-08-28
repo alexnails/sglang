@@ -7,36 +7,44 @@ concatenate and two scatters::
     left_pad = conv_state.index_select(0, slots)          # gather
     padded   = cat([left_pad, qk.unsqueeze(-1)], dim=-1)  # concat
     conv_state.index_copy_(0, slots, padded[..., -W+1:])   # scatter (shift)
-    prev_hs  = prev_hs_state.index_select(0, slots)        # gather
-    prev_hs_state.index_copy_(0, slots, hidden_states)     # scatter
+    lag_prev = lag_state.index_select(0, slots)            # gather
+    lag_state.index_copy_(0, slots, lag_now)               # scatter
 
 It emits the ``[T, C, W]`` conv window the matmul consumes, returns the previous
-hidden state that feeds ``val_proj2``, and shifts both pool slots in place --
-reading each slot before overwriting it, so the gather/scatter pair on the same
-row is safe within one program.
+step's ``val_proj2`` value, and shifts both pool slots in place -- reading each
+slot before overwriting it, so the gather/scatter pair on the same row is safe
+within one program.
 
-The grid is ``(T, n_channel_tiles + n_hidden_tiles)``: the second axis indexes
-one flat tile space where the low ``n_channel_tiles`` entries do the conv window
-and history shift for their slice of ``C``, and the rest do the ``prev_hs``
-read-then-overwrite for their slice of ``H``. Tiling that second axis rather
+The ``lag`` stream is the one-token ``val_proj2`` lag: ``lag_now`` is the
+*projected* value ``W_v2 . hs`` (``latent_k_dim / 2`` wide), not the raw hidden
+state, so the pool traffic here is 32x smaller than the hidden width on
+ZAYA1-74B. Passing ``lag_now`` / ``lag_state`` as ``None`` compiles the stream
+out entirely (``HAS_LAG``) *and* drops its tiles from the grid, which is what a
+rank whose K heads all come from ``val_proj1`` wants -- it never reads the lag.
+
+The grid is ``(T, n_channel_tiles + n_lag_tiles)``: the second axis indexes one
+flat tile space where the low ``n_channel_tiles`` entries do the conv window and
+history shift for their slice of ``C``, and the rest do the lag
+read-then-overwrite for their slice of ``D``. Tiling that second axis rather
 than looping it inside one program is what makes the kernel fill the GPU at
 decode batch sizes: at 32 tokens a ``grid=(T,)`` launch is 32 programs on a
-256-CU MI355X, each serially walking 5 channel tiles and 8 hidden tiles, so the
+256-CU MI355X, each serially walking 5 channel tiles and 8 lag tiles, so the
 tiles that could run concurrently instead queue behind each other.
 
 The split is safe because it never puts two programs on the same
-``(slot, column)``: within a token the tiles partition ``C`` and ``H``
+``(slot, column)``: within a token the tiles partition ``C`` and ``D``
 disjointly, so the "read the old value before storing the new one" ordering that
-the shift and the ``prev_hs`` swap rely on stays *inside* one program, exactly
-as it did with the inner loops. Two tokens sharing one positive slot id would
-alias -- but they did under ``grid=(T,)`` too (two programs, same rows, no
-ordering between them), so the contract is unchanged: slot ids must be distinct,
-apart from the negative padding ids, which touch nothing.
+the shift and the lag swap rely on stays *inside* one program, exactly as it did
+with the inner loops. Two tokens sharing one positive slot id would alias -- but
+they did under ``grid=(T,)`` too (two programs, same rows, no ordering between
+them), so the contract is unchanged: slot ids must be distinct, apart from the
+negative padding ids, which touch nothing.
 
 The grouped matmul itself is deliberately left outside: it is a batched
 ``[Cg, Cg*W] x [Cg*W]`` per group, which cuBLAS/rocBLAS-backed einsum already
-runs near bandwidth, and a hand-rolled Triton matvec measured no better. The
-launches removed here are pure data movement.
+runs near bandwidth, and a hand-rolled Triton matvec measured no better (see
+``cca_conv1d_update``, which tried exactly that and lost). The launches removed
+here are pure data movement.
 
 Follows ``kda_fused_decode``'s structure -- a ``covered()`` predicate gates
 supported inputs and the caller falls back to the unfused chain -- and, like it,
@@ -57,26 +65,27 @@ import triton.language as tl
 @triton.jit
 def _cca_state_step_kernel(
     qk_ptr,  # [T, C]        this step's pre-conv q/k row
-    hs_ptr,  # [T, H]        this step's hidden state
-    conv_state_ptr,  # [S, C, W-1]   per-slot conv history
-    prev_hs_ptr,  # [S, H, 1]     per-slot previous hidden state
+    lag_ptr,  # [T, D]       this step's val_proj2 value (lag input)
+    conv_state_ptr,  # [S, C, W-1]  per-slot conv history
+    lag_state_ptr,  # [S, D, 1]    per-slot previous val_proj2 value
     slots_ptr,  # [T]           mamba slot per token (<0 == padding)
-    window_ptr,  # [T, C, W]     out: conv window
-    prev_out_ptr,  # [T, H]        out: previous hidden state
+    window_ptr,  # [T, C, W(+1)] out: conv window
+    lag_out_ptr,  # [T, D]       out: previous val_proj2 value
     s_qk_t,
-    s_hs_t,
+    s_lag_t,
     s_cs_s,
     s_cs_c,
-    s_ph_s,
+    s_ls_s,
     s_win_t,
     s_win_c,
-    s_pv_t,
+    s_lo_t,
     num_channels,
-    hidden_size,
+    lag_dim,
     W: tl.constexpr,  # taps == total_padding + 1
     NC_TILES: tl.constexpr,  # ceil(num_channels / BLOCK_C)
     BLOCK_C: tl.constexpr,
-    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    HAS_LAG: tl.constexpr,
 ):
     t = tl.program_id(0)
     tile = tl.program_id(1)
@@ -118,22 +127,25 @@ def _cca_state_step_kernel(
             mask=cmask & (slot >= 0),
         )
     else:
-        # ---- previous hidden state: read before overwrite -------------------
-        h = (tile - NC_TILES) * BLOCK_H + tl.arange(0, BLOCK_H)
-        hmask = h < hidden_size
-        prev = tl.load(
-            prev_hs_ptr + slot * s_ph_s + h, mask=hmask & (slot >= 0), other=0.0
-        )
-        tl.store(prev_out_ptr + t * s_pv_t + h, prev, mask=hmask)
-        cur = tl.load(hs_ptr + t * s_hs_t + h, mask=hmask, other=0.0)
-        tl.store(prev_hs_ptr + slot * s_ph_s + h, cur, mask=hmask & (slot >= 0))
+        # ---- val_proj2 lag: read before overwrite ---------------------------
+        # Only reachable when HAS_LAG: the caller sets the lag tile count to 0
+        # otherwise, so this arm is both compiled out and never scheduled.
+        if HAS_LAG:
+            d = (tile - NC_TILES) * BLOCK_D + tl.arange(0, BLOCK_D)
+            dmask = d < lag_dim
+            prev = tl.load(
+                lag_state_ptr + slot * s_ls_s + d, mask=dmask & (slot >= 0), other=0.0
+            )
+            tl.store(lag_out_ptr + t * s_lo_t + d, prev, mask=dmask)
+            cur = tl.load(lag_ptr + t * s_lag_t + d, mask=dmask, other=0.0)
+            tl.store(lag_state_ptr + slot * s_ls_s + d, cur, mask=dmask & (slot >= 0))
 
 
 def covered(
     qk: torch.Tensor,
-    hidden_states: torch.Tensor,
+    lag_now: Optional[torch.Tensor],
     conv_state: torch.Tensor,
-    prev_hs_state: torch.Tensor,
+    lag_state: Optional[torch.Tensor],
     slots: Optional[torch.Tensor],
     total_padding: int,
 ) -> bool:
@@ -142,98 +154,122 @@ def covered(
     Requires everything on one accelerator, matching dtypes between each pool and
     the value written into it, a unit innermost stride on the pool views, and at
     least two taps (``total_padding >= 1``) so the shift is well defined.
+
+    ``lag_now`` / ``lag_state`` must be both present or both ``None`` -- the
+    latter compiles the lag stream out for a rank that never reads it. A
+    half-specified pair is rejected rather than guessed at, because guessing
+    wrong means either a skipped pool write (stale lag next step) or a write of
+    the wrong width.
     """
     if slots is None or total_padding < 1:
         return False
-    tensors = (qk, hidden_states, conv_state, prev_hs_state, slots)
+    if (lag_now is None) != (lag_state is None):
+        return False
+    tensors = [qk, conv_state, slots]
+    if lag_now is not None:
+        tensors += [lag_now, lag_state]
     if not all(t.is_cuda for t in tensors):
         return False
-    if qk.ndim != 2 or hidden_states.ndim != 2:
+    if qk.ndim != 2:
         return False
-    if conv_state.ndim != 3 or prev_hs_state.ndim != 3:
+    if conv_state.ndim != 3:
         return False
     if conv_state.shape[-1] != total_padding:
         return False
     if conv_state.shape[-2] != qk.shape[-1]:
         return False
-    if prev_hs_state.shape[-2] != hidden_states.shape[-1]:
-        return False
-    if prev_hs_state.shape[-1] != 1:
-        return False
     if slots.ndim != 1 or slots.shape[0] != qk.shape[0]:
         return False
     if not slots.is_contiguous():
         return False
-    # The kernel stores qk straight into the conv pool and hidden_states into the
-    # prev_hs pool, so no dtype conversion is modelled.
-    if conv_state.dtype != qk.dtype or prev_hs_state.dtype != hidden_states.dtype:
+    # The kernel stores qk straight into the conv pool and lag_now into the lag
+    # pool, so no dtype conversion is modelled.
+    if conv_state.dtype != qk.dtype:
         return False
+    if conv_state.stride(-1) != 1 or qk.stride(-1) != 1:
+        return False
+    if lag_now is None:
+        return True
+    if lag_now.ndim != 2 or lag_state.ndim != 3:
+        return False
+    if lag_state.shape[-2] != lag_now.shape[-1]:
+        return False
+    if lag_state.shape[-1] != 1:
+        return False
+    if lag_now.shape[0] != qk.shape[0]:
+        return False
+    if lag_state.dtype != lag_now.dtype:
+        return False
+    # The lag pool row is addressed as ``slot * stride(0) + d``, so its feature
+    # axis must be unit-strided too -- a narrowed view of a wider pool entry
+    # (a rank that owns only part of val_proj2's output) still satisfies this.
     return (
-        conv_state.stride(-1) == 1
-        and prev_hs_state.stride(-1) == 1
-        and qk.stride(-1) == 1
-        and hidden_states.stride(-1) == 1
+        lag_state.stride(-1) == 1
+        and lag_state.stride(-2) == 1
+        and lag_now.stride(-1) == 1
     )
 
 
 def cca_state_step(
     qk: torch.Tensor,
-    hidden_states: torch.Tensor,
+    lag_now: Optional[torch.Tensor],
     conv_state: torch.Tensor,
-    prev_hs_state: torch.Tensor,
+    lag_state: Optional[torch.Tensor],
     slots: torch.Tensor,
     total_padding: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return ``(window, prev_hs)`` and shift both pool slots in place.
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Return ``(window, lag_prev)`` and shift both pool slots in place.
 
-    ``window`` is ``[T, C, total_padding + 1]`` in ``qk``'s dtype; ``prev_hs`` is
-    ``[T, H]`` in ``hidden_states``' dtype. Caller must have checked
-    :func:`covered`."""
+    ``window`` is ``[T, C, total_padding + 1]`` in ``qk``'s dtype; ``lag_prev``
+    is ``[T, D]`` in ``lag_now``'s dtype, or ``None`` when the lag stream is
+    compiled out. Caller must have checked :func:`covered`."""
     num_tokens, num_channels = qk.shape
-    hidden_size = hidden_states.shape[-1]
     taps = total_padding + 1
+    has_lag = lag_now is not None
+    lag_dim = lag_now.shape[-1] if has_lag else 0
 
     window = torch.empty(
         (num_tokens, num_channels, taps), dtype=qk.dtype, device=qk.device
     )
-    prev_out = torch.empty(
-        (num_tokens, hidden_size),
-        dtype=hidden_states.dtype,
-        device=hidden_states.device,
+    lag_prev = (
+        torch.empty((num_tokens, lag_dim), dtype=lag_now.dtype, device=lag_now.device)
+        if has_lag
+        else None
     )
     if num_tokens == 0:
-        return window, prev_out
+        return window, lag_prev
 
-    # One flat tile axis: [0, nc_tiles) walk the channels, the rest walk the
-    # hidden dim. Tiling both instead of looping them inside one program is what
-    # gets the launch off 32 programs at decode batch sizes; see the module
-    # docstring for why no two programs can then share a (slot, column).
-    block_c, block_h = 256, 512
+    # One flat tile axis: [0, nc_tiles) walk the channels, the rest walk the lag
+    # dim. Tiling both instead of looping them inside one program is what gets
+    # the launch off 32 programs at decode batch sizes; see the module docstring
+    # for why no two programs can then share a (slot, column).
+    block_c, block_d = 256, 512
     nc_tiles = triton.cdiv(num_channels, block_c)
-    nh_tiles = triton.cdiv(hidden_size, block_h)
+    nd_tiles = triton.cdiv(lag_dim, block_d) if has_lag else 0
 
-    _cca_state_step_kernel[(num_tokens, nc_tiles + nh_tiles)](
+    _cca_state_step_kernel[(num_tokens, nc_tiles + nd_tiles)](
         qk,
-        hidden_states,
+        lag_now if has_lag else qk,
         conv_state,
-        prev_hs_state,
+        lag_state if has_lag else conv_state,
         slots,
         window,
-        prev_out,
+        lag_prev if has_lag else window,
         qk.stride(0),
-        hidden_states.stride(0),
+        lag_now.stride(0) if has_lag else 0,
         conv_state.stride(0),
         conv_state.stride(1),
-        prev_hs_state.stride(0),
+        lag_state.stride(0) if has_lag else 0,
         window.stride(0),
         window.stride(1),
-        prev_out.stride(0),
+        lag_prev.stride(0) if has_lag else 0,
         num_channels,
-        hidden_size,
+        lag_dim,
         W=taps,
         NC_TILES=nc_tiles,
         BLOCK_C=block_c,
-        BLOCK_H=block_h,
+        BLOCK_D=block_d,
+        HAS_LAG=has_lag,
         num_warps=4,
     )
-    return window, prev_out
+    return window, lag_prev

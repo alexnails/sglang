@@ -6,9 +6,9 @@ weight. This module folds the conv arithmetic into the window build, so the wind
 is never materialized and the batched GEMM is replaced by a tiled ``tl.dot``.
 
 **This is launch-neutral, not a launch saving, and that is deliberate.** The
-conv-channel work (``C`` channels, ``G`` groups) and the ``prev_hs`` carry (``H``
-channels) have different natural parallel shapes, so one kernel covering both
-would either run the ``H`` work ``G`` times over or collapse to a handful of
+conv-channel work (``C`` channels, ``G`` groups) and the val_proj2 lag carry
+(``D`` channels) have different natural parallel shapes, so one kernel covering
+both would either run the ``D`` work ``G`` times over or collapse to a handful of
 programs. Two launches with the right decomposition beat one with the wrong one.
 What it could win was the ``[T, C, W]`` round-trip and, possibly, the GEMM itself:
 ``cca_state_step``'s note that "a hand-rolled Triton matvec measured no better"
@@ -134,39 +134,39 @@ def _cca_conv1d_update_kernel(
 
 
 @triton.jit
-def _prev_hs_step_kernel(
-    hs_ptr,  # [T, H]
-    prev_hs_ptr,  # [S, H, 1]
-    prev_out_ptr,  # [T, H]  out
+def _lag_step_kernel(
+    lag_ptr,  # [T, D]
+    lag_state_ptr,  # [S, D, 1]
+    lag_out_ptr,  # [T, D]  out
     slots_ptr,  # [T]
-    s_hs_t,
-    s_ph_s,
-    s_pv_t,
-    hidden_size,
-    BLOCK_H: tl.constexpr,
+    s_lag_t,
+    s_ls_s,
+    s_lo_t,
+    lag_dim,
+    BLOCK_D: tl.constexpr,
 ):
     t = tl.program_id(0)
     slot = tl.load(slots_ptr + t)
-    for h0 in tl.range(0, hidden_size, BLOCK_H):
-        h = h0 + tl.arange(0, BLOCK_H)
-        hmask = h < hidden_size
-        # Read this slot's carried state before overwriting it with the current
-        # token; one program owns the pair, so the two cannot race.
+    for d0 in tl.range(0, lag_dim, BLOCK_D):
+        d = d0 + tl.arange(0, BLOCK_D)
+        dmask = d < lag_dim
+        # Read this slot's carried value before overwriting it with the current
+        # token's; one program owns the pair, so the two cannot race.
         prev = tl.load(
-            prev_hs_ptr + slot * s_ph_s + h, mask=hmask & (slot >= 0), other=0.0
+            lag_state_ptr + slot * s_ls_s + d, mask=dmask & (slot >= 0), other=0.0
         )
-        tl.store(prev_out_ptr + t * s_pv_t + h, prev, mask=hmask)
-        cur = tl.load(hs_ptr + t * s_hs_t + h, mask=hmask, other=0.0)
-        tl.store(prev_hs_ptr + slot * s_ph_s + h, cur, mask=hmask & (slot >= 0))
+        tl.store(lag_out_ptr + t * s_lo_t + d, prev, mask=dmask)
+        cur = tl.load(lag_ptr + t * s_lag_t + d, mask=dmask, other=0.0)
+        tl.store(lag_state_ptr + slot * s_ls_s + d, cur, mask=dmask & (slot >= 0))
 
 
 def covered(
     qk: torch.Tensor,
-    hidden_states: torch.Tensor,
+    lag_now: Optional[torch.Tensor],
     weight: Optional[torch.Tensor],
     bias: Optional[torch.Tensor],
     conv_state: torch.Tensor,
-    prev_hs_state: torch.Tensor,
+    lag_state: Optional[torch.Tensor],
     slots: Optional[torch.Tensor],
     total_padding: int,
     groups: int,
@@ -181,16 +181,23 @@ def covered(
         return False
     if total_padding < 1 or groups < 1:
         return False
+    if (lag_now is None) != (lag_state is None):
+        return False
 
-    tensors = (qk, hidden_states, weight, bias, conv_state, prev_hs_state, slots)
+    tensors = [qk, weight, bias, conv_state, slots]
+    if lag_now is not None:
+        tensors += [lag_now, lag_state]
     if not all(t.is_cuda for t in tensors):
         return False
-    if qk.ndim != 2 or hidden_states.ndim != 2:
+    if qk.ndim != 2:
         return False
-    if conv_state.ndim != 3 or prev_hs_state.ndim != 3:
+    if conv_state.ndim != 3:
         return False
-    if qk.shape[0] != hidden_states.shape[0]:
-        return False
+    if lag_now is not None:
+        if lag_now.ndim != 2 or lag_state.ndim != 3:
+            return False
+        if qk.shape[0] != lag_now.shape[0]:
+            return False
 
     num_channels = qk.shape[-1]
     if num_channels % groups != 0:
@@ -206,54 +213,60 @@ def covered(
         return False
     if conv_state.shape[-1] != total_padding or conv_state.shape[-2] != num_channels:
         return False
-    if prev_hs_state.shape[-2] != hidden_states.shape[-1]:
-        return False
-    if prev_hs_state.shape[-1] != 1:
-        return False
+    if lag_now is not None:
+        if lag_state.shape[-2] != lag_now.shape[-1]:
+            return False
+        if lag_state.shape[-1] != 1:
+            return False
+        if lag_state.stride(-2) != 1:
+            return False
     if slots.ndim != 1 or slots.shape[0] != qk.shape[0]:
         return False
     if not slots.is_contiguous():
         return False
 
-    if conv_state.dtype != qk.dtype or prev_hs_state.dtype != hidden_states.dtype:
+    if conv_state.dtype != qk.dtype:
         return False
     if weight.dtype != qk.dtype or bias.dtype != qk.dtype:
         return False
 
-    return (
-        qk.stride(-1) == 1
-        and hidden_states.stride(-1) == 1
-        and conv_state.stride(-1) == 1
-        and prev_hs_state.stride(-1) == 1
-        and weight.stride(-1) == 1
-    )
+    if not (
+        qk.stride(-1) == 1 and conv_state.stride(-1) == 1 and weight.stride(-1) == 1
+    ):
+        return False
+    if lag_now is None:
+        return True
+    if lag_state.dtype != lag_now.dtype:
+        return False
+    return lag_now.stride(-1) == 1 and lag_state.stride(-1) == 1
 
 
 def cca_conv1d_update(
     qk: torch.Tensor,
-    hidden_states: torch.Tensor,
+    lag_now: Optional[torch.Tensor],
     weight: torch.Tensor,
     bias: torch.Tensor,
     conv_state: torch.Tensor,
-    prev_hs_state: torch.Tensor,
+    lag_state: Optional[torch.Tensor],
     slots: torch.Tensor,
     total_padding: int,
     groups: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return ``(qk_out, prev_hs)``, shifting both pool slots in place.
+) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Return ``(qk_out, lag_prev)``, shifting both pool slots in place.
 
-    ``qk_out`` is the conv output ``[T, C]`` and ``prev_hs`` the previous hidden
-    state feeding ``val_proj2``. Caller must have checked :func:`covered`.
+    ``qk_out`` is the conv output ``[T, C]`` and ``lag_prev`` the previous step's
+    ``val_proj2`` value, or ``None`` when this rank carries no lag stream (then
+    this is a single launch). Caller must have checked :func:`covered`.
     """
     num_tokens, num_channels = qk.shape
-    hidden_size = hidden_states.shape[-1]
     ch_per_group = num_channels // groups
     taps = total_padding + 1
+    has_lag = lag_now is not None
 
     qk_out = torch.empty_like(qk)
-    prev_out = torch.empty_like(hidden_states)
+    lag_prev = torch.empty_like(lag_now) if has_lag else None
     if num_tokens == 0:
-        return qk_out, prev_out
+        return qk_out, lag_prev
 
     block_t = 16 if num_tokens < 64 else 64
     _cca_conv1d_update_kernel[(triton.cdiv(num_tokens, block_t), groups)](
@@ -275,16 +288,17 @@ def cca_conv1d_update(
         BLOCK_T=block_t,
         num_warps=4,
     )
-    _prev_hs_step_kernel[(num_tokens,)](
-        hidden_states,
-        prev_hs_state,
-        prev_out,
-        slots,
-        hidden_states.stride(0),
-        prev_hs_state.stride(0),
-        prev_out.stride(0),
-        hidden_size,
-        BLOCK_H=512,
-        num_warps=4,
-    )
-    return qk_out, prev_out
+    if has_lag:
+        _lag_step_kernel[(num_tokens,)](
+            lag_now,
+            lag_state,
+            lag_prev,
+            slots,
+            lag_now.stride(0),
+            lag_state.stride(0),
+            lag_prev.stride(0),
+            lag_now.shape[-1],
+            BLOCK_D=512,
+            num_warps=4,
+        )
+    return qk_out, lag_prev

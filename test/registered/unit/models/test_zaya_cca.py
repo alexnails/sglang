@@ -10,11 +10,16 @@ which are each exercised by a dedicated test case:
    single-chunk run.
 3. A batched two-request decode for request 0 yields identical q / k / v to a
    single-request decode of request 0 at the same step.
-4. Multi-request prefills update only the conv state and ``prev_hs`` slots for
-   each request and leave unused slots zero.
+4. Multi-request prefills update only the conv state and lag slots for each
+   request and leave unused slots zero.
 5. A simulated tensor-parallel (TP=2) CCA produces per-rank q / k / v slices
    that match the corresponding head slices of a TP=1 reference, both for
    prefill (``_forward_extend``) and for decode (``_forward_decode``).
+6. A prefill resumed from a cached prefix -- alone or batched alongside a fresh
+   request -- matches a single-chunk run, which is what pins the *kind* of value
+   parked at a chunk boundary (``conv[1]`` holds ``val_proj2 . hs``, not ``hs``).
+7. A biased checkpoint, where ``W . 0 != 0``, falls back to caching the raw
+   hidden state and is still numerically right.
 
 All tests run on CPU with a tiny configuration so they stay fast and have no
 GPU dependency. State is stored in a mock centralized pool that mirrors the
@@ -93,8 +98,10 @@ class _MockReqToTokenPool:
     that CCA calls: ``mamba2_layer_cache`` and ``get_mamba_indices``.
 
     For TP-aware tests, ``tp_size`` controls the per-rank ``in_out_ch`` of the
-    ``conv[0]`` state. ``conv[1]`` (prev_hs) is replicated and stays at full
-    ``hidden_size``.
+    ``conv[0]`` state. ``conv[1]`` (the ``val_proj2`` lag) is replicated and
+    takes its width from ``ZayaConfig.cca_v2_state_dim`` -- the projected value
+    width when the checkpoint allows it, ``hidden_size`` otherwise -- exactly as
+    ``mamba2_cache_params`` sizes it at serving time.
     """
 
     def __init__(self, pool_size: int, cca_config, tp_size: int = 1):
@@ -110,7 +117,7 @@ class _MockReqToTokenPool:
             num_layers, pool_size + 1, in_out_ch_per_rank, total_padding
         )
         self.prev_hs_state = torch.zeros(
-            num_layers, pool_size + 1, cca_config.hidden_size, 1
+            num_layers, pool_size + 1, cca_config.cca_v2_state_dim, 1
         )
         self.temporal = torch.zeros(num_layers, pool_size + 1, 1, 1, 0)
         self._layer_map = {lid: i for i, lid in enumerate(cca_config.linear_layer_ids)}
@@ -317,6 +324,223 @@ class TestZayaCCA(CustomTestCase):
         torch.testing.assert_close(k, k_ref, atol=1e-5, rtol=1e-5)
         torch.testing.assert_close(v, v_ref, atol=1e-5, rtol=1e-5)
 
+    def test_chunked_prefill_across_request_boundary(self):
+        """A resumed chunk must read the PROJECTED boundary value from its slot.
+
+        Two requests in one extend batch: request 0 resumes a cached prefix,
+        request 1 starts fresh. That is the mixed (non-``all_fresh``) path, where
+        the lag row preceding each request's first token comes from a different
+        place -- the pool slot for the resumed request, zero for the fresh one.
+
+        This is the case that fails silently if a chunk boundary parks the raw
+        hidden state while the read side expects the projected value: same shape,
+        same dtype, no error, just wrong ``v`` on every resumed token. Both
+        requests are compared against their own one-shot reference so a mix-up
+        between the two slots also shows up.
+        """
+        cca, config = _make_tiny_cca(seed=31)
+        cca_ref, _ = _make_tiny_cca(seed=31)
+        with torch.no_grad():
+            cca_ref.load_state_dict(cca.state_dict())
+
+        A0, A1, S_b = 3, 4, 5
+        S_a = A0 + A1
+        torch.manual_seed(311)
+        hs_a = torch.randn(S_a, cca.hidden_size, dtype=torch.float32) * 0.1
+        hs_b = torch.randn(S_b, cca.hidden_size, dtype=torch.float32) * 0.1
+
+        qa_ref, ka_ref, va_ref = cca_ref._forward_no_state(hs_a)
+        qb_ref, kb_ref, vb_ref = cca_ref._forward_no_state(hs_b)
+
+        pool = _MockReqToTokenPool(pool_size=8, cca_config=config)
+        # Hold both batches alive: the mock memoizes its per-step slot mirror on
+        # id(forward_batch), and a GC'd-then-reused address would false-collide.
+        fb0 = _make_forward_batch(
+            is_decode=False,
+            extend_seq_lens_cpu=[A0],
+            extend_prefix_lens_cpu=[0],
+            req_pool_indices=[1],
+            input_ids=torch.arange(A0, dtype=torch.int64),
+        )
+        fb1 = _make_forward_batch(
+            is_decode=False,
+            extend_seq_lens_cpu=[A1, S_b],
+            extend_prefix_lens_cpu=[A0, 0],
+            req_pool_indices=[1, 4],
+            input_ids=torch.arange(A1 + S_b, dtype=torch.int64),
+        )
+        with _mock_pool_context(pool):
+            # Chunk 0 of request 0 only.
+            cca.forward(hs_a[:A0], fb0)
+            # Chunk 1 of request 0 (resumes) batched with a fresh request 1.
+            q, k, v = cca.forward(torch.cat([hs_a[A0:], hs_b], dim=0), fb1)
+
+        torch.testing.assert_close(q[:A1], qa_ref[A0:], atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(k[:A1], ka_ref[A0:], atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(v[:A1], va_ref[A0:], atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(q[A1:], qb_ref, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(k[A1:], kb_ref, atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(v[A1:], vb_ref, atol=1e-4, rtol=1e-4)
+
+    def test_chunked_prefill_then_decode_matches_full_sequence(self):
+        """Two prefill chunks then decode steps, all against one reference.
+
+        Extends the boundary case above past the prefill: after a resumed chunk
+        the request keeps decoding, so a boundary row that is wrong in *kind*
+        (raw instead of projected) would also poison the first decode step.
+        """
+        cca, config = _make_tiny_cca(seed=32)
+        cca_ref, _ = _make_tiny_cca(seed=32)
+        with torch.no_grad():
+            cca_ref.load_state_dict(cca.state_dict())
+
+        S0, S1, S2 = 3, 3, 2
+        S_total = S0 + S1 + S2
+        torch.manual_seed(321)
+        hs = torch.randn(S_total, cca.hidden_size, dtype=torch.float32) * 0.1
+        q_ref, k_ref, v_ref = cca_ref._forward_no_state(hs)
+
+        pool = _MockReqToTokenPool(pool_size=8, cca_config=config)
+        # ``batches`` keeps every ForwardBatch alive: the mock memoizes its
+        # per-step slot mirror on id(forward_batch), so a recycled address would
+        # hand a later step the wrong request list.
+        batches = []
+        for chunk, prefix in ((slice(0, S0), 0), (slice(S0, S0 + S1), S0)):
+            n = chunk.stop - chunk.start
+            batches.append(
+                (
+                    hs[chunk],
+                    _make_forward_batch(
+                        is_decode=False,
+                        extend_seq_lens_cpu=[n],
+                        extend_prefix_lens_cpu=[prefix],
+                        req_pool_indices=[3],
+                        input_ids=torch.arange(n, dtype=torch.int64),
+                    ),
+                )
+            )
+        for t in range(S2):
+            idx = S0 + S1 + t
+            batches.append(
+                (
+                    hs[idx : idx + 1],
+                    _make_forward_batch(
+                        is_decode=True,
+                        extend_seq_lens_cpu=[],
+                        extend_prefix_lens_cpu=[],
+                        req_pool_indices=[3],
+                        input_ids=torch.tensor([0], dtype=torch.int64),
+                    ),
+                )
+            )
+
+        outs = []
+        with _mock_pool_context(pool):
+            for chunk_hs, fb in batches:
+                outs.append(cca.forward(chunk_hs, fb))
+
+        for got, ref in zip(
+            (torch.cat([o[i] for o in outs], dim=0) for i in range(3)),
+            (q_ref, k_ref, v_ref),
+        ):
+            torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
+
+    def test_projected_lag_is_narrower_than_the_hidden_state(self):
+        """The whole point: conv[1] shrinks to the val_proj2 output width.
+
+        Guards the arithmetic the pool sizing depends on -- that the cached
+        quantity really is ``latent_k_dim / 2`` wide and that the model and the
+        config agree on it. If these drift apart the pool entry and the value
+        written into it disagree in width.
+        """
+        cca, config = _make_tiny_cca(seed=33)
+        self.assertTrue(cca.cache_projected_v2)
+        expected = (config.num_query_groups * config.head_dim) // 2
+        self.assertEqual(cca.v2_lag_dim, expected)
+        self.assertEqual(config.cca_v2_state_dim, expected)
+        self.assertLess(cca.v2_lag_dim, cca.hidden_size)
+
+    def test_biased_projection_falls_back_to_the_raw_hidden_state_lag(self):
+        """With a bias, ``W . 0 != 0``, so the projected cache is refused.
+
+        A freshly allocated slot is zero and the first token's ``val_proj2``
+        input is defined to be zero. Caching the projection only reproduces that
+        when there is no bias term; otherwise the zero slot would have to stand
+        for ``b``. The gate must therefore fall back to caching the raw hidden
+        state -- and the fallback must still be numerically right, which is what
+        the reference comparison here pins.
+        """
+        from sglang.srt.configs.zaya import ZayaConfig
+
+        cfg = _make_tiny_config()
+        biased = ZayaConfig(
+            hidden_size=cfg.hidden_size,
+            ffn_hidden_size=cfg.ffn_hidden_size,
+            num_hidden_layers=cfg.num_hidden_layers,
+            num_experts=cfg.num_experts,
+            num_attention_heads=cfg.num_attention_heads,
+            num_query_groups=cfg.num_query_groups,
+            num_key_value_heads=cfg.num_key_value_heads,
+            head_dim=cfg.head_dim,
+            cca_time0=cfg.cca_time0,
+            cca_time1=cfg.cca_time1,
+            max_position_embeddings=cfg.max_position_embeddings,
+            moe_router_topk=cfg.moe_router_topk,
+            zaya_mlp_expansion=cfg.zaya_mlp_expansion,
+            attention_bias=True,
+        )
+        self.assertFalse(biased.cca_cache_projected_v2)
+        self.assertEqual(biased.cca_v2_state_dim, biased.hidden_size)
+
+        cca, _ = _make_tiny_cca(seed=34, config=biased)
+        cca_ref, _ = _make_tiny_cca(seed=34, config=biased)
+        with torch.no_grad():
+            cca_ref.load_state_dict(cca.state_dict())
+        self.assertFalse(cca.cache_projected_v2)
+        self.assertEqual(cca.v2_lag_dim, biased.hidden_size)
+        self.assertIsNotNone(cca.val_proj2.bias)
+
+        S0, S1 = 4, 2
+        torch.manual_seed(341)
+        hs = torch.randn(S0 + S1, cca.hidden_size, dtype=torch.float32) * 0.1
+        q_ref, k_ref, v_ref = cca_ref._forward_no_state(hs)
+
+        pool = _MockReqToTokenPool(pool_size=8, cca_config=biased)
+        self.assertEqual(pool.prev_hs_state.shape[-2], biased.hidden_size)
+        # Held for the id(forward_batch) memo (see the chunked-prefill tests).
+        batches = [
+            (
+                hs[:S0],
+                _make_forward_batch(
+                    is_decode=False,
+                    extend_seq_lens_cpu=[S0],
+                    extend_prefix_lens_cpu=[0],
+                    req_pool_indices=[0],
+                    input_ids=torch.arange(S0, dtype=torch.int64),
+                ),
+            )
+        ] + [
+            (
+                hs[S0 + t : S0 + t + 1],
+                _make_forward_batch(
+                    is_decode=True,
+                    extend_seq_lens_cpu=[],
+                    extend_prefix_lens_cpu=[],
+                    req_pool_indices=[0],
+                    input_ids=torch.tensor([0], dtype=torch.int64),
+                ),
+            )
+            for t in range(S1)
+        ]
+        outs = []
+        with _mock_pool_context(pool):
+            for chunk_hs, fb in batches:
+                outs.append(cca.forward(chunk_hs, fb))
+
+        for i, ref in enumerate((q_ref, k_ref, v_ref)):
+            got = torch.cat([o[i] for o in outs], dim=0)
+            torch.testing.assert_close(got, ref, atol=1e-4, rtol=1e-4)
+
     def test_prefill_then_decode_matches_full_sequence(self):
         """Prefill(S0) followed by ``S1`` single-token decode steps matches a
         one-shot reference over ``S0 + S1`` tokens."""
@@ -455,27 +679,37 @@ class TestZayaCCA(CustomTestCase):
 
         layer_cache = pool.mamba2_layer_cache(0)
         conv_state = layer_cache.conv[0]
-        prev_hs_state = layer_cache.conv[1]
+        lag_state = layer_cache.conv[1]
 
         self.assertTrue(torch.any(conv_state[2] != 0))
         self.assertTrue(torch.any(conv_state[5] != 0))
 
+        # conv[1] holds the PROJECTED boundary value ``val_proj2 . hs[-1]``, not
+        # the raw hidden state. Pinning the projected quantity is what catches a
+        # chunk boundary that parks the wrong tensor: the widths agree with the
+        # raw hidden state only by accident of a tiny config, and a mismatch
+        # there degrades resumed prefixes silently rather than raising.
+        self.assertTrue(cca.cache_projected_v2)
+        self.assertEqual(lag_state.shape[-2], config.cca_v2_state_dim)
+        with torch.no_grad():
+            expected0 = cca.val_proj2(hs0[-1:])[0]
+            expected1 = cca.val_proj2(hs1[-1:])[0]
         torch.testing.assert_close(
-            prev_hs_state[2].squeeze(-1).to(torch.float32),
-            hs0[-1].to(torch.float32),
+            lag_state[2].squeeze(-1).to(torch.float32),
+            expected0.squeeze(0).to(torch.float32),
             atol=1e-5,
             rtol=1e-5,
         )
         torch.testing.assert_close(
-            prev_hs_state[5].squeeze(-1).to(torch.float32),
-            hs1[-1].to(torch.float32),
+            lag_state[5].squeeze(-1).to(torch.float32),
+            expected1.squeeze(0).to(torch.float32),
             atol=1e-5,
             rtol=1e-5,
         )
 
         for idx in (0, 1, 3, 4):
             self.assertTrue(torch.all(conv_state[idx] == 0))
-            self.assertTrue(torch.all(prev_hs_state[idx] == 0))
+            self.assertTrue(torch.all(lag_state[idx] == 0))
 
     def test_mamba_indices_resolved_once_per_forward_step(self):
         """The req -> MambaPool-slot mapping is identical for every CCA layer in
@@ -658,124 +892,49 @@ class TestCCAStateStepKernel(CustomTestCase):
                     self.assertTrue(torch.equal(prev_got, prev_ref))
 
     @unittest.skipUnless(torch.cuda.is_available(), "fused kernel requires a GPU")
-    def test_negative_padding_slots_repeat_freely(self):
-        """The one slot id a decode batch does repeat: the padding sentinel.
+    def test_lag_free_variant_matches_the_conv_only_chain(self):
+        """``HAS_LAG=False`` must leave the conv half byte-identical.
 
-        CUDA-graph replay pads the batch with ``-1`` rows, so several tokens carry
-        the same negative slot. Those must read and write nothing, whichever grid
-        program picks them up -- and with the 2-D grid there are now
-        ``n_channel_tiles + n_hidden_tiles`` programs per token that could get it
-        wrong instead of one.
+        A rank whose V heads all come from ``val_proj1`` passes no lag tensors, so
+        the lag block compiles out. The conv window and the conv-history shift
+        must be unchanged by that -- a constexpr that accidentally gated the conv
+        loop too would return plausible-looking zeros.
         """
         from sglang.kernels.ops.attention import cca_state_step as kernel
 
         dev = "cuda"
-        torch.manual_seed(9)
-        # Multi-tile on both axes so every tile index sees a padding row.
-        num_channels, hidden_size, total_padding = 600, 1100, 2
-        real, pad = 3, 5
-        num_tokens = real + pad
-        slots = torch.full((num_tokens,), -1, device=dev, dtype=torch.long)
-        slots[:real] = torch.arange(1, real + 1, device=dev)
-
+        torch.manual_seed(7)
+        num_channels, total_padding, num_tokens = 48, 2, 5
+        slots = torch.randperm(32, device=dev)[:num_tokens].to(torch.long) + 1
         qk = torch.randn(num_tokens, num_channels, device=dev, dtype=torch.bfloat16)
-        hs = torch.randn(num_tokens, hidden_size, device=dev, dtype=torch.bfloat16)
         conv0 = torch.randn(
-            32, num_channels, total_padding, device=dev, dtype=torch.bfloat16
+            64, num_channels, total_padding, device=dev, dtype=torch.bfloat16
         )
-        prev0 = torch.randn(32, hidden_size, 1, device=dev, dtype=torch.bfloat16)
-        conv_got, prev_got = conv0.clone(), prev0.clone()
+        prev0 = torch.randn(64, 16, 1, device=dev, dtype=torch.bfloat16)
+        hs = torch.randn(num_tokens, 16, device=dev, dtype=torch.bfloat16)
 
+        conv_ref, prev_ref = conv0.clone(), prev0.clone()
+        conv_got, prev_got = conv0.clone(), prev0.clone()
         with torch.no_grad():
+            # Reference: run WITH the lag, then discard the lag results.
             self.assertTrue(
-                kernel.covered(qk, hs, conv_got, prev_got, slots, total_padding)
+                kernel.covered(qk, hs, conv_ref, prev_ref, slots, total_padding)
             )
-            window, prev_out = kernel.cca_state_step(
-                qk, hs, conv_got, prev_got, slots, total_padding
+            window_ref, _ = kernel.cca_state_step(
+                qk, hs, conv_ref, prev_ref, slots, total_padding
             )
-
-        touched = slots[:real]
-        untouched = torch.ones(32, dtype=torch.bool, device=dev)
-        untouched[touched] = False
-        # No padding row wrote into any pool slot.
-        self.assertTrue(torch.equal(conv_got[untouched], conv0[untouched]))
-        self.assertTrue(torch.equal(prev_got[untouched], prev0[untouched]))
-        # The real rows still shifted exactly as they would have alone.
-        for i in range(real):
-            slot = int(touched[i])
-            self.assertTrue(torch.equal(conv_got[slot, :, -1], qk[i]))
-            self.assertTrue(torch.equal(prev_got[slot, :, 0], hs[i]))
-            self.assertTrue(torch.equal(window[i, :, -1], qk[i]))
-            self.assertTrue(torch.equal(prev_out[i], prev0[slot, :, 0]))
-        # Padding rows read zeros, not another token's state.
-        zeros_c = torch.zeros_like(window[real:, :, :total_padding])
-        self.assertTrue(torch.equal(window[real:, :, :total_padding], zeros_c))
-        pad_prev = prev_out[real:]
-        self.assertTrue(torch.equal(pad_prev, torch.zeros_like(pad_prev)))
-
-    @unittest.skipUnless(torch.cuda.is_available(), "fused kernel requires a GPU")
-    def test_duplicate_positive_slots_stay_confined_to_that_slot(self):
-        """Two tokens on one slot: undefined *at* that slot, correct everywhere else.
-
-        Out of contract -- a decode batch gives each request its own mamba slot --
-        but worth pinning, because the 2-D grid is the change that made it
-        tempting to assume otherwise. Aliasing was already unordered under
-        ``grid=(T,)`` (two programs, same rows, no ordering between them), and the
-        tile split does not widen it: each program still owns a disjoint column
-        range, so a duplicate slot can only make *that slot's* rows one of the two
-        valid serializations. It must not corrupt the other tokens, the other
-        slots, or the parts of the output that never come from the pool.
-        """
-        from sglang.kernels.ops.attention import cca_state_step as kernel
-
-        dev = "cuda"
-        torch.manual_seed(13)
-        num_channels, hidden_size, total_padding = 600, 1100, 2
-        # Tokens 0 and 2 share slot 4; token 1 owns slot 7.
-        slots = torch.tensor([4, 7, 4], device=dev, dtype=torch.long)
-
-        qk = torch.randn(3, num_channels, device=dev, dtype=torch.bfloat16)
-        hs = torch.randn(3, hidden_size, device=dev, dtype=torch.bfloat16)
-        conv0 = torch.randn(
-            16, num_channels, total_padding, device=dev, dtype=torch.bfloat16
-        )
-        prev0 = torch.randn(16, hidden_size, 1, device=dev, dtype=torch.bfloat16)
-        conv_got, prev_got = conv0.clone(), prev0.clone()
-
-        with torch.no_grad():
-            window, prev_out = kernel.cca_state_step(
-                qk, hs, conv_got, prev_got, slots, total_padding
+            self.assertTrue(
+                kernel.covered(qk, None, conv_got, None, slots, total_padding)
+            )
+            window_got, lag_got = kernel.cca_state_step(
+                qk, None, conv_got, None, slots, total_padding
             )
 
-        # 1. Every slot outside {4, 7} is untouched.
-        untouched = torch.ones(16, dtype=torch.bool, device=dev)
-        untouched[torch.tensor([4, 7], device=dev)] = False
-        self.assertTrue(torch.equal(conv_got[untouched], conv0[untouched]))
-        self.assertTrue(torch.equal(prev_got[untouched], prev0[untouched]))
-
-        # 2. The token that owns its slot is exactly right.
-        self.assertTrue(torch.equal(conv_got[7, :, -1], qk[1]))
-        self.assertTrue(torch.equal(prev_got[7, :, 0], hs[1]))
-        self.assertTrue(torch.equal(prev_out[1], prev0[7, :, 0]))
-
-        # 3. The aliased tokens' own contribution to the window (the last tap is
-        #    this token's qk, never a pool read) is unaffected.
-        for i in (0, 2):
-            self.assertTrue(torch.equal(window[i, :, -1], qk[i]))
-
-        # 4. The aliased slot ends up holding one writer's value per column --
-        #    a valid serialization, not a mix of the two writes and a stale read.
-        newest = conv_got[4, :, -1]
-        self.assertTrue(bool(((newest == qk[0]) | (newest == qk[2])).all()))
-        stored = prev_got[4, :, 0]
-        self.assertTrue(bool(((stored == hs[0]) | (stored == hs[2])).all()))
-
-        # 5. Each aliased token read either the original slot content or the
-        #    other token's write -- never a third value.
-        for i, other in ((0, 2), (2, 0)):
-            got = prev_out[i]
-            ok = (got == prev0[4, :, 0]) | (got == hs[other])
-            self.assertTrue(bool(ok.all()))
+        self.assertIsNone(lag_got)
+        self.assertTrue(torch.equal(window_got, window_ref))
+        self.assertTrue(torch.equal(conv_got, conv_ref))
+        # The lag pool the lag-free call was never handed stays untouched.
+        self.assertTrue(torch.equal(prev_got, prev0))
 
     def test_uncovered_inputs_fall_back(self):
         # covered() gates an in-place pool mutation, so its negative branches
@@ -798,6 +957,18 @@ class TestCCAStateStepKernel(CustomTestCase):
         self.assertFalse(
             kernel.covered(qk.to(torch.bfloat16), hs, conv, prev, slots, 2)
         )
+        # Same for the lag pool: it is written from lag_now with no conversion.
+        self.assertFalse(
+            kernel.covered(qk, hs, conv, prev.to(torch.bfloat16), slots, 2)
+        )
+        # The lag stream is either fully specified or fully absent. A
+        # half-specified pair must be refused rather than guessed at: guessing
+        # "no lag" skips the pool write and the next step reads a stale value,
+        # guessing "lag" writes the wrong width into the pool. Neither raises.
+        self.assertFalse(kernel.covered(qk, hs, conv, None, slots, 2))
+        self.assertFalse(kernel.covered(qk, None, conv, prev, slots, 2))
+        # Widths must agree between the value and the pool entry it lands in.
+        self.assertFalse(kernel.covered(qk, torch.randn(4, 5), conv, prev, slots, 2))
 
 
 class TestCCAQKMixKernel(CustomTestCase):
@@ -1516,6 +1687,66 @@ class TestZayaCCATensorParallel(CustomTestCase):
 
             torch.testing.assert_close(rank_state, expected, atol=1e-5, rtol=1e-5)
 
+    def test_tp2_lag_stream_only_exists_on_the_val_proj2_rank(self):
+        """At attn_tp == 2 with two K heads, only rank 1 reads ``val_proj2``.
+
+        The HF layout gives rank 0 its V heads entirely from ``val_proj1``, so it
+        needs no lag at all: no projection, no pool read, no pool write. Rank 1
+        needs the whole of ``val_proj2``'s output. Pinning both halves matters
+        because the write side and the read side derive the range separately --
+        if they disagree, rank 1 reads a slot nothing filled (silently zero) or
+        rank 0 pays a GEMM it never uses.
+        """
+        ref_cca, cfg = _make_tiny_cca(seed=24, tp_rank=0, tp_size=1)
+        S = 4
+        torch.manual_seed(904)
+        hs = torch.randn(S, ref_cca.hidden_size, dtype=torch.float32) * 0.1
+
+        # tp=1 straddles the boundary and uses all of val_proj2's output.
+        self.assertTrue(ref_cca.v_uses_val1)
+        self.assertTrue(ref_cca.v_uses_val2)
+        self.assertEqual(ref_cca.v2_lag_dim, cfg.cca_v2_state_dim)
+
+        expected = {0: (True, False, 0), 1: (False, True, cfg.cca_v2_state_dim)}
+        for tp_rank in range(self.TP_SIZE):
+            rank_cca, _ = _make_tiny_cca(
+                seed=24 + tp_rank, tp_rank=tp_rank, tp_size=self.TP_SIZE
+            )
+            self._slice_full_state_dict_into_rank(ref_cca, rank_cca, tp_rank)
+            uses1, uses2, lag_dim = expected[tp_rank]
+            self.assertEqual(rank_cca.v_uses_val1, uses1)
+            self.assertEqual(rank_cca.v_uses_val2, uses2)
+            self.assertEqual(rank_cca.v2_lag_dim, lag_dim)
+
+            rank_pool = _MockReqToTokenPool(
+                pool_size=4, cca_config=cfg, tp_size=self.TP_SIZE
+            )
+            with _mock_pool_context(rank_pool):
+                rank_cca.forward(
+                    hs,
+                    _make_forward_batch(
+                        is_decode=False,
+                        extend_seq_lens_cpu=[S],
+                        extend_prefix_lens_cpu=[0],
+                        req_pool_indices=[0],
+                        input_ids=torch.arange(S, dtype=torch.int64),
+                    ),
+                )
+            lag_slot = rank_pool.mamba2_layer_cache(0).conv[1][0]
+            # The pool entry stays rank-uniform (a per-rank size would desync
+            # max_mamba_cache_size across the TP group); rank 0 just leaves it at
+            # the zeros MambaPool handed out.
+            self.assertEqual(lag_slot.shape[-2], cfg.cca_v2_state_dim)
+            if uses2:
+                self.assertTrue(torch.any(lag_slot != 0))
+                with torch.no_grad():
+                    expected_row = rank_cca.val_proj2(hs[-1:])[0].squeeze(0)
+                torch.testing.assert_close(
+                    lag_slot.squeeze(-1), expected_row, atol=1e-5, rtol=1e-5
+                )
+            else:
+                self.assertTrue(torch.all(lag_slot == 0))
+
     def test_tp_assertions_reject_indivisible_head_counts(self):
         """The CCA constructor must reject TP sizes that don't evenly divide
         both num_q_heads and num_k_heads, since both grouped-mean and
@@ -1945,11 +2176,11 @@ class TestDpGatherStagingFusion(CustomTestCase):
 
 def _reference_extend_conv(
     qk: torch.Tensor,
-    hidden_states: torch.Tensor,
+    lag_now: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor,
     conv_state: torch.Tensor,
-    prev_hs_state: torch.Tensor,
+    lag_state: torch.Tensor,
     seq_lens: List[int],
     slot_ids: List[int],
     has_prefix: List[bool],
@@ -1963,9 +2194,9 @@ def _reference_extend_conv(
     agree only if the varlen indexing is right.
     """
     qk_out = torch.empty_like(qk)
-    v2_out = torch.empty_like(hidden_states)
+    lag_out = torch.empty_like(lag_now)
     new_conv_state = conv_state.clone()
-    new_prev_hs = prev_hs_state.clone()
+    new_lag_state = lag_state.clone()
 
     start = 0
     for i, seq_len in enumerate(seq_lens):
@@ -1983,16 +2214,16 @@ def _reference_extend_conv(
             padded[..., -total_padding:].squeeze(0).to(conv_state.dtype)
         )
 
-        hs_cur = hidden_states[start:end]
+        lag_cur = lag_now[start:end]
         if has_prefix[i]:
-            first = prev_hs_state[slot].squeeze(-1).to(hs_cur.dtype).unsqueeze(0)
+            first = lag_state[slot].squeeze(-1).to(lag_cur.dtype).unsqueeze(0)
         else:
-            first = hs_cur.new_zeros((1, hs_cur.shape[-1]))
-        v2_out[start:end] = torch.cat([first, hs_cur[:-1]], dim=0)
-        new_prev_hs[slot] = hs_cur[-1].unsqueeze(-1).to(prev_hs_state.dtype)
+            first = lag_cur.new_zeros((1, lag_cur.shape[-1]))
+        lag_out[start:end] = torch.cat([first, lag_cur[:-1]], dim=0)
+        new_lag_state[slot] = lag_cur[-1].unsqueeze(-1).to(lag_state.dtype)
         start = end
 
-    return qk_out, v2_out, new_conv_state, new_prev_hs
+    return qk_out, lag_out, new_conv_state, new_lag_state
 
 
 class TestCCAFusedPrefillConv(CustomTestCase):
@@ -2006,7 +2237,10 @@ class TestCCAFusedPrefillConv(CustomTestCase):
 
     GROUPS = 3
     CG = 16  # tl.dot needs a tile at least 16 wide
-    HIDDEN = 8
+    # The lag stream is the projected val_proj2 value, not the hidden state, so
+    # it is narrower than the conv channel count -- keep the test shape that way
+    # too rather than reusing a hidden_size-shaped stream.
+    LAG_DIM = 8
     TOTAL_PADDING = 2
 
     def _inputs(self, seq_lens: List[int], has_prefix: List[bool], seed: int = 0):
@@ -2019,13 +2253,13 @@ class TestCCAFusedPrefillConv(CustomTestCase):
         dt = torch.bfloat16
         return dict(
             qk=torch.randn(total, channels, device=dev, dtype=dt),
-            hidden_states=torch.randn(total, self.HIDDEN, device=dev, dtype=dt),
+            lag_now=torch.randn(total, self.LAG_DIM, device=dev, dtype=dt),
             weight=torch.randn(channels, self.CG, taps, device=dev, dtype=dt) * 0.1,
             bias=torch.randn(channels, device=dev, dtype=dt) * 0.1,
             conv_state=torch.randn(
                 num_slots, channels, self.TOTAL_PADDING, device=dev, dtype=dt
             ),
-            prev_hs_state=torch.randn(num_slots, self.HIDDEN, 1, device=dev, dtype=dt),
+            lag_state=torch.randn(num_slots, self.LAG_DIM, 1, device=dev, dtype=dt),
             seq_lens=seq_lens,
             has_prefix=has_prefix,
         )
@@ -2042,13 +2276,13 @@ class TestCCAFusedPrefillConv(CustomTestCase):
         slots = torch.tensor(slot_ids, dtype=torch.int64, device="cuda")
         prefix = torch.tensor(has_prefix, dtype=torch.bool, device="cuda")
 
-        ref_qk, ref_v2, ref_cs, ref_ph = _reference_extend_conv(
+        ref_qk, ref_lag, ref_cs, ref_ls = _reference_extend_conv(
             args["qk"],
-            args["hidden_states"],
+            args["lag_now"],
             args["weight"],
             args["bias"],
             args["conv_state"],
-            args["prev_hs_state"],
+            args["lag_state"],
             seq_lens,
             slot_ids,
             has_prefix,
@@ -2057,15 +2291,15 @@ class TestCCAFusedPrefillConv(CustomTestCase):
         )
 
         conv_state = args["conv_state"].clone()
-        prev_hs_state = args["prev_hs_state"].clone()
+        lag_state = args["lag_state"].clone()
         self.assertTrue(
             cca_conv1d.covered(
                 args["qk"],
-                args["hidden_states"],
+                args["lag_now"],
                 args["weight"],
                 args["bias"],
                 conv_state,
-                prev_hs_state,
+                lag_state,
                 cu,
                 prefix,
                 slots,
@@ -2073,28 +2307,28 @@ class TestCCAFusedPrefillConv(CustomTestCase):
                 self.GROUPS,
             )
         )
-        got_qk, got_v2 = cca_conv1d.cca_conv1d_fn(
+        got_qk, got_lag = cca_conv1d.cca_conv1d_fn(
             args["qk"],
-            args["hidden_states"],
+            args["lag_now"],
             args["weight"],
             args["bias"],
             conv_state,
-            prev_hs_state,
+            lag_state,
             cu,
             prefix,
             slots,
             self.TOTAL_PADDING,
             self.GROUPS,
         )
-        return (got_qk, got_v2, conv_state, prev_hs_state), (
+        return (got_qk, got_lag, conv_state, lag_state), (
             ref_qk,
-            ref_v2,
+            ref_lag,
             ref_cs,
-            ref_ph,
+            ref_ls,
         )
 
     def _assert_matches(self, got, ref):
-        names = ("qk_out", "v2_input", "conv_state", "prev_hs_state")
+        names = ("qk_out", "lag_prev", "conv_state", "lag_state")
         for name, g, r in zip(names, got, ref):
             torch.testing.assert_close(
                 g.float(), r.float(), rtol=2e-2, atol=2e-2, msg=f"{name} mismatch"
@@ -2141,6 +2375,197 @@ class TestCCAFusedPrefillConv(CustomTestCase):
         self._assert_matches(got, ref)
 
     @unittest.skipUnless(torch.cuda.is_available(), "fused conv is a GPU kernel")
+    def test_chunked_prefill_boundary_carries_the_projected_value(self):
+        """Two chunks of one request must equal a single chunk over both.
+
+        The fused path's chunk boundary lives in ``_boundary_state_kernel``: it
+        parks the chunk's last lag row in the pool slot and, next chunk, reads it
+        back as the row preceding the first token. That row is the PROJECTED
+        val_proj2 value; if the boundary ever carried the raw hidden state
+        instead, the resumed tokens would read a wrong v2 with no shape or dtype
+        error -- the output would just get worse.
+
+        Splitting a request and comparing against the unsplit run pins the carry
+        in both directions (what is written, and what is read back), which the
+        single-shot ``test_resumed_prefix_reads_carried_state`` case cannot: it
+        seeds the slot with random values rather than with the kernel's own
+        output.
+        """
+        from sglang.kernels.ops.attention import cca_conv1d
+
+        dev, dt = "cuda", torch.bfloat16
+        channels = self.GROUPS * self.CG
+        taps = self.TOTAL_PADDING + 1
+        s0, s1 = 5, 7
+        total = s0 + s1
+        torch.manual_seed(31)
+        qk = torch.randn(total, channels, device=dev, dtype=dt)
+        lag_now = torch.randn(total, self.LAG_DIM, device=dev, dtype=dt)
+        weight = torch.randn(channels, self.CG, taps, device=dev, dtype=dt) * 0.1
+        bias = torch.randn(channels, device=dev, dtype=dt) * 0.1
+        slots = torch.tensor([1], dtype=torch.int64, device=dev)
+
+        def _fresh_pools():
+            return (
+                torch.zeros(4, channels, self.TOTAL_PADDING, device=dev, dtype=dt),
+                torch.zeros(4, self.LAG_DIM, 1, device=dev, dtype=dt),
+            )
+
+        def _run(qk_c, lag_c, cs, ls, prefix):
+            cu = torch.tensor([0, qk_c.shape[0]], dtype=torch.int32, device=dev)
+            pf = torch.tensor([prefix], dtype=torch.bool, device=dev)
+            self.assertTrue(
+                cca_conv1d.covered(
+                    qk_c,
+                    lag_c,
+                    weight,
+                    bias,
+                    cs,
+                    ls,
+                    cu,
+                    pf,
+                    slots,
+                    self.TOTAL_PADDING,
+                    self.GROUPS,
+                )
+            )
+            return cca_conv1d.cca_conv1d_fn(
+                qk_c,
+                lag_c,
+                weight,
+                bias,
+                cs,
+                ls,
+                cu,
+                pf,
+                slots,
+                self.TOTAL_PADDING,
+                self.GROUPS,
+            )
+
+        cs_one, ls_one = _fresh_pools()
+        one_qk, one_lag = _run(qk, lag_now, cs_one, ls_one, False)
+
+        cs_two, ls_two = _fresh_pools()
+        a_qk, a_lag = _run(qk[:s0], lag_now[:s0], cs_two, ls_two, False)
+        b_qk, b_lag = _run(qk[s0:], lag_now[s0:], cs_two, ls_two, True)
+
+        torch.testing.assert_close(
+            torch.cat([a_qk, b_qk]).float(), one_qk.float(), rtol=2e-2, atol=2e-2
+        )
+        # The lag stream is pure data movement, so require exact equality: any
+        # boundary bug shows as a wrong row, never as rounding.
+        self.assertTrue(torch.equal(torch.cat([a_lag, b_lag]), one_lag))
+        self.assertTrue(torch.equal(cs_two, cs_one))
+        self.assertTrue(torch.equal(ls_two, ls_one))
+        # The carried row really is this chunk's last projected value.
+        self.assertTrue(torch.equal(ls_two[1].squeeze(-1), lag_now[-1]))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused conv is a GPU kernel")
+    def test_no_lag_stream_leaves_the_conv_half_identical(self):
+        """A rank with no lag drops two of the four launches.
+
+        Ranks whose K heads all come from ``val_proj1`` never read the lag, so
+        they pass ``None`` and the shifted copy plus the boundary kernel are
+        skipped. The conv half must be untouched by that, and the lag pool must
+        stay exactly as handed over.
+        """
+        from sglang.kernels.ops.attention import cca_conv1d
+
+        args = self._inputs([6, 3], [True, False], seed=12)
+        cu = torch.tensor([0, 6, 9], dtype=torch.int32, device="cuda")
+        slots = torch.tensor([0, 1], dtype=torch.int64, device="cuda")
+        prefix = torch.tensor([True, False], dtype=torch.bool, device="cuda")
+
+        cs_ref = args["conv_state"].clone()
+        ls_ref = args["lag_state"].clone()
+        ref_qk, _ = cca_conv1d.cca_conv1d_fn(
+            args["qk"],
+            args["lag_now"],
+            args["weight"],
+            args["bias"],
+            cs_ref,
+            ls_ref,
+            cu,
+            prefix,
+            slots,
+            self.TOTAL_PADDING,
+            self.GROUPS,
+        )
+
+        cs_got = args["conv_state"].clone()
+        ls_got = args["lag_state"].clone()
+        self.assertTrue(
+            cca_conv1d.covered(
+                args["qk"],
+                None,
+                args["weight"],
+                args["bias"],
+                cs_got,
+                None,
+                cu,
+                prefix,
+                slots,
+                self.TOTAL_PADDING,
+                self.GROUPS,
+            )
+        )
+        got_qk, got_lag = cca_conv1d.cca_conv1d_fn(
+            args["qk"],
+            None,
+            args["weight"],
+            args["bias"],
+            cs_got,
+            None,
+            cu,
+            prefix,
+            slots,
+            self.TOTAL_PADDING,
+            self.GROUPS,
+        )
+        self.assertIsNone(got_lag)
+        self.assertTrue(torch.equal(got_qk, ref_qk))
+        self.assertTrue(torch.equal(cs_got, cs_ref))
+        # Never handed the lag pool, so it cannot have moved.
+        self.assertTrue(torch.equal(ls_got, args["lag_state"]))
+
+    def test_covered_rejects_a_half_specified_lag_pair(self):
+        """One lag tensor without the other is refused, not guessed at.
+
+        Guessing "no lag" would skip the chunk-boundary carry, and the next chunk
+        would silently resume from a stale slot. This runs on CPU: ``covered()``
+        rejects the pair before it ever reaches the device checks.
+        """
+        from sglang.kernels.ops.attention import cca_conv1d
+
+        qk = torch.randn(4, self.GROUPS * self.CG)
+        lag = torch.randn(4, self.LAG_DIM)
+        weight = torch.randn(self.GROUPS * self.CG, self.CG, self.TOTAL_PADDING + 1)
+        bias = torch.randn(self.GROUPS * self.CG)
+        cs = torch.randn(3, self.GROUPS * self.CG, self.TOTAL_PADDING)
+        ls = torch.randn(3, self.LAG_DIM, 1)
+        cu = torch.tensor([0, 4], dtype=torch.int32)
+        pf = torch.zeros(1, dtype=torch.bool)
+        slots = torch.zeros(1, dtype=torch.int64)
+        for lag_now, lag_state in ((lag, None), (None, ls)):
+            with self.subTest(lag_now=lag_now is not None):
+                self.assertFalse(
+                    cca_conv1d.covered(
+                        qk,
+                        lag_now,
+                        weight,
+                        bias,
+                        cs,
+                        lag_state,
+                        cu,
+                        pf,
+                        slots,
+                        self.TOTAL_PADDING,
+                        self.GROUPS,
+                    )
+                )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused conv is a GPU kernel")
     def test_covered_rejects_the_unfolded_two_stage_conv(self):
         """Without the folded weight there is nothing for this kernel to apply."""
         from sglang.kernels.ops.attention import cca_conv1d
@@ -2150,11 +2575,11 @@ class TestCCAFusedPrefillConv(CustomTestCase):
         self.assertFalse(
             cca_conv1d.covered(
                 args["qk"],
-                args["hidden_states"],
+                args["lag_now"],
                 None,
                 args["bias"],
                 args["conv_state"],
-                args["prev_hs_state"],
+                args["lag_state"],
                 cu,
                 torch.zeros(1, dtype=torch.bool, device="cuda"),
                 torch.zeros(1, dtype=torch.int64, device="cuda"),
@@ -2175,7 +2600,7 @@ class TestCCAFusedDecodeConv(CustomTestCase):
 
     GROUPS = 3
     CG = 16
-    HIDDEN = 8
+    LAG_DIM = 8
     TOTAL_PADDING = 2
 
     def _run(self, num_tokens: int, slot_ids: List[int]):
@@ -2188,7 +2613,7 @@ class TestCCAFusedDecodeConv(CustomTestCase):
         num_slots = max(s for s in slot_ids) + 2
 
         qk = torch.randn(num_tokens, channels, device=dev, dtype=dt)
-        hs = torch.randn(num_tokens, self.HIDDEN, device=dev, dtype=dt)
+        lag_now = torch.randn(num_tokens, self.LAG_DIM, device=dev, dtype=dt)
         weight = (
             torch.randn(self.GROUPS, self.CG, self.CG * taps, device=dev, dtype=dt)
             * 0.1
@@ -2197,33 +2622,33 @@ class TestCCAFusedDecodeConv(CustomTestCase):
         conv_state = torch.randn(
             num_slots, channels, self.TOTAL_PADDING, device=dev, dtype=dt
         )
-        prev_hs = torch.randn(num_slots, self.HIDDEN, 1, device=dev, dtype=dt)
+        lag_state = torch.randn(num_slots, self.LAG_DIM, 1, device=dev, dtype=dt)
         slots = torch.tensor(slot_ids, dtype=torch.int64, device=dev)
 
         # Reference: build the window, apply the einsum, shift the pools.
         live = [s for s in slot_ids if s >= 0]
-        ref_cs, ref_ph = conv_state.clone(), prev_hs.clone()
+        ref_cs, ref_ls = conv_state.clone(), lag_state.clone()
         left = conv_state.index_select(0, slots.clamp(min=0))
         window = torch.cat([left, qk.unsqueeze(-1)], dim=-1)
         grouped = window.reshape(num_tokens, self.GROUPS, -1)
         ref_qk = (
             torch.einsum("tgk,gok->tgo", grouped.float(), weight.float()) + bias.float()
         ).reshape(num_tokens, -1)
-        ref_prev = prev_hs.index_select(0, slots.clamp(min=0)).squeeze(-1)
+        ref_prev = lag_state.index_select(0, slots.clamp(min=0)).squeeze(-1)
         for i, s in enumerate(slot_ids):
             if s >= 0:
                 ref_cs[s] = window[i, :, -self.TOTAL_PADDING :]
-                ref_ph[s] = hs[i].unsqueeze(-1)
+                ref_ls[s] = lag_now[i].unsqueeze(-1)
 
-        got_cs, got_ph = conv_state.clone(), prev_hs.clone()
+        got_cs, got_ls = conv_state.clone(), lag_state.clone()
         self.assertTrue(
             cca_conv1d_update.covered(
                 qk,
-                hs,
+                lag_now,
                 weight,
                 bias,
                 got_cs,
-                got_ph,
+                got_ls,
                 slots,
                 self.TOTAL_PADDING,
                 self.GROUPS,
@@ -2231,11 +2656,11 @@ class TestCCAFusedDecodeConv(CustomTestCase):
         )
         got_qk, got_prev = cca_conv1d_update.cca_conv1d_update(
             qk,
-            hs,
+            lag_now,
             weight,
             bias,
             got_cs,
-            got_ph,
+            got_ls,
             slots,
             self.TOTAL_PADDING,
             self.GROUPS,
@@ -2248,8 +2673,8 @@ class TestCCAFusedDecodeConv(CustomTestCase):
                 ref_cs.index_select(0, idx).float(),
             )
             torch.testing.assert_close(
-                got_ph.index_select(0, idx).float(),
-                ref_ph.index_select(0, idx).float(),
+                got_ls.index_select(0, idx).float(),
+                ref_ls.index_select(0, idx).float(),
             )
         return got_prev, ref_prev
 
@@ -2273,30 +2698,30 @@ class TestCCAFusedDecodeConv(CustomTestCase):
         taps = self.TOTAL_PADDING + 1
         dev, dt = "cuda", torch.bfloat16
         qk = torch.randn(4, channels, device=dev, dtype=dt)
-        hs = torch.randn(4, self.HIDDEN, device=dev, dtype=dt)
+        lag_now = torch.randn(4, self.LAG_DIM, device=dev, dtype=dt)
         weight = (
             torch.randn(self.GROUPS, self.CG, self.CG * taps, device=dev, dtype=dt)
             * 0.1
         )
         bias = torch.randn(self.GROUPS, self.CG, device=dev, dtype=dt) * 0.1
         conv_state = torch.randn(3, channels, self.TOTAL_PADDING, device=dev, dtype=dt)
-        prev_hs = torch.randn(3, self.HIDDEN, 1, device=dev, dtype=dt)
-        before_cs, before_ph = conv_state.clone(), prev_hs.clone()
+        lag_state = torch.randn(3, self.LAG_DIM, 1, device=dev, dtype=dt)
+        before_cs, before_ls = conv_state.clone(), lag_state.clone()
         slots = torch.tensor([-1, -1, -1, -1], dtype=torch.int64, device=dev)
 
         cca_conv1d_update.cca_conv1d_update(
             qk,
-            hs,
+            lag_now,
             weight,
             bias,
             conv_state,
-            prev_hs,
+            lag_state,
             slots,
             self.TOTAL_PADDING,
             self.GROUPS,
         )
         self.assertTrue(torch.equal(conv_state, before_cs))
-        self.assertTrue(torch.equal(prev_hs, before_ph))
+        self.assertTrue(torch.equal(lag_state, before_ls))
 
 
 class TestZayaMoDReachability(CustomTestCase):

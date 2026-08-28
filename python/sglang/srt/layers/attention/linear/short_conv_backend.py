@@ -20,7 +20,7 @@ state* (stored in the centralized ``MambaPool``) with softmax attention layers:
   a depthwise gated short conv (``causal_conv1d_fn`` / ``causal_conv1d_update``)
   as a standalone token mixer on its own conv layers.
 * **ZAYA1** (:class:`CCA <sglang.srt.models.zaya.CCA>`) -- a two-stage grouped
-  conv plus a one-token ``prev_hs`` lag, preprocessing q/k for the layer's
+  conv plus a one-token ``val_proj2`` value lag, preprocessing q/k for the
   softmax attention.
 
 These share the *state plumbing* -- resolving the per-request slot indices, the
@@ -58,7 +58,7 @@ class ShortConvMetadata(NamedTuple):
     """Per-(layer, step) conv-state handle handed to a model's conv kernel.
 
     ``layer_cache`` exposes the per-layer pool views (``conv[0]`` = conv state,
-    ``conv[1]`` = an optional second state such as ZAYA1's ``prev_hs``,
+    ``conv[1]`` = an optional second state such as ZAYA1's val_proj2 lag,
     ``temporal`` = SSM state, unused by pure short convs). The device tensors are
     cuda-graph-static on the decode/replay path; the ``*_cpu`` host mirrors are
     built once per step only for models whose extend path runs a host loop
