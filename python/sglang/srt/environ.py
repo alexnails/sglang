@@ -832,8 +832,7 @@ class Envs:
     # Override the ROCm <= 7.2.0 guard that forces the capture-safe pynccl path
     # for custom / quick all-reduce inside CUDA graph capture (see
     # distributed/parallel_state._rocm_cuda_graph_custom_ar_unsafe). Unset means
-    # "use the HIP-version check"; 0 re-enables custom AR during capture, which
-    # is much faster for the small messages a DP-attention decode step issues.
+    # "use the HIP-version check"; 0 re-enables custom AR during capture.
     SGLANG_ROCM_CUDA_GRAPH_FORCE_PYNCCL = EnvBool(None)
     SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("tilelang")
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
@@ -1222,7 +1221,10 @@ class Envs:
     # raising max_running_requests. Off = original locking + ratio (escape hatch).
     SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
 
-    #     SGLANG_USE_BREAKABLE_CUDA_GRAPH = EnvBool(False)
+    # ===================================================================
+    # CUDA graphs and execution buffers
+    # ===================================================================
+    SGLANG_USE_BREAKABLE_CUDA_GRAPH = EnvBool(False)
     # Guards CUDA graph executable dedup via cudaGraphExecUpdate.
     SGLANG_ENABLE_CUDA_GRAPH_DEDUP = EnvBool(False)
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
@@ -1516,23 +1518,16 @@ class Envs:
     # ===================================================================
     # ZAYA1
     # ===================================================================
-    # A tp=8/dp=4 ZAYA1-74B decode step spends most of its GPU time in
-    # collectives, and throughput tracks collective OP COUNT, not payload bytes:
-    # cutting bytes 40% while raising op count 67% lost 1-3% at every
-    # concurrency, and a side-stream gather cost a flat ~58us/layer barrier.
-    # Cutting op count is the direction that works, which is what the global
-    # residual below does.
     # Hold the residual stream in the global DP layout instead of the DP-local
     # one. One partial gather of the o_proj partials then does the work of both
     # the attention-TP all-reduce and the DP gather, cutting an attention+MoE
     # layer pair from three collectives to two and dropping the MoE scatter, at
     # the cost of running each norm over every replica's rows.
     #
-    # ON by default: +6.3-7.6% tok/s on MI350X and +7.0-8.8% on MI355X at
-    # tp=8/dp=4, TPOT -6 to -8%, TTFT -7 to -10%, with greedy ids BIT-IDENTICAL
-    # on both. It is also self-declining -- global_residual_layout() returns None
-    # unless the expert reduce actually spans DP replicas -- so it is inert, not
-    # wrong, at tp=1 or under plain tensor parallelism. Set 0 to A/B it back.
+    # ON by default: measured +6.3-8.8% tok/s at tp=8/dp=4 on MI350X / MI355X,
+    # greedy ids bit-identical. Self-declining -- global_residual_layout()
+    # returns None unless the expert reduce actually spans DP replicas -- so it
+    # is inert, not wrong, at tp=1 or under plain TP. Set 0 to A/B it back.
     SGLANG_OPT_ZAYA_GLOBAL_RESIDUAL = EnvBool(True)
     # Run the prefill CCA conv as one varlen Triton kernel pair instead of the
     # per-request host loop in cca_extend. The loop issues O(batch) launches per

@@ -398,10 +398,9 @@ def capture_prefill_graph(
     )
     if len(model_runner.attention_layers) != len(layer_model.layers):
         # The list is read as ``attention_layers[layer_id]``, so it has to cover
-        # every layer; a short one means this model's layer structure was not
-        # recognized and the entries past the first unrecognized layer are
-        # shifted. Note a None entry is fine -- a layer that holds no attention
-        # (a MoE-only layer in an alternating stack) is never the one indexing.
+        # every layer; a short one means the entries past the first unrecognized
+        # layer are shifted. A None entry is fine -- a layer holding no attention
+        # never indexes it.
         log_info_on_rank0(
             logger,
             "Disable prefill CUDA graph because the attention layers could not be "

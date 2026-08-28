@@ -1,55 +1,28 @@
-"""Fused ZAYA1 CCA prefill conv, varlen and driven entirely by device tensors.
+"""Fused ZAYA1 CCA prefill conv: varlen, driven entirely by device tensors.
 
 Replaces the per-request host loop in :func:`cca_extend
-<sglang.srt.models.zaya.cca_extend>`. That loop walks the batch on the CPU and
-issues, per request, a pack copy, an unpack copy, a conv-state write, a
-``torch.cat`` and a lag-slot write -- so its launch count grows with the batch
-and its trip count comes from ``extend_seq_lens_cpu``. Reading CPU sequence
-lengths is also what keeps the prefill CUDA graph uncapturable.
+<sglang.srt.models.zaya.cca_extend>`, whose launch count grows with the batch and
+whose reads of ``extend_seq_lens_cpu`` also block prefill CUDA-graph capture.
+This path is four launches per layer at any batch size:
 
-This path is four launches per layer whatever the batch size -- two on a rank
-that carries no lag stream, see below -- and every bound it needs (request of a
-token, that request's start, its pool slot, whether it resumes a prefix) is read
-from device tensors the backend already publishes (``query_start_loc``,
-``cache_indices``, ``has_initial_state``):
+1. a shifted copy for ``lag_prev[1:] = lag_now[:-1]``,
+2. :func:`_boundary_state_kernel` -- fix ``lag_prev`` at each request start from
+   that request's cached lag slot, and carry its last row into the slot,
+3. :func:`_cca_conv1d_varlen_kernel` -- the conv, tiled over tokens,
+4. :func:`_cca_conv_state_tail_kernel` -- write each request's trailing window
+   back to ``conv_state``. Must follow step 3, which reads the *incoming*
+   ``conv_state`` for the halo taps of a resumed request.
 
-1. a plain shifted copy for ``lag_prev[1:] = lag_now[:-1]``,
-2. :func:`_boundary_state_kernel` -- fixes the ``lag_prev`` row at each request
-   start from that request's cached lag slot, and carries the request's last lag
-   row into the slot for the next chunk,
-3. :func:`_cca_conv1d_varlen_kernel` -- the conv itself, tiled over tokens,
-4. :func:`_cca_conv_state_tail_kernel` -- writes each request's trailing window
-   back to its ``conv_state`` slot.
+The lag stream carries the *projected* ``val_proj2`` value, not the raw hidden
+state: the projection is linear and bias-free, so shifting commutes with it, and
+the stream is ``latent_k_dim / 2`` wide instead of ``hidden_size``. Passing
+``lag_now`` / ``lag_state`` as ``None`` drops steps 1-2 for a rank whose K heads
+all come from ``val_proj1``.
 
-Order matters and is load-bearing. Step 2 reads a slot it then overwrites within
-one program, so the read/write pair on a row is safe. Step 4 must follow step 3,
-because step 3 reads the *incoming* ``conv_state`` for the halo taps of the first
-tokens of a resumed request; writing the outgoing window first would corrupt it.
-
-The lag stream carries the *projected* ``val_proj2`` value ``W_v2 . hs``, not the
-raw hidden state: the projection is linear and bias-free, so shifting before or
-after it is the same function, and the stream is ``latent_k_dim / 2`` wide rather
-than ``hidden_size`` -- 128 instead of 4096 on ZAYA1-74B. Step 1 is where that
-matters most: it was a full ``[T, 4096]`` copy per layer (2.0 GB per prefill step
-at T=2048 over 60 layers) and is now ``[T, 128]`` (63 MB). Passing ``lag_now`` /
-``lag_state`` as ``None`` drops steps 1 and 2 altogether, leaving two launches --
-what a rank whose K heads all come from ``val_proj1`` wants, since it never reads
-the lag. The boundary row it parks is therefore also the projected value; storing
-the raw hidden state there would leave a resumed prefix reading the wrong v2,
-with no shape or dtype error to catch it.
-
-The conv consumes the single folded grouped weight (``CCA.fold_conv1d_weight``,
-see :meth:`CCA.fold_decode_conv`), not the two-stage ``conv_qk`` -- the fold is
-itself a convolution, so one 3-tap grouped kernel is exactly equivalent.
-
-Tiling over tokens rather than one program per token is what makes this
-affordable: the per-group weight is ``Cg x Cg x taps`` (98 KB at ZAYA1's
-Cg=128, taps=3), so a program-per-token grid would re-read it 4096 times per
-layer -- gigabytes of weight traffic for a conv whose arithmetic is trivial.
-
-Written in Triton so it runs on ROCm, ZAYA1's reference deployment. Follows
-``cca_state_step``'s structure: a ``covered()`` predicate gates supported inputs
-and the caller falls back to the reference torch path.
+The conv consumes the folded grouped weight (:meth:`CCA.fold_decode_conv`), not
+the two-stage ``conv_qk``; the fold is itself a convolution, so one 3-tap grouped
+kernel is equivalent. Like ``cca_state_step``, a ``covered()`` predicate gates
+supported inputs and the caller falls back to the reference torch path.
 """
 
 from __future__ import annotations
@@ -81,23 +54,19 @@ def _boundary_state_kernel(
 
     start = tl.load(cu_ptr + b)
     end = tl.load(cu_ptr + b + 1)
-    # Batch padding leaves zero-length requests; they own no tokens and their
-    # slot must not be touched.
+    # Zero-length (padded) requests own no tokens; leave their slot alone.
     if end > start:
         slot = tl.load(slots_ptr + b)
         prefix = tl.load(prefix_ptr + b)
 
-        # The first token's val_proj2 value is the one the request carried over
-        # from its previous chunk, or zero on a fresh chunk (which is what the
-        # zeroed pool slot holds, since val_proj2 is bias-free). Read it before
-        # the store below overwrites the same row.
+        # The first token reads the value carried over from the previous chunk
+        # (zero on a fresh one). Read before the store below overwrites the row.
         prev = tl.load(
             lag_state_ptr + slot * s_ls_s + d, mask=dmask & prefix, other=0.0
         )
         tl.store(out_ptr + start * s_out_t + d, prev, mask=dmask)
 
-        # Carry this chunk's last PROJECTED value, not the raw hidden state --
-        # the read side above expects the projection already applied.
+        # Carry the projected value, not the raw hidden state (see module doc).
         last = tl.load(lag_ptr + (end - 1) * s_lag_t + d, mask=dmask, other=0.0)
         tl.store(lag_state_ptr + slot * s_ls_s + d, last, mask=dmask)
 
@@ -132,9 +101,8 @@ def _cca_conv1d_varlen_kernel(
     tmask = t < num_tokens
     tsafe = tl.where(tmask, t, 0)
 
-    # Which request owns each token: the largest b with cu[b] <= t. Taking the
-    # *largest* is what makes zero-length (padded) requests fall out -- for them
-    # cu[b] == cu[b+1], so the next request wins the tie.
+    # Request owning each token: the largest b with cu[b] <= t, so zero-length
+    # (padded) requests lose the tie and fall out.
     lo = tl.zeros([BLOCK_T], dtype=tl.int32)
     hi = tl.full([BLOCK_T], num_requests, dtype=tl.int32)
     for _ in tl.static_range(SEARCH):
@@ -153,19 +121,17 @@ def _cca_conv1d_varlen_kernel(
 
     acc = tl.zeros([BLOCK_T, CG], dtype=tl.float32)
     for m in tl.static_range(TAPS):
-        # Tap m of the causal window reads request position local-(TAPS-1)+m.
+        # Tap m of the causal window reads request position local-(TAPS-1)+m;
+        # inside the chunk its global row is t-(TAPS-1)+m.
         pos = local - (TAPS - 1) + m
         in_seq = pos >= 0
-        # When the tap lies inside this chunk its global row is just
-        # t-(TAPS-1)+m, independent of which request the token belongs to.
         src = tl.maximum(tsafe - (TAPS - 1) + m, 0)
         x = tl.load(
             qk_ptr + src[:, None] * s_qk_t + co[None, :],
             mask=tmask[:, None] & in_seq[:, None],
             other=0.0,
         )
-        # Otherwise it is a halo tap from the carried history, whose tap index
-        # is PAD+pos (pos in [-PAD, 0), so this lands in [0, PAD)).
+        # Otherwise a halo tap from the carried history, at tap index PAD+pos.
         halo = tl.load(
             conv_state_ptr
             + slot[:, None] * s_cs_s
@@ -222,9 +188,8 @@ def _cca_conv_state_tail_kernel(
                 other=0.0,
             )
             # A chunk shorter than the window keeps its oldest taps from the
-            # incoming history, shifted left by seq_len. Reads index seq_len+i,
-            # which is always above the taps already written (0..i-1), so the
-            # in-place update does not alias.
+            # incoming history. Reads index seq_len+i, always above the taps
+            # already written (0..i-1), so the in-place update does not alias.
             v_carry = tl.load(
                 conv_state_ptr
                 + slot * s_cs_s
@@ -255,14 +220,8 @@ def covered(
 ) -> bool:
     """Whether the fused prefill conv can serve these inputs.
 
-    Needs the folded single grouped weight (the two-stage ``conv_qk`` is not
-    expressible here), the backend's device-side request metadata, everything on
-    one accelerator with unit innermost strides, and a channels-per-group that
-    ``tl.dot`` can take as a tile width.
-
-    ``lag_now`` / ``lag_state`` must be both present or both ``None``. ``None``
-    drops the two lag launches for a rank that never reads the stream; a
-    half-specified pair is refused rather than guessed at, because guessing "no
+    ``lag_now`` / ``lag_state`` must be both present or both ``None``: a
+    half-specified pair is refused rather than guessed at, since guessing "no
     lag" silently skips the chunk-boundary carry and the next chunk then resumes
     from a stale slot.
     """
@@ -314,9 +273,8 @@ def covered(
     if conv_state.shape[-1] != total_padding or conv_state.shape[-2] != num_channels:
         return False
     if lag_now is not None:
-        # The lag pool row is addressed as ``slot * stride(0) + d``, so its
-        # feature axis must be unit-strided; a narrowed view of a wider pool
-        # entry (a rank owning only part of val_proj2's output) still is.
+        # The lag row is addressed as ``slot * stride(0) + d``, so its feature
+        # axis must be unit-strided (a narrowed view of a wider entry still is).
         if lag_state.shape[-2] != lag_now.shape[-1]:
             return False
         if lag_state.shape[-1] != 1:
@@ -336,9 +294,7 @@ def covered(
     ):
         return False
 
-    # The kernels store qk straight into the conv pool and lag_now into the lag
-    # pool, and read the weight at the activation dtype, so no dtype conversion
-    # is modelled.
+    # No dtype conversion is modelled: qk goes straight into the conv pool.
     if conv_state.dtype != qk.dtype:
         return False
     if weight.dtype != qk.dtype or bias.dtype != qk.dtype:
@@ -367,11 +323,8 @@ def cca_conv1d_fn(
     total_padding: int,
     groups: int,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Return ``(qk_out, lag_prev)``, updating both pool slots in place.
-
-    ``qk_out`` is the conv output ``[T, C]`` and ``lag_prev`` the right-shifted
-    ``val_proj2`` value stream ``[T, D]``, both in the activation dtype;
-    ``lag_prev`` is ``None`` when the lag stream is switched off. Caller must have
+    """Return ``(qk_out [T, C], lag_prev [T, D])``, updating both pool slots in
+    place. ``lag_prev`` is ``None`` when the lag stream is off. Caller must have
     checked :func:`covered`.
     """
     num_tokens, num_channels = qk.shape
@@ -386,9 +339,8 @@ def cca_conv1d_fn(
         return qk_out, lag_prev
 
     if has_lag:
-        # val_proj2 reads the previous token. Inside a request that is a plain
-        # shift of the PROJECTED stream (128 wide, not the 4096-wide hidden
-        # state); the row at each request start is wrong here and is fixed next.
+        # val_proj2 reads the previous token: inside a request a plain shift.
+        # The row at each request start is wrong here and is fixed next.
         lag_prev[1:].copy_(lag_now[:-1])
 
         lag_dim = lag_now.shape[-1]

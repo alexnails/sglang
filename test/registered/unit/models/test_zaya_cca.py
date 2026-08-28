@@ -1,29 +1,15 @@
 """Numerical and state-cache correctness tests for the ZAYA1 CCA module.
 
-The CCA per-request conv-state cache must satisfy the following invariants,
-which are each exercised by a dedicated test case:
+Every path that consumes the per-request conv-state cache -- single-chunk
+extend, chunked prefill, decode, a resumed prefix, a batched mix of the two,
+and the TP=2 head split -- is pinned against a reference that processes the
+whole sequence at once. That equivalence is what fixes the *kind* of value
+parked at a chunk boundary (``conv[1]`` holds ``val_proj2 . hs``, not ``hs``),
+which no shape or dtype check would catch.
 
-1. A single-chunk extend forward (no prefix) is numerically equivalent to the
-   reference torch implementation that processes the whole sequence at once.
-2. Splitting a sequence into one prefill of ``S0`` tokens and ``S1`` single-
-   token decode steps produces the same q / k / v tensors as the equivalent
-   single-chunk run.
-3. A batched two-request decode for request 0 yields identical q / k / v to a
-   single-request decode of request 0 at the same step.
-4. Multi-request prefills update only the conv state and lag slots for each
-   request and leave unused slots zero.
-5. A simulated tensor-parallel (TP=2) CCA produces per-rank q / k / v slices
-   that match the corresponding head slices of a TP=1 reference, both for
-   prefill (``_forward_extend``) and for decode (``_forward_decode``).
-6. A prefill resumed from a cached prefix -- alone or batched alongside a fresh
-   request -- matches a single-chunk run, which is what pins the *kind* of value
-   parked at a chunk boundary (``conv[1]`` holds ``val_proj2 . hs``, not ``hs``).
-7. A biased checkpoint, where ``W . 0 != 0``, falls back to caching the raw
-   hidden state and is still numerically right.
-
-All tests run on CPU with a tiny configuration so they stay fast and have no
-GPU dependency. State is stored in a mock centralized pool that mirrors the
-``HybridReqToTokenPool`` / ``MambaPool`` interface used at serving time.
+CPU tests use a tiny configuration and a mock pool mirroring the
+``HybridReqToTokenPool`` / ``MambaPool`` interface. Tests marked
+``skipUnless(torch.cuda.is_available())`` cover the Triton kernels.
 """
 
 import os
@@ -43,12 +29,9 @@ register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 
 def _ensure_dist_initialized() -> None:
-    """Set up a minimal single-rank gloo distributed environment plus the
-    SGLang model-parallel groups (TP=1, PP=1, EP=1). The CCA module reads
-    ``get_tensor_model_parallel_rank()`` / ``get_tensor_model_parallel_world_size()``
-    inside ``__init__`` to size its head-parallel projections, so the world
-    group and model parallel groups must both be initialized before any CCA
-    construction.
+    """Minimal single-rank gloo environment plus the SGLang model-parallel
+    groups (TP=1, PP=1, EP=1). ``CCA.__init__`` reads the TP rank and world size
+    to size its head-parallel projections, so both must exist first.
     """
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29632")
@@ -71,23 +54,16 @@ def _ensure_dist_initialized() -> None:
         )
 
     if not model_parallel_is_initialized():
-        # WARNING, on a machine with a GPU: ``backend="gloo"`` does not keep this
-        # on the CPU. ``GroupCoordinator.__init__`` sets
-        # ``self.device = cuda:{local_rank}`` whenever ``is_cuda_alike()``, which
-        # is fixed at import from the platform and not from the backend argument,
-        # and ``init_model_parallel_group`` then defaults ``use_pynccl=True`` and
-        # ``use_custom_allreduce=_ENABLE_CUSTOM_ALL_REDUCE``. So this builds CUDA
-        # device communicators -- RCCL, custom-allreduce IPC -- over a gloo
-        # process group. On gfx950 that aborts the process, and because the abort
-        # is asynchronous it lands wherever the CPU thread happens to be.
+        # WARNING, on a machine with a GPU: ``backend="gloo"`` does not keep
+        # this on the CPU. ``GroupCoordinator.device`` is fixed at import from
+        # the platform, so this builds CUDA communicators (RCCL,
+        # custom-allreduce IPC) over a gloo process group, which aborts the
+        # process on gfx950 -- asynchronously, so it lands anywhere. Only call
+        # it from tests that genuinely need model-parallel state.
         #
-        # Only call this from tests that genuinely need model-parallel state
-        # (CCA reads the TP rank in __init__); most do not.
-        #
-        # Pass arguments as kwargs because ``ensure_model_parallel_initialized``
-        # forwards positional ``backend`` into the ``attention_data_parallel_size``
-        # slot of ``initialize_model_parallel``, which then explodes on
-        # ``int // str``. Using kwargs avoids that footgun.
+        # kwargs, because ``ensure_model_parallel_initialized`` forwards a
+        # positional ``backend`` into the ``attention_data_parallel_size`` slot
+        # and then explodes on ``int // str``.
         initialize_model_parallel(
             tensor_model_parallel_size=1,
             expert_model_parallel_size=1,
@@ -108,14 +84,12 @@ class _MockLayerCache:
 
 
 class _MockReqToTokenPool:
-    """Minimal stand-in for ``HybridReqToTokenPool`` providing the two methods
-    that CCA calls: ``mamba2_layer_cache`` and ``get_mamba_indices``.
+    """Minimal stand-in for ``HybridReqToTokenPool``: ``mamba2_layer_cache`` and
+    ``get_mamba_indices``, the two methods CCA calls.
 
-    For TP-aware tests, ``tp_size`` controls the per-rank ``in_out_ch`` of the
-    ``conv[0]`` state. ``conv[1]`` (the ``val_proj2`` lag) is replicated and
-    takes its width from ``ZayaConfig.cca_v2_state_dim`` -- the projected value
-    width when the checkpoint allows it, ``hidden_size`` otherwise -- exactly as
-    ``mamba2_cache_params`` sizes it at serving time.
+    ``tp_size`` controls the per-rank ``in_out_ch`` of ``conv[0]``. ``conv[1]``
+    (the ``val_proj2`` lag) is replicated and takes its width from
+    ``ZayaConfig.cca_v2_state_dim``, exactly as ``mamba2_cache_params`` sizes it.
     """
 
     def __init__(self, pool_size: int, cca_config, tp_size: int = 1):
@@ -151,12 +125,10 @@ class _MockReqToTokenPool:
 class _MockShortConvBackend:
     """Stand-in for ``ShortConvHybridAttnBackend`` in the CPU unit tests.
 
-    The CCA module reaches the conv-state plumbing via
-    ``get_attn_backend().conv_state_metadata(...)`` and runs its own conv
-    kernel. This mock exposes that accessor over a ``_MockReqToTokenPool``,
-    mirroring ``ShortConvAttnBackend``: the req -> slot mapping (and, for extend,
-    its host ``.tolist()`` mirror) is resolved once per step and shared across
-    all conv layers, while the decode path stays entirely on-device.
+    Exposes ``conv_state_metadata`` over a ``_MockReqToTokenPool``, mirroring
+    ``ShortConvAttnBackend``: the req -> slot mapping (and, for extend, its host
+    ``.tolist()`` mirror) is resolved once per step and shared across conv
+    layers, while decode stays entirely on-device.
     """
 
     def __init__(self, pool: "_MockReqToTokenPool"):
@@ -352,16 +324,11 @@ class TestZayaCCA(CustomTestCase):
     def test_chunked_prefill_across_request_boundary(self):
         """A resumed chunk must read the PROJECTED boundary value from its slot.
 
-        Two requests in one extend batch: request 0 resumes a cached prefix,
-        request 1 starts fresh. That is the mixed (non-``all_fresh``) path, where
-        the lag row preceding each request's first token comes from a different
-        place -- the pool slot for the resumed request, zero for the fresh one.
-
-        This is the case that fails silently if a chunk boundary parks the raw
-        hidden state while the read side expects the projected value: same shape,
-        same dtype, no error, just wrong ``v`` on every resumed token. Both
-        requests are compared against their own one-shot reference so a mix-up
-        between the two slots also shows up.
+        Two requests in one extend batch -- one resuming a cached prefix, one
+        fresh -- exercise the mixed path where the lag row preceding the first
+        token comes from the pool for one and from zero for the other. A boundary
+        that parks the raw hidden state gives the same shape, the same dtype, no
+        error, and wrong ``v`` on every resumed token.
         """
         cca, config = _make_tiny_cca(seed=31)
         cca_ref, _ = _make_tiny_cca(seed=31)
@@ -473,15 +440,11 @@ class TestZayaCCA(CustomTestCase):
     def test_folded_prefill_then_decode_matches_the_two_stage_reference(self):
         """End-to-end with the folded decode conv, including the bias column.
 
-        The other equivalence tests leave ``_decode_conv_folded`` False, so decode
-        runs the real two-stage ``conv_qk`` and never touches the folded weight.
-        This one folds the module under test and compares it against an UNFOLDED
-        reference, so one assertion covers the fold itself, the bias now riding in
-        a trailing weight column, and the state plumbing around them.
-
-        Without a GPU the window arrives from the unfused gather/concat, so this
-        exercises the ``F.pad`` arm that appends the constant-1.0 tap; the fused
-        arm gets it from ``cca_state_step`` and is pinned on GPU instead.
+        The other equivalence tests leave ``_decode_conv_folded`` False. This one
+        folds the module under test and compares it against an UNFOLDED
+        reference, covering the fold, the bias riding in a trailing weight column
+        and the state plumbing in one assertion. On CPU the window comes from the
+        unfused gather/concat, so this is the ``F.pad`` arm.
         """
         cca, config = _make_tiny_cca(seed=35)
         cca_ref, _ = _make_tiny_cca(seed=35)
@@ -548,12 +511,10 @@ class TestZayaCCA(CustomTestCase):
     def test_biased_projection_falls_back_to_the_raw_hidden_state_lag(self):
         """With a bias, ``W . 0 != 0``, so the projected cache is refused.
 
-        A freshly allocated slot is zero and the first token's ``val_proj2``
-        input is defined to be zero. Caching the projection only reproduces that
-        when there is no bias term; otherwise the zero slot would have to stand
-        for ``b``. The gate must therefore fall back to caching the raw hidden
-        state -- and the fallback must still be numerically right, which is what
-        the reference comparison here pins.
+        A fresh slot is zero and the first ``val_proj2`` input is defined to be
+        zero, which caching the projection reproduces only without a bias term.
+        The gate must fall back to the raw hidden state and still be numerically
+        right.
         """
         from sglang.srt.configs.zaya import ZayaConfig
 
@@ -769,11 +730,10 @@ class TestZayaCCA(CustomTestCase):
         self.assertTrue(torch.any(conv_state[2] != 0))
         self.assertTrue(torch.any(conv_state[5] != 0))
 
-        # conv[1] holds the PROJECTED boundary value ``val_proj2 . hs[-1]``, not
-        # the raw hidden state. Pinning the projected quantity is what catches a
-        # chunk boundary that parks the wrong tensor: the widths agree with the
-        # raw hidden state only by accident of a tiny config, and a mismatch
-        # there degrades resumed prefixes silently rather than raising.
+        # conv[1] holds the PROJECTED boundary value, not the raw hidden state.
+        # The widths agree with the raw hidden state only by accident of a tiny
+        # config, so pin the quantity: a mismatch degrades resumed prefixes
+        # silently rather than raising.
         self.assertTrue(cca.cache_projected_v2)
         self.assertEqual(lag_state.shape[-2], config.cca_v2_state_dim)
         with torch.no_grad():
@@ -797,13 +757,10 @@ class TestZayaCCA(CustomTestCase):
             self.assertTrue(torch.all(lag_state[idx] == 0))
 
     def test_mamba_indices_resolved_once_per_forward_step(self):
-        """The req -> MambaPool-slot mapping is identical for every CCA layer in
-        a step, so it (and its GPU->CPU ``.tolist()`` sync) must be resolved once
-        per forward step and shared across layers, not recomputed per layer.
-
-        Regression guard for the per-layer mamba-sync fix: two CCA layers driven
-        by a single ForwardBatch must trigger exactly one ``get_mamba_indices``
-        lookup and one host materialization for the whole step.
+        """Two CCA layers driven by one ForwardBatch must trigger exactly one
+        ``get_mamba_indices`` lookup and one host ``.tolist()`` sync. The mapping
+        is identical for every layer, so recomputing it per layer costs a
+        device->host sync per layer.
         """
 
         class _CountingPool(_MockReqToTokenPool):
@@ -893,16 +850,11 @@ class TestZayaCCA(CustomTestCase):
 class TestCCAStateStepKernel(CustomTestCase):
     """The fused decode state step must be bit-identical to the torch chain.
 
-    Derived property. ``cca_state_step`` re-derives the conv history shift
-    (``new[w] = old[w+1]``, last tap = this token) and the read-before-overwrite
-    ordering of the ``prev_hs`` gather/scatter, while mutating the pools in place.
-    An off-by-one in the shift, or writing the slot before reading it, corrupts
-    only the *next* step for that request -- which surfaces as gradual output
-    drift rather than an error, so pin exactness on both the returned tensors and
-    the mutated pools.
-
-    Requires a GPU (Triton); on CPU ``covered()`` selects the torch chain, which
-    the rest of this file already exercises.
+    ``cca_state_step`` re-derives the conv history shift (``new[w] = old[w+1]``,
+    last tap = this token) and the read-before-overwrite ordering of the lag
+    gather/scatter while mutating the pools in place. An off-by-one in the shift,
+    or writing the slot before reading it, corrupts only the *next* step for that
+    request, so pin exactness on both the returned tensors and the pools.
     """
 
     @unittest.skipUnless(torch.cuda.is_available(), "fused kernel requires a GPU")
@@ -911,12 +863,10 @@ class TestCCAStateStepKernel(CustomTestCase):
 
         dev = "cuda"
         torch.manual_seed(5)
-        # total_padding 3 exercises a shift longer than ZAYA1's 2, where an
-        # off-by-one in the history roll would otherwise be invisible.
-        # (600, 1100) spans several channel AND hidden tiles of the 2-D grid
-        # (BLOCK_C=256, BLOCK_H=512): with the small shapes alone every launch is
-        # a single tile per axis, so a wrong tile offset would never show up. 40
-        # tokens likewise puts more than one token behind each tile index.
+        # total_padding 3 is a shift longer than ZAYA1's 2, where an off-by-one
+        # in the history roll would otherwise be invisible. (600, 1100) spans
+        # several channel AND hidden tiles (BLOCK_C=256, BLOCK_H=512), so a wrong
+        # tile offset shows up; the small shapes are one tile per axis.
         shapes = ((64, 32, 2), (48, 16, 3), (600, 1100, 2))
         for num_channels, hidden_size, total_padding in shapes:
             for num_tokens in (1, 6, 40):
@@ -1059,15 +1009,11 @@ class TestCCAStateStepKernel(CustomTestCase):
 class TestCCAQKMixKernel(CustomTestCase):
     """The fused q/k head-mix kernel must match the torch chain it replaces.
 
-    Derived property. ``cca_qk_mix`` collapses ``_add_grouped_qk_means`` +
-    ``_normalize_qk`` into one kernel, re-deriving the GQA group indexing
-    (q head == g * gqa_groups + j), the 0.5 blend weights, the per-k-head
-    temperature and the two RMS normalizations from scratch. Any of those can be
-    subtly wrong -- a transposed group index or a temperature applied to q
-    instead of k still produces plausible tensors -- so pin the equivalence.
-
-    Requires a GPU (Triton); the CPU suite exercises the torch fallback instead,
-    which ``covered()`` selects when the folded scale vector is absent.
+    ``cca_qk_mix`` re-derives the GQA group indexing (q head ==
+    g * gqa_groups + j), the 0.5 blend weights, the per-k-head temperature and
+    the two RMS normalizations from scratch. A transposed group index or a
+    temperature applied to q instead of k still produces plausible tensors, so
+    pin the equivalence.
     """
 
     def _run(
@@ -1160,13 +1106,11 @@ class TestCCAQKMixKernel(CustomTestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "fused kernel requires a GPU")
     def test_matches_torch_chain_at_the_serving_shape(self):
-        """head_dim 128 and a decode-sized batch, i.e. the launch config in prod.
+        """head_dim 128 and a decode-sized batch, the launch config in prod.
 
-        The other case pins the algebra at head_dim 32, which fits one ROCm
-        wavefront twice over; 128 is what ZAYA1 actually runs and is the shape the
-        block size and warp count are chosen for, so any reduction that only
-        happens to be right at 32 lanes shows up here. 40 tokens puts several
-        programs on every CU instead of one.
+        The other case pins the algebra at head_dim 32, one ROCm wavefront twice
+        over; 128 is what the block size and warp count are chosen for, so a
+        reduction that only happens to be right at 32 lanes shows up here.
         """
         _ensure_dist_initialized()
         for num_tokens in (1, 40):
@@ -1199,21 +1143,15 @@ class TestCCAQKMixKernel(CustomTestCase):
 
 
 class TestCCAQKMixRope(CustomTestCase):
-    """The fused partial-rotary RoPE inside ``cca_qk_mix``.
-
-    ZAYA1 runs ``partial_rotary_factor=0.5`` with ``head_dim=128``, so the cos/sin
-    cache is ``[max_pos, 64]``. That is the exact shape the shared fused rope
-    path refuses (``rope_cache`` derives ``d_freq = cos_sin.shape[-1] // 2 == 32``
-    and asserts it equals ``d`` or ``d // 2``), which is why the rotation lives in
-    ``cca_qk_mix`` instead. This class pins that it computes the same thing as the
-    ``_normalize_qk`` -> ``rotary_emb`` chain it replaces.
+    """The fused partial-rotary RoPE inside ``cca_qk_mix`` must compute the same
+    function as the ``_normalize_qk`` -> ``rotary_emb`` chain it replaces.
 
     Not bit-identical, deliberately: the chain rounds q/k to bf16 before rotating
     and (on ROCm) reads a bf16 cos/sin cache, while the fused kernel keeps the
-    normalized head in fp32 across the rotation and rounds once at the store. The
-    bf16 comparison is therefore ``allclose`` at bf16 tolerance, and a separate
-    fp64 reference shows which side the difference falls on: the fused result must
-    be at least as close to exact as the chain.
+    normalized head in fp32 across the rotation and rounds once at the store. So
+    the bf16 comparison is ``allclose`` at bf16 tolerance, and a separate fp64
+    reference pins which side the difference falls on: the fused result must be
+    at least as close to exact as the chain.
     """
 
     @classmethod
@@ -1312,14 +1250,12 @@ class TestCCAQKMixRope(CustomTestCase):
         cca.head_dim = head_dim
         cca.sqrt_head_dim = head_dim**0.5
         cca.clamp_temp = False
-        # ON THE DEVICE, not on the host. ``_normalize_qk`` and the fp64
-        # reference read ``self.temp`` and multiply it into CUDA activations, so
-        # a host parameter is a device mismatch. Note which way this is fixed:
-        # the tensors go to CUDA, never the other way round. Only the two pure
-        # torch expression trees (``_add_grouped_qk_means`` / ``_normalize_qk``)
-        # are borrowed off this CPU-built module -- the module is never *called*,
-        # so no sglang fused op gets to resolve an aiter device kernel from the
-        # platform and run it over host pointers.
+        # ON THE DEVICE, not on the host: ``_normalize_qk`` and the fp64
+        # reference multiply ``self.temp`` into CUDA activations. The tensors go
+        # to CUDA, never the other way round -- only the two pure torch
+        # expression trees are borrowed off this CPU-built module, which is never
+        # itself called, so no fused op resolves a device kernel over host
+        # pointers.
         cca.temp = torch.nn.Parameter((torch.rand(num_k_heads) + 0.5).to(dev))
 
         rotary_emb = get_rope(
@@ -1365,12 +1301,9 @@ class TestCCAQKMixRope(CustomTestCase):
 
         rope = CCARope.of(rotary_dev, positions)
         self.assertIsNotNone(rope, "the plain RotaryEmbedding must be fusable")
-        # ``conv_qk.device`` (cuda:0), NOT ``torch.device("cuda")``: the index is
-        # part of a device's identity, so an un-indexed literal compares unequal
-        # to every real tensor's device. Production passes ``qk_out.device``, so
-        # this mirrors it -- and the assertion reports the gate that declined,
-        # because a bare False here would mean the test silently never exercised
-        # the fused path.
+        # ``conv_qk.device`` (cuda:0), NOT ``torch.device("cuda")``: the index
+        # is part of a device's identity. Assert on the reason, since a bare
+        # False would mean the test silently never took the fused path.
         reason = kernel.rope_decline_reason(
             rope.positions,
             rope.cos_sin_cache,
@@ -1398,32 +1331,20 @@ class TestCCAQKMixRope(CustomTestCase):
             rotary_dim=rope.rotary_dim,
         )
 
-        # bf16 equivalence with the chain. The elements are O(1) (RMS-normalized
-        # then scaled by sqrt(head_dim), so the per-element RMS is 1), and the
-        # chain rounds twice more than the fused path does, so the gap is a
-        # couple of bf16 ulps: 2 * 2^-8 ~= 8e-3 absolute.
-        # fp32 budget, derived rather than guessed: the RMS reduction splits into
-        # three partial sums instead of one tree (~sqrt(128)*2^-24 ~= 7e-7
-        # relative), Triton's ``tl.rsqrt`` may be the hardware approximate
-        # instruction (~2^-22 ~= 2.4e-7), and the rotation is three more fp32 ops
-        # whose absolute error is bounded by ~(|lo|+|hi|)*2^-24 on O(1) elements.
-        # That is ~2e-6; 1e-4 leaves two decades of headroom for whatever
-        # ``sgl_kernel.rotary_embedding`` does internally, and still shows the
-        # ~80x collapse from the bf16 case, which is the point of the fp32 run.
+        # Elements are O(1) (RMS-normalized, then scaled by sqrt(head_dim)) and
+        # the chain rounds twice more than the fused path, so bf16 is a couple of
+        # ulps: 2 * 2^-8 ~= 8e-3 absolute. The fp32 budget is derived, not
+        # guessed: a three-way split RMS reduction (~7e-7 relative), an
+        # approximate ``tl.rsqrt`` (~2.4e-7) and three more fp32 rotation ops
+        # come to ~2e-6, so 1e-4 leaves two decades of headroom.
         tol = 8e-3 if dtype is torch.bfloat16 else 1e-4
         torch.testing.assert_close(q_got, q_ref, rtol=tol, atol=tol)
         torch.testing.assert_close(k_got, k_ref, rtol=tol, atol=tol)
 
-        # Direction of the error: the fused path must be at least as close to the
-        # fp64 evaluation as the chain it replaces, because it carries the
-        # rotation in fp32 and rounds once instead of three times.
-        #
-        # bf16 only. That advantage exists precisely because the chain rounds to
-        # bf16 mid-rotation; at fp32 both paths carry full precision throughout
-        # and the residual difference is just rounding order (measured at ~4e-7
-        # between the two references), so "which is closer" is noise and
-        # asserting on it would be a flake. The fp32 run's claim is the tolerance
-        # check above.
+        # The fused path must be at least as close to the fp64 evaluation as
+        # the chain, since it carries the rotation in fp32 and rounds once.
+        # bf16 only: at fp32 both paths carry full precision and the residual
+        # difference is rounding order, so "which is closer" would be a flake.
         if dtype is not torch.bfloat16:
             return
         for got, ref, exact, name in (
@@ -1638,12 +1559,11 @@ class TestCCAQKMixRopeCoverage(CustomTestCase):
 class TestCCAQKMixKVStore(CustomTestCase):
     """The fused KV scatter must write exactly what ``set_kv_buffer`` would.
 
-    Correctness here is not self-announcing: a wrong slot, a wrong head stride or
-    a missed ``full_to_swa`` indirection does not crash, it corrupts KV and shows
-    up much later as degraded output. So this compares the pool contents against
-    a second, identical pool driven through the real ``set_kv_buffer`` -- on both
-    a sliding-window layer (where the write goes through ``full_to_swa`` into the
-    SWA sub-pool) and a full-attention layer (where it does not).
+    A wrong slot, a wrong head stride or a missed ``full_to_swa`` indirection
+    does not crash, it corrupts KV. So compare the pool contents against a
+    second, identical pool driven through the real ``set_kv_buffer``, on both a
+    sliding-window layer (the write goes through ``full_to_swa``) and a
+    full-attention one.
     """
 
     @classmethod
@@ -1754,12 +1674,10 @@ class TestCCAQKMixKVStore(CustomTestCase):
                 full_to_swa = mapping if is_sliding else None
                 k_cache = fused_pool.get_key_buffer(layer_id)
                 v_cache = fused_pool.get_value_buffer(layer_id)
-                # ``conv_qk.device`` (cuda:0), NOT ``torch.device("cuda")``: the
-                # index is part of a device's identity, so an un-indexed literal
-                # compares unequal to every real tensor's device and the gate
-                # declines. Production passes ``qk_out.device``. Assert on the
-                # reason, not a bare bool -- a silent decline here would mean the
-                # pool comparison below never saw the fused write at all.
+                # ``conv_qk.device`` (cuda:0), NOT ``torch.device("cuda")``;
+                # see the same note in TestCCAQKMixRope. Assert on the reason:
+                # a silent decline means the pool comparison below never saw
+                # the fused write at all.
                 reason = kernel.store_decline_reason(
                     value,
                     k_cache,
@@ -1890,10 +1808,8 @@ class TestCCAQKMixStoreCoverage(CustomTestCase):
     """``store_covered`` negatives.
 
     A rejected input costs one extra ``set_kv_buffer`` launch; an input that
-    should have been rejected corrupts KV silently. So the gate is the part that
-    matters, and it is written to be checkable without a GPU: the device test is
-    an explicit equality against the caller's device rather than ``is_cuda``, so
-    every branch can be exercised on CPU tensors.
+    should have been rejected corrupts KV silently. The gate compares against an
+    explicit caller device rather than ``is_cuda``, so every branch runs on CPU.
     """
 
     @staticmethod
@@ -2003,14 +1919,11 @@ class TestCCAQKMixStoreCoverage(CustomTestCase):
         )
 
     def test_an_unindexed_reference_device_still_matches(self):
-        # Regression. ``torch.device("cuda") != torch.device("cuda:0")`` -- the
-        # index is part of the identity -- while every tensor reports an indexed
-        # device. A caller that writes the reference device by hand instead of
-        # reading it off a tensor used to fail every check, and because this gate
-        # declines by FALLING BACK, that showed up as "the fusion is silently
-        # off", not as an error. An un-indexed reference means "any device of
-        # this type", so it must match. Pinned on CPU, where the same asymmetry
-        # does not exist (cpu has no index), by driving the helper directly.
+        # Regression. ``torch.device("cuda") != torch.device("cuda:0")``, so a
+        # caller writing the reference device by hand used to fail every check --
+        # and since this gate declines by FALLING BACK, that read as "the fusion
+        # is silently off", not as an error. An un-indexed reference means "any
+        # device of this type" and must match.
         from sglang.kernels.ops.attention import cca_qk_mix as kernel
 
         t = torch.zeros(2)
@@ -2128,9 +2041,8 @@ class TestZayaAttentionKVStoreGate(CustomTestCase):
     """``ZayaAttention._kv_store`` must decline every pool it cannot address.
 
     The resolver is pure Python over the live pool objects, so its rejects are
-    checkable on CPU with stand-ins: an unrecognized pool type is refused before
-    any tensor is touched, which is the branch that keeps an unfamiliar layout
-    from reaching the kernel.
+    checkable on CPU with stand-ins. An unrecognized pool type is refused before
+    any tensor is touched.
     """
 
     @classmethod
@@ -2203,13 +2115,12 @@ class TestZayaAttentionKVStoreGate(CustomTestCase):
 class TestCCADecodeConvFold(CustomTestCase):
     """``CCA.fold_decode_conv`` must reproduce the two-stage conv exactly.
 
-    Derived property. At decode the window is ``[T, C, total_padding + 1]`` and
-    only one output timestep is needed, so conv_qk[0] (depthwise, k=cca_time0)
-    composed with conv_qk[1] (grouped, k=cca_time1) collapses to a single grouped
-    matmul whose weight is precomputable. The tap-index bookkeeping
+    At decode only one output timestep is needed, so conv_qk[0] composed with
+    conv_qk[1] collapses to a single grouped matmul whose weight is
+    precomputable. The tap-index bookkeeping
     (``A[..., j+k] += w1[..., j] * w0[..., k]``) and the depthwise bias
-    pass-through are easy to get subtly wrong -- off-by-one in the tap offset
-    still produces plausible-looking output -- so pin the identity directly.
+    pass-through are easy to get subtly wrong -- an off-by-one in the tap offset
+    still produces plausible output -- so pin the identity directly.
     """
 
     @classmethod
@@ -2258,15 +2169,11 @@ class TestCCADecodeConvFold(CustomTestCase):
         torch.testing.assert_close(got_widened, got, rtol=0, atol=0)
 
     def test_folded_weight_carries_the_bias_column(self):
-        """The bias rides in the weight so the separate add can go.
-
-        ``_cca_decode_conv`` used to do ``einsum(...) + decode_conv_bias``, one
-        launch per attention layer -- 60 per decode step on ZAYA1-74B. Folding
-        the bias into a trailing weight column, activated by a constant-1.0 tap
-        the window kernel writes for free, puts it inside the matmul's fp32
-        accumulator instead. Pin both halves: the column holds the bias on the
-        last input channel, and zero on every other, so each output picks it up
-        exactly once.
+        """The bias rides in a trailing weight column, activated by a
+        constant-1.0 tap, so it lands in the matmul's fp32 accumulator instead of
+        a separate add. Pin both halves: the column holds the bias on the last
+        input channel and zero on every other, so each output picks it up exactly
+        once.
         """
         cca, _ = _make_tiny_cca(seed=9)
         cca.fold_decode_conv()
@@ -2298,11 +2205,11 @@ class TestCCADecodeConvFold(CustomTestCase):
             self._check(cca, T=2)
 
     def test_unfolded_cca_does_not_use_the_zero_buffers(self):
-        # Regression guard. The folded buffers are zero-initialized and only
-        # valid after fold_decode_conv() runs against loaded weights. A forward
-        # that consumed them unconditionally emitted bias-only garbage with no
-        # error -- silent wrongness for any path that populates weights without
-        # going through ZayaForCausalLM.load_weights.
+        # The folded buffers are zero-initialized and only valid after
+        # fold_decode_conv() has run against loaded weights, so the flag that
+        # gates them must start False. NOTE: this asserts the flag only -- it
+        # runs no forward, so it does not cover the bias-only output a forward
+        # that consumed the zero buffers would produce.
         cca, _ = _make_tiny_cca(seed=6)
         self.assertFalse(cca._decode_conv_folded)
         cca.fold_decode_conv()
@@ -2325,15 +2232,11 @@ class TestCCADecodeConvFold(CustomTestCase):
 class TestShortConvPaddingSlotClamp(CustomTestCase):
     """``ShortConvAttnBackend`` must clamp the -1 batch-padding sentinel.
 
-    Regression guard. Batch padding poisons unused rows' mamba slot ids to -1
-    (``MambaAttnBackendBase._forward_metadata``); DP attention hits this on every
-    step where a replica's batch is padded. CCA feeds the shared index view
-    straight into ``index_select`` / ``index_copy_``, and a negative index there
-    is an out-of-bounds device gather -- on ROCm it aborts the queue with
-    HSA_STATUS_ERROR_EXCEPTION 0x1016 instead of raising, which crashed ZAYA1 at
-    attn_tp > 1 under DP attention. Clamping to 0 is safe because
-    ``MambaSlotAllocator`` reserves slot 0 (it hands out 1..size), so padded rows
-    land on a scratch slot they cannot corrupt.
+    Batch padding poisons unused rows' mamba slot ids to -1, and CCA feeds the
+    shared index view straight into ``index_select`` / ``index_copy_``. A
+    negative index there is an out-of-bounds device gather, which on ROCm aborts
+    the queue with HSA_STATUS_ERROR_EXCEPTION 0x1016 instead of raising. Clamping
+    to 0 is safe because ``MambaSlotAllocator`` reserves slot 0.
     """
 
     @staticmethod
@@ -2513,12 +2416,11 @@ def _query_start_loc(extend_seq_lens):
 class TestShortConvTrackIndices(CustomTestCase):
     """``_init_track_conv_indices``: where the extend snapshot reads from.
 
-    The radix tree is handed a state checkpoint keyed on
-    ``mamba_last_track_seqlen = prefix + floor(extend_len / chunk) * chunk``,
-    NOT on the end of the extend. For a conv, the state at length L is exactly
-    the last ``window`` input rows ending at L, so the snapshot is a gather at
-    flattened positions ``[qsl_i + aligned - window, qsl_i + aligned)``. Get
-    this wrong by one and every prefix hit resumes from a shifted conv window.
+    The checkpoint is keyed on ``mamba_last_track_seqlen = prefix +
+    floor(extend_len / chunk) * chunk``, NOT on the end of the extend, and a
+    conv's state at length L is its last ``window`` input rows ending at L. So
+    the gather is at ``[qsl_i + aligned - window, qsl_i + aligned)``; off by one
+    and every prefix hit resumes from a shifted window.
     """
 
     def _indices(self, harness, forward_batch, extend_seq_lens):
@@ -2941,18 +2843,12 @@ class TestShortConvTrackDecode(CustomTestCase):
 class TestShortConvTrackWidthContract(CustomTestCase):
     """The snapshot must cache exactly what the conv state holds.
 
-    Regression guard for a real integration break. ``conv[1]`` was narrowed from
-    ``hidden_size`` to ``cca_v2_state_dim`` when CCA started caching the
-    PROJECTED ``val_proj2`` value instead of the raw hidden state; the extend
-    snapshot kept handing ``hidden_states`` and blew up on the first prefill
-    with ``value tensor of shape [4096, 1] cannot be broadcast to indexing
-    result of shape [1, 128, 1]``. Wrong width AND wrong quantity: even had the
-    widths matched, a prefix restore would have reloaded a value the decode path
-    never writes.
-
-    What pins it now is that the model hands the backend the state VIEW it wrote
-    through, and the backend checks that view against the input it is told to
-    gather from.
+    ``conv[1]`` holds the PROJECTED ``val_proj2`` value, not the raw hidden
+    state, so an extend snapshot handing ``hidden_states`` is both the wrong
+    width and the wrong quantity -- and had the widths matched, a prefix restore
+    would reload a value the decode path never writes. What pins it is that the
+    model hands the backend the state VIEW it wrote through, and the backend
+    checks that view against the input it gathers from.
     """
 
     @classmethod
@@ -3417,14 +3313,11 @@ class TestShortConvTrackStateGuards(CustomTestCase):
 class TestShortConvCacheChunkSize(CustomTestCase):
     """``mamba_cache_chunk_size`` must not be the model's scan length.
 
-    Two different quantities share the word "chunk".
-    ``hf_config.mamba_chunk_size`` is the SSM chunk-scan length; ZAYA1 and LFM2
-    honestly report ``1`` because they have no chunked recurrence at all.
-    ``ServerArgs.mamba_cache_chunk_size`` is the radix caching-point
-    granularity -- how often a prefill checkpoints state and at what boundary a
-    cached prefix may be trimmed. Taking the first as the second gave a
-    granularity of 1, which is below ZAYA1's conv window and made
-    ``ShortConvAttnBackend`` refuse to start.
+    ``hf_config.mamba_chunk_size`` is the SSM chunk-scan length, reported as
+    ``1`` by models with no chunked recurrence; ``ServerArgs.
+    mamba_cache_chunk_size`` is the radix caching-point granularity. Taking the
+    first as the second gives a granularity of 1, below ZAYA1's conv window,
+    which makes ``ShortConvAttnBackend`` refuse to start.
     """
 
     @staticmethod
@@ -3780,14 +3673,12 @@ class TestZayaSlidingWindowAttention(CustomTestCase):
         self.assertFalse(is_hybrid_swa_model(["ZayaForCausalLM"], base))
 
     def test_moe_layers_are_excluded_from_both_kv_layer_lists(self):
-        # Regression guard. ZAYA1 alternates attention (even) and MoE (odd) layers,
-        # and the MoE layers hold no KV at all. get_hybrid_layer_ids derives
-        # swa_attention_layer_ids from `pattern == 1` and full_attention_layer_ids
-        # from `pattern == 0`, and those lists SIZE the SWA sub-pools rather than
-        # merely indexing them -- so reporting MoE layers as 0 made the full
-        # sub-pool 90 layers wide instead of 30 on the 74B, tripling its per-token
-        # cost (23039 vs 7680 bytes/token of K) and turning hybrid-SWA into a
-        # capacity regression. MoE layers must therefore be in NEITHER list.
+        # ZAYA1's odd layers are MoE and hold no KV. get_hybrid_layer_ids
+        # derives swa_attention_layer_ids from `pattern == 1` and
+        # full_attention_layer_ids from `pattern == 0`, and those lists SIZE the
+        # sub-pools rather than merely indexing them: reporting MoE layers as 0
+        # made the full sub-pool 90 layers wide instead of 30 on the 74B. They
+        # must be in NEITHER list.
         from sglang.srt.configs.model_config import get_hybrid_layer_ids
 
         config = _make_swa_config(
@@ -3808,13 +3699,9 @@ class TestZayaSlidingWindowAttention(CustomTestCase):
 
 
 class TestZayaCCATensorParallel(CustomTestCase):
-    """Head-parallel TP equivalence:
-
-    For each TP rank, the CCA's q / k / v output must equal the head slice of
-    the TP=1 reference's output that corresponds to that rank's heads. This
-    verifies that the grouped-mean step and ``conv_qk.1`` (groups = num_q_heads
-    + num_k_heads) are correctly partitioned across heads with no cross-rank
-    leakage.
+    """Head-parallel TP equivalence: each rank's q / k / v must equal the head
+    slice of the TP=1 reference for that rank's heads, so the grouped-mean step
+    and ``conv_qk.1`` partition across heads with no cross-rank leakage.
     """
 
     TP_SIZE = 2
@@ -3824,11 +3711,9 @@ class TestZayaCCATensorParallel(CustomTestCase):
         _ensure_dist_initialized()
 
     def _slice_full_state_dict_into_rank(self, ref_cca, tp_cca, tp_rank: int):
-        """Copy the reference's full weights into the per-rank CCA, using the
-        per-parameter ``weight_loader`` that the CCA installs on its own
-        parameters during ``__init__``. This mirrors what
-        ``ZayaForCausalLM.load_weights`` does at serving time and is the
-        only way TP correctness is exercised end-to-end.
+        """Copy the reference's full weights into the per-rank CCA through the
+        per-parameter ``weight_loader`` the CCA installs in ``__init__``,
+        mirroring what ``ZayaForCausalLM.load_weights`` does at serving time.
         """
         ref_state = dict(ref_cca.state_dict())
         from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -4039,12 +3924,10 @@ class TestZayaCCATensorParallel(CustomTestCase):
     def test_tp2_lag_stream_only_exists_on_the_val_proj2_rank(self):
         """At attn_tp == 2 with two K heads, only rank 1 reads ``val_proj2``.
 
-        The HF layout gives rank 0 its V heads entirely from ``val_proj1``, so it
-        needs no lag at all: no projection, no pool read, no pool write. Rank 1
-        needs the whole of ``val_proj2``'s output. Pinning both halves matters
-        because the write side and the read side derive the range separately --
-        if they disagree, rank 1 reads a slot nothing filled (silently zero) or
-        rank 0 pays a GEMM it never uses.
+        Rank 0 takes its V heads entirely from ``val_proj1`` and needs no lag at
+        all. Pin both halves: the write side and the read side derive the range
+        separately, and if they disagree rank 1 reads a slot nothing filled
+        (silently zero) or rank 0 pays a GEMM it never uses.
         """
         ref_cca, cfg = _make_tiny_cca(seed=24, tp_rank=0, tp_size=1)
         S = 4
@@ -4148,12 +4031,10 @@ def _dp_layout(sizes: List[int], rank: int, is_max_len: bool):
 class TestZayaGlobalResidualLayout(CustomTestCase):
     """Row arithmetic for the global-residual DP dataflow.
 
-    On that dataflow the residual stream lives in the global DP layout and each
-    attention layer slices its own rows back out of it, so the CPU offsets in
-    ``GlobalResidualLayout`` and the device-side offsets that ``dp_gather_partial``
-    writes at (``get_dp_local_info``, a cumsum over ``global_num_tokens_gpu``) must
-    describe the same rows. Nothing at runtime cross-checks them: if they drift,
-    attention silently reads another replica's tokens.
+    The CPU offsets in ``GlobalResidualLayout`` and the device-side offsets
+    ``dp_gather_partial`` writes at (``get_dp_local_info``) must describe the same
+    rows. Nothing at runtime cross-checks them: if they drift, attention silently
+    reads another replica's tokens.
     """
 
     def _layout(self, sizes: List[int], rank: int, is_max_len: bool):
@@ -4236,10 +4117,12 @@ class TestZayaGlobalResidualLayout(CustomTestCase):
         self.assertEqual(view.data_ptr(), hidden[3].data_ptr())
 
     def test_disabled_by_default_without_touching_parallel_state(self):
-        """Flag off must yield the DP-local dataflow, and decide that first.
+        """No global layout when the expert reduce does not span DP replicas.
 
-        The env check has to short-circuit ahead of the parallel-layout probe, or
-        merely importing the model on a machine with no runtime context breaks.
+        NOTE: this does not exercise the env flag, which defaults to True --
+        ``global_residual_layout`` returns None here because
+        ``dp_gather_required()`` is false for this fixture. The claim that the
+        env check short-circuits ahead of the parallel-layout probe is untested.
         """
         from sglang.srt.models import zaya
 
@@ -4250,12 +4133,11 @@ class TestZayaGlobalResidualLayout(CustomTestCase):
 class TestZayaPartialGatherFoldsTheAttnReduce(CustomTestCase):
     """The algebra that lets one collective replace two.
 
-    The global-residual dataflow drops ``attn_tp_all_reduce`` from the attention
-    layer and gathers the *unreduced* o_proj partials instead: every attention-TP
-    rank of a replica memcpys its partial into the same slot of the global buffer,
-    so the all-reduce that gathers across replicas also sums within them. These
-    cases pin that equivalence, and the failure mode of getting it wrong (using the
-    replicate gather, which takes rank 0's rows and discards the rest).
+    The global-residual dataflow gathers the *unreduced* o_proj partials instead
+    of running ``attn_tp_all_reduce``: every attention-TP rank memcpys its
+    partial into the same slot, so the cross-replica all-reduce also sums within
+    each replica. Pins that equivalence and the failure mode of using the
+    replicate gather, which keeps rank 0's rows and discards the rest.
     """
 
     HIDDEN = 4
@@ -4327,15 +4209,13 @@ class TestZayaPartialGatherFoldsTheAttnReduce(CustomTestCase):
 
 
 class TestDpGatherStagingFusion(CustomTestCase):
-    """The two launches per sum_len partial gather that C1 removes.
+    """The two launches per sum_len partial gather that the staging fusion drops.
 
-    ``_dp_gather_via_all_reduce`` used to issue four launches: ``fill_(0)``, a
-    memcpy of this rank's rows into its slot, the all-reduce, and a copy of the
-    (out-of-place) all-reduce result back into the caller's buffer. The fill now
-    folds into the memcpy, and the copy-back is skipped by callers that take the
-    returned tensor. Both are meant to be *exactly* the old behaviour, so pin the
-    fused kernel against ``fill_(0) + memcpy`` and pin what the gather returns
-    for an out-of-place and an in-place collective.
+    The ``fill_(0)`` folds into the memcpy, and the copy-back out of the
+    out-of-place all-reduce is skipped by callers that take the returned tensor.
+    Both are meant to be *exactly* the old behaviour, so pin the fused kernel
+    against ``fill_(0) + memcpy`` and pin what the gather returns for an
+    out-of-place and an in-place collective.
     """
 
     @staticmethod
@@ -4579,9 +4459,9 @@ class TestCCAFusedPrefillConv(CustomTestCase):
     """Fused varlen prefill conv vs the per-request torch reference.
 
     The fused kernel resolves each token's request, start offset, pool slot and
-    prefix flag from device tensors instead of a host loop. Every one of those is a
-    silent-corruption path: a token attributed to the wrong request reads another
-    request's conv history, and nothing downstream notices.
+    prefix flag from device tensors instead of a host loop. A token attributed to
+    the wrong request reads another request's conv history, and nothing
+    downstream notices.
     """
 
     GROUPS = 3
@@ -4727,18 +4607,13 @@ class TestCCAFusedPrefillConv(CustomTestCase):
     def test_chunked_prefill_boundary_carries_the_projected_value(self):
         """Two chunks of one request must equal a single chunk over both.
 
-        The fused path's chunk boundary lives in ``_boundary_state_kernel``: it
-        parks the chunk's last lag row in the pool slot and, next chunk, reads it
-        back as the row preceding the first token. That row is the PROJECTED
-        val_proj2 value; if the boundary ever carried the raw hidden state
-        instead, the resumed tokens would read a wrong v2 with no shape or dtype
-        error -- the output would just get worse.
-
-        Splitting a request and comparing against the unsplit run pins the carry
-        in both directions (what is written, and what is read back), which the
-        single-shot ``test_resumed_prefix_reads_carried_state`` case cannot: it
-        seeds the slot with random values rather than with the kernel's own
-        output.
+        ``_boundary_state_kernel`` parks the chunk's last lag row in the pool slot
+        and reads it back next chunk as the row preceding the first token. That
+        row is the PROJECTED val_proj2 value; the raw hidden state there is wrong
+        with no shape or dtype error. Splitting and comparing against the unsplit
+        run pins the carry in both directions, which the single-shot
+        ``test_resumed_prefix_reads_carried_state`` cannot: it seeds the slot with
+        random values rather than the kernel's own output.
         """
         from sglang.kernels.ops.attention import cca_conv1d
 
@@ -4942,15 +4817,11 @@ class TestZayaMoDReachability(CustomTestCase):
     """``ZayaRouter.fold_mod_reachability`` decides whether MOD is live.
 
     ``balancing_biases`` is added to a *softmax probability*, not a logit, so the
-    skip slot's score is bounded above by ``1 + b_skip`` while every real expert's
-    is at least ``b_j``. When ``1 + b_skip < max_j b_j`` the skip slot is strictly
-    below the best real slot for every possible input and no tie-breaking rule can
-    pick it -- so the two MOD kernels per MoE layer are dead work.
-
-    ZAYA1-74B ships ``b_skip = -1.0`` on all 60 MoE layers, so this decides the
-    real checkpoint. Pinned because the branch is a silent 120-launch-per-step
-    cost when it is wrong in one direction, and silently wrong OUTPUT when it is
-    wrong in the other.
+    skip slot's score is bounded above by ``1 + b_skip`` while every real
+    expert's is at least ``b_j``. When ``1 + b_skip < max_j b_j`` no tie-breaking
+    rule can pick the skip slot and the MOD path is dead work. Wrong in one
+    direction it is silent extra launches; wrong in the other, silently wrong
+    output.
     """
 
     def _router(self, *, use_mod=True):

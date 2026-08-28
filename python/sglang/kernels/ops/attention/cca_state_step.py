@@ -15,50 +15,32 @@ step's ``val_proj2`` value, and shifts both pool slots in place -- reading each
 slot before overwriting it, so the gather/scatter pair on the same row is safe
 within one program.
 
-The ``lag`` stream is the one-token ``val_proj2`` lag: ``lag_now`` is the
-*projected* value ``W_v2 . hs`` (``latent_k_dim / 2`` wide), not the raw hidden
-state, so the pool traffic here is 32x smaller than the hidden width on
-ZAYA1-74B. Passing ``lag_now`` / ``lag_state`` as ``None`` compiles the stream
-out entirely (``HAS_LAG``) *and* drops its tiles from the grid, which is what a
-rank whose K heads all come from ``val_proj1`` wants -- it never reads the lag.
+``lag_now`` is the *projected* ``val_proj2`` value (``latent_k_dim / 2`` wide),
+not the raw hidden state. Passing ``lag_now`` / ``lag_state`` as ``None``
+compiles the stream out (``HAS_LAG``) and drops its tiles from the grid, which is
+what a rank whose K heads all come from ``val_proj1`` wants.
 
-``ones_column`` appends a constant-1.0 tap to the emitted window. It costs one
-extra store on a window the kernel is already writing, and it lets the caller
-fold the conv bias into the matmul's weight (see ``CCA.fold_decode_conv``) so
-the separate bias add -- one launch per attention layer, 60 per decode step on
-ZAYA1-74B -- disappears. The bias then lands in the matmul's fp32 accumulator
-instead of being added after the output has already been rounded to bf16, so the
-result is *more* accurate than the two-step form, not merely equal to it.
+``ones_column`` appends a constant-1.0 tap to the emitted window, which lets the
+caller fold the conv bias into the matmul's weight (see ``CCA.fold_decode_conv``)
+and drop the separate bias add. The bias then lands in the matmul's fp32
+accumulator rather than being added after the output was rounded to bf16.
 
-The grid is ``(T, n_channel_tiles + n_lag_tiles)``: the second axis indexes one
-flat tile space where the low ``n_channel_tiles`` entries do the conv window and
-history shift for their slice of ``C``, and the rest do the lag
-read-then-overwrite for their slice of ``D``. Tiling that second axis rather
-than looping it inside one program is what makes the kernel fill the GPU at
-decode batch sizes: at 32 tokens a ``grid=(T,)`` launch is 32 programs on a
-256-CU MI355X, each serially walking 5 channel tiles and 8 lag tiles, so the
-tiles that could run concurrently instead queue behind each other.
+The grid is ``(T, n_channel_tiles + n_lag_tiles)``: one flat tile axis where the
+low ``n_channel_tiles`` entries do the conv window and history shift for their
+slice of ``C`` and the rest do the lag read-then-overwrite for their slice of
+``D``. Tiling that axis rather than looping it inside one program is what fills
+the GPU at decode batch sizes. It never puts two programs on the same
+``(slot, column)`` -- within a token the tiles partition ``C`` and ``D``
+disjointly, so the read-before-write ordering stays inside one program. Slot ids
+must therefore be distinct, apart from the negative padding ids, which touch
+nothing; that contract is unchanged from the ``grid=(T,)`` form.
 
-The split is safe because it never puts two programs on the same
-``(slot, column)``: within a token the tiles partition ``C`` and ``D``
-disjointly, so the "read the old value before storing the new one" ordering that
-the shift and the lag swap rely on stays *inside* one program, exactly as it did
-with the inner loops. Two tokens sharing one positive slot id would alias -- but
-they did under ``grid=(T,)`` too (two programs, same rows, no ordering between
-them), so the contract is unchanged: slot ids must be distinct, apart from the
-negative padding ids, which touch nothing.
-
-The grouped matmul itself is deliberately left outside: it is a batched
-``[Cg, Cg*W] x [Cg*W]`` per group, which cuBLAS/rocBLAS-backed einsum already
-runs near bandwidth. Folding it in here was tried and measured a LOSS (TPOT
-+2.4% at C=32 on MI355X), so do not re-fold it without a measurement; the
-launches removed here are pure data movement.
+The grouped matmul is deliberately left outside: folding it in measured a LOSS
+(TPOT +2.4% at C=32 on MI355X), so do not re-fold it without a measurement.
 
 Follows ``kda_fused_decode``'s structure -- a ``covered()`` predicate gates
-supported inputs and the caller falls back to the unfused chain -- and, like it,
-handles the negative slot ids that batch padding writes (those rows read and
-write nothing; their outputs are discarded by the caller). Written in Triton so
-it runs on ROCm, ZAYA1's reference deployment.
+supported inputs and the caller falls back to the unfused chain. Triton, so it
+runs on ROCm.
 """
 
 from __future__ import annotations
@@ -165,15 +147,11 @@ def covered(
 ) -> bool:
     """Whether the fused state step can serve these inputs.
 
-    Requires everything on one accelerator, matching dtypes between each pool and
-    the value written into it, a unit innermost stride on the pool views, and at
-    least two taps (``total_padding >= 1``) so the shift is well defined.
-
     ``lag_now`` / ``lag_state`` must be both present or both ``None`` -- the
     latter compiles the lag stream out for a rank that never reads it. A
-    half-specified pair is rejected rather than guessed at, because guessing
-    wrong means either a skipped pool write (stale lag next step) or a write of
-    the wrong width.
+    half-specified pair is rejected rather than guessed at, since guessing wrong
+    means a skipped pool write (stale lag next step) or a write of the wrong
+    width.
     """
     if slots is None or total_padding < 1:
         return False
@@ -255,10 +233,8 @@ def cca_state_step(
     if num_tokens == 0:
         return window, lag_prev
 
-    # One flat tile axis: [0, nc_tiles) walk the channels, the rest walk the lag
-    # dim. Tiling both instead of looping them inside one program is what gets
-    # the launch off 32 programs at decode batch sizes; see the module docstring
-    # for why no two programs can then share a (slot, column).
+    # One flat tile axis: [0, nc_tiles) walk the channels, the rest the lag dim.
+    # See the module docstring for why no two programs share a (slot, column).
     block_c, block_d = 256, 512
     nc_tiles = triton.cdiv(num_channels, block_c)
     nd_tiles = triton.cdiv(lag_dim, block_d) if has_lag else 0

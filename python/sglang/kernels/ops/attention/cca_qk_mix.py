@@ -1,4 +1,4 @@
-"""Fused ZAYA1 CCA q/k head-mix + normalize (+ partial-rotary RoPE).
+"""Fused ZAYA1 CCA q/k head-mix + normalize (+ partial-rotary RoPE, + KV store).
 
 One kernel replaces the ~26-launch elementwise tail of the CCA projection --
 ``_add_grouped_qk_means`` followed by ``_normalize_qk`` in
@@ -8,82 +8,49 @@ One kernel replaces the ~26-launch elementwise tail of the CCA projection --
     k_out[g]   = rms(conv_k[g]   + 0.5*mean_j(pre_q[g,j]) + 0.5*base_k[g])  * sqrt_hd * temp[g]
 
 where ``rms(x) = x * rsqrt(sum(x^2) + eps)`` over the head dim and ``g`` indexes
-GQA groups (one k head per group, ``gqa_groups`` q heads inside it). The blend
-and the two normalizations are separate torch expression trees today, each
-materializing fp32 temporaries of the full q tensor; every intermediate here
-stays in registers and only the two results are written.
+GQA groups (one k head per group, ``gqa_groups`` q heads inside it).
 
 One program per ``(token, k head)``, holding the whole group as a ``[G, HD]``
-tile. The ``G`` q-head RMS sums then reduce together along ``axis=1`` instead of
-one serial ``tl.sum`` per head, and ``mean_j(pre_q)`` for the k blend is a
-reduction along ``axis=0`` of that same tile rather than a separate running
-accumulator -- so ``pre_q`` is read once and the group's ``G + 1`` reductions
-collapse to two.
+tile: the ``G`` q-head RMS sums reduce together along ``axis=1`` and
+``mean_j(pre_q)`` along ``axis=0`` of that same tile, so ``pre_q`` is read once
+and the group's ``G + 1`` reductions collapse to two.
 
 Rotary
 ------
-``ROT_D > 0`` folds the neox partial-rotary RoPE in as well, removing the
-separate ``sgl_kernel.rotary_embedding`` launch that ran immediately after this
-kernel (one per attention layer, 60 per decode step on ZAYA1-74B). The head is
-already in registers, so the rotation is free arithmetic on values that would
-otherwise be stored, re-read and stored again.
+``ROT_D > 0`` folds the neox partial rotary in, removing the separate
+``sgl_kernel.rotary_embedding`` launch. The shared fused rope path
+(``fused_qk_rope_reshape_and_cache``) cannot serve ZAYA1: it asserts
+``d_freq in (d // 2, d)``, and ``partial_rotary_factor=0.5`` gives ``d_freq ==
+32`` against ``head_dim=128`` -- that kernel has no partial-rotary mode.
 
-The shared fused rope path (``models/utils.create_fused_set_kv_buffer_arg`` ->
-``fused_qk_rope_reshape_and_cache``) cannot serve ZAYA1: it derives
-``d_freq = cos_sin.shape[-1] // 2`` and asserts ``d_freq in (d // 2, d)``. With
-``partial_rotary_factor=0.5`` the cache is ``[max_pos, 64]`` against
-``head_dim=128``, so ``d_freq == 32`` and the assert fires -- that kernel has no
-partial-rotary mode. Hence the rotation lives here instead.
-
-Under ``ROT_D`` the head is loaded as three register tiles rather than one:
-``lo = d[0:ROT_D/2]``, ``hi = d[ROT_D/2:ROT_D]`` and ``pass = d[ROT_D:HD]``.
-Splitting on load is what makes the neox rotation
-
-    lo' = lo*cos - hi*sin        hi' = hi*cos + lo*sin
-
-pure lane-local arithmetic: ``lo`` and ``hi`` sit in the *same* lane of two
-different tiles, so no cross-lane shuffle (``tl.flip`` / ``tl.reshape``, as
-``rope_cache._get_neox_rotated_x`` needs) is required. Each element is still
-loaded exactly once; only the address arithmetic is split.
+The head is loaded as three register tiles -- ``lo = d[0:ROT_D/2]``,
+``hi = d[ROT_D/2:ROT_D]``, ``pass = d[ROT_D:HD]`` -- so ``lo`` and ``hi`` sit in
+the *same* lane and the neox rotation ``lo' = lo*cos - hi*sin`` /
+``hi' = hi*cos + lo*sin`` needs no cross-lane shuffle. Each element is still
+loaded once; only the address arithmetic is split.
 
 ORDERING: the RMS sum runs over all ``HD`` dims and the k temperature is applied
-*before* the rotation, matching today's ``_normalize_qk`` -> ``rotary_emb``
-order. The rotation is norm-preserving on the rotated half so the two do not
-interact numerically, but the order is pinned anyway rather than relied upon.
+*before* the rotation, matching the ``_normalize_qk`` -> ``rotary_emb`` order.
 
 NOT bit-identical to the unfused chain: on ROCm the cos/sin cache is stored in
-the model dtype (``RotaryEmbedding.__init__`` casts it whenever the platform is
-not CUDA/XPU and ``SGLANG_ROPE_CACHE_FP32`` is off), and the separate rotary
-kernel also receives ``q``/``k`` already rounded to bf16. This kernel keeps the
-normalized head in fp32 across the rotation and rounds once, at the store, so
-its result is *closer* to the fp64 reference than the chain it replaces -- but
-it differs from it in the last bf16 bits.
+the model dtype and the separate rotary kernel receives q/k already rounded to
+bf16, while this keeps the normalized head in fp32 across the rotation and
+rounds once, at the store.
 
 KV store
 --------
-``HAS_STORE`` additionally scatters the post-rope ``k`` and the matching ``v``
-into the paged KV buffers at ``out_cache_loc[t]``, so ``RadixAttention`` can be
-called with ``save_kv_cache=False`` (the pattern ``qwen3_moe`` uses) and the
-per-layer ``set_kv_buffer`` launch -- another 60 per decode step -- disappears.
-``k`` is already in registers post-rotation, so the only new traffic is reading
-``v``, which the store kernel had to read anyway.
-
-The slot resolution mirrors ``rope_cache``'s: ``slot = out_cache_loc[t]``, then
-``slot = full_to_swa[slot]`` on a sliding-window layer of a hybrid pool, then
-skip when ``slot < 0`` (the sentinel row batch padding maps to). The caller does
-the layout gating; :func:`store_covered` only accepts a 3-D ``[rows, H, D]`` NHD
-buffer, which by construction excludes the 5-D SHUFFLE layout, the 4-D HND
-layout and the page-major strided views. A wrong write here corrupts KV
-silently, so both gates are deliberately narrower than the kernel could serve.
+``HAS_STORE`` also scatters the post-rope ``k`` and the matching ``v`` into the
+paged KV buffers at ``out_cache_loc[t]``, so ``RadixAttention`` can be called
+with ``save_kv_cache=False`` and the per-layer ``set_kv_buffer`` launch
+disappears. Slot resolution mirrors ``rope_cache``'s: ``slot =
+out_cache_loc[t]``, then ``slot = full_to_swa[slot]`` on a sliding-window layer
+of a hybrid pool, then skip when ``slot < 0`` (the sentinel row batch padding
+maps to). A wrong write here corrupts KV silently rather than crashing, so
+:func:`store_covered` is deliberately narrower than the kernel could serve.
 
 Follows the structure of ``kda_fused_decode`` (a ``covered()`` predicate gates
 supported inputs, everything else falls back to the unfused chain), but is
-written in Triton rather than CUDA-JIT so it runs on ROCm as well -- ZAYA1's
-reference deployment is MI350X.
-
-Motivation: an eager decode profile of ZAYA1-base put 56% of GPU time in tiny
-elementwise kernels at ~4270 launches per step, and this tail was the second
-largest cluster (~400 launches/step, 6.2% of decode).
+written in Triton rather than CUDA-JIT so it runs on ROCm.
 """
 
 from __future__ import annotations
@@ -98,10 +65,8 @@ import triton.language as tl
 # block. ZAYA1 uses 128; 256 leaves headroom without hurting occupancy.
 _MAX_HEAD_DIM = 256
 
-# A program holds the whole group as one [G, HD] fp32 tile (three of them: the
-# blend inputs and the result), so G bounds register pressure rather than just
-# a loop count. 16 x 256 fp32 is already 4096 elements per tile; beyond that the
-# torch fallback is the better bet. ZAYA1 uses 8.
+# G bounds register pressure, not just a loop count: a program holds three
+# [G, HD] fp32 tiles. Beyond 16 x 256 the torch fallback is the better bet.
 _MAX_GQA_GROUPS = 16
 
 _RMS_EPS = 1e-12
@@ -112,12 +77,8 @@ _FLOAT_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
 @triton.jit
 def _blend(conv_row, pre_row, half_base_k, off, mask):
-    """``conv + 0.5*pre + 0.5*base_k`` for one offset tile, in fp32.
-
-    ``conv_row`` / ``pre_row`` are already advanced to the token's row, and
-    ``half_base_k`` is broadcast-compatible with ``off``. Returns the blend and
-    the raw ``pre`` load, which the k blend reduces over the group.
-    """
+    """``conv + 0.5*pre + 0.5*base_k`` in fp32, plus the raw ``pre`` load that the
+    k blend reduces over the group. Rows are pre-advanced to the token."""
     pre = tl.load(pre_row + off, mask=mask, other=0.0).to(tl.float32)
     conv = tl.load(conv_row + off, mask=mask, other=0.0).to(tl.float32)
     return conv + 0.5 * pre + half_base_k, pre
@@ -127,16 +88,13 @@ def _blend(conv_row, pre_row, half_base_k, off, mask):
 def _kv_slot(loc_ptr, swa_map_ptr, t, HAS_SWA: tl.constexpr):
     """The physical KV slot for token ``t``, or a negative sentinel to skip it.
 
-    Mirrors ``rope_cache._fused_qk_rope_reshape_and_cache_kernel``: the allocated
-    (full-pool) slot, then one indirection through ``full_to_swa`` on a
-    sliding-window layer of a hybrid pool. That mapping's trailing ``-1`` entry
-    is what makes a padding row map to a skip rather than to slot 0.
+    ``full_to_swa``'s trailing ``-1`` entry is what makes a padding row map to a
+    skip rather than to slot 0.
     """
     slot = tl.load(loc_ptr + t).to(tl.int64)
     if HAS_SWA:
-        # Guard the gather itself: a negative source slot would index before the
-        # mapping's base. The shared rope+store kernel reads it unguarded because
-        # out_cache_loc is non-negative in practice; guarding costs one select.
+        # Guard the gather: a negative source slot would index before the
+        # mapping's base. Costs one select.
         mapped = tl.load(swa_map_ptr + tl.maximum(slot, 0)).to(tl.int64)
         slot = tl.where(slot >= 0, mapped, -1)
     return slot
@@ -200,9 +158,8 @@ def _cca_qk_mix_kernel(
     base_row = base_k_ptr + t * s_base_t + g * HD
     conv_k_row = conv_row + latent_q + g * HD
 
-    # The group's q heads reduce together: one [BLOCK_G, ...] tile whose rows are
-    # the group's q heads, so the G RMS sums collapse to one axis=1 reduction and
-    # mean_j(pre_q) to one axis=0 reduction of the same tile.
+    # One [BLOCK_G, ...] tile whose rows are the group's q heads, so the G RMS
+    # sums collapse to one axis=1 reduction and mean_j(pre_q) to one axis=0.
     j = tl.arange(0, BLOCK_G)[:, None]
     jmask = j < G
     q_row = (g * G + j) * HD  # [BLOCK_G, 1]
@@ -360,14 +317,10 @@ def covered(
 ) -> bool:
     """Whether the fused kernel can serve these inputs.
 
-    Requires a whole number of q heads per k head (ZAYA1 always splits evenly)
-    and few enough of them to hold the group as one register tile, a head dim
-    that fits one Triton block, row-major 2-D inputs with a unit innermost
-    stride, and float inputs on an accelerator. ``k_scale`` is the folded
-    ``sqrt(head_dim) * temperature`` vector, absent until weights load.
-
-    Says nothing about the rotary fusion -- see :func:`rope_covered`, which is a
-    strictly additional gate. The mix can fuse while the rotation falls back.
+    ``k_scale`` is the folded ``sqrt(head_dim) * temperature`` vector, absent
+    until weights load. Says nothing about the rotary or KV-store fusions --
+    :func:`rope_covered` and :func:`store_covered` are strictly additional gates,
+    so the mix can fuse while either of those falls back.
     """
     if k_scale is None:
         return False
@@ -397,15 +350,9 @@ def covered(
 
 
 def _same_device(tensor: torch.Tensor, device: torch.device) -> bool:
-    """Device equality that tolerates an un-indexed reference device.
-
-    ``torch.device("cuda") != torch.device("cuda:0")`` -- the index is part of
-    the identity -- while every tensor reports an indexed device. A caller that
-    writes the reference device by hand rather than reading it off a tensor would
-    otherwise see every check fail, and because these predicates decline by
-    *falling back*, that reads as "the fusion is off" with no error anywhere. An
-    un-indexed reference means "any device of this type", so honor that.
-    """
+    """Device equality that reads an un-indexed reference as "any device of this
+    type". ``torch.device("cuda") != torch.device("cuda:0")``, and a hand-written
+    reference device would otherwise decline every gate silently."""
     got = tensor.device
     if got.type != device.type:
         return False
@@ -417,19 +364,11 @@ def rope_geometry_decline_reason(
 ) -> Optional[str]:
     """Why the head shape is not one the three-tile split can express, or ``None``.
 
-    * ``rotary_dim == head_dim // 2`` -- ZAYA1's ``partial_rotary_factor=0.5``.
-      Any other split changes the tile geometry (the pass-through tail stops
-      being the same width as the rotated part) and is rejected rather than
-      guessed at.
-    * ``rotary_dim // 2`` even -- ``lo`` and ``hi`` are addressed as two tiles of
-      ``rotary_dim // 2`` lanes and the cos/sin cache is read at the same
-      granularity, so an odd half is refused instead of relying on the mask to
-      paper over a half-lane.
-    * neox layout. GPT-J interleaves the rotated pair *within* a lane, which is
-      exactly the cross-lane case this kernel avoids by splitting on load.
-
-    Split out from ``rope_decline_reason`` so the geometry can be pinned without
-    a GPU.
+    Requires neox layout (GPT-J interleaves the rotated pair intra-lane, the
+    cross-lane case this kernel avoids), ``rotary_dim == head_dim // 2``, and an
+    even ``rotary_dim // 2``; anything else is rejected rather than guessed at.
+    Split out from :func:`rope_decline_reason` so the geometry can be pinned
+    without a GPU.
     """
     if not is_neox_style:
         return "gptj layout (the rotated pair is intra-lane)"
@@ -461,15 +400,10 @@ def rope_decline_reason(
 ) -> Optional[str]:
     """Why the neox partial rotary cannot fold into the mix kernel, or ``None``.
 
-    Deliberately narrow: :func:`rope_geometry_decline_reason` for the head shape,
-    plus a ``[max_pos, rotary_dim]`` cache (cos half then sin half) with a unit
-    innermost stride and a 1-D integer ``positions``, both on the inputs' device.
-
-    Everything it rejects still gets the fused mix plus a separate rotary launch,
-    i.e. today's behavior. Returning the *reason* rather than a bare bool is what
-    keeps such a decline visible: it feeds both the once-per-outcome fusion log
-    and the tests' assertion messages. The string is built only on decline, so
-    the accepted path pays nothing for it.
+    Everything it rejects still gets the fused mix plus a separate rotary launch.
+    The reason string, rather than a bare bool, is what keeps such a decline
+    visible: it feeds the once-per-outcome fusion log and the tests' assertion
+    messages, and is built only on decline.
     """
     if positions is None or cos_sin_cache is None:
         return "no rotary offered"
@@ -540,33 +474,21 @@ def store_decline_reason(
 ) -> Optional[str]:
     """Why the KV scatter cannot fold into the mix kernel, or ``None``.
 
-    A wrong write here does not crash -- it corrupts KV and shows up as degraded
-    output quality -- so this gate is deliberately narrower than the kernel could
-    serve, and every check below is a hard reject rather than a fixup:
+    A wrong write here does not crash, it corrupts KV, so every check is a hard
+    reject rather than a fixup:
 
-    * **3-D ``[rows, heads, dim]`` K/V buffers only.** That is the plain NHD pool
-      layout, where the write target is a flat slot row and needs no page
-      arithmetic at all. It is exactly the shape ``_set_kv_buffer_impl`` writes.
-      Requiring 3-D is what rules out the other layouts by construction: the 5-D
-      SHUFFLE (vectorized_5d) buffers, the 4-D HND ``(page, head, off, dim)``
-      buffers and the page-major strided views are all rejected without this
-      needing to know which one it is looking at. The caller pins the page-size
-      side of that invariant by checking ``rows == pool.size + pool.page_size``,
-      which is what makes the flat slot index correct for ANY page size and also
-      rejects the placeholder buffers of a no-op pool.
-    * **matching dtypes.** ``k_cache.dtype == v_cache.dtype == out_dtype`` is the
-      bf16 gate: an fp8 or fp4 pool stores under a different ``store_dtype`` (and
-      needs per-tensor scales the kernel does not apply), so it falls back.
-    * unit innermost strides on both buffers and on ``value`` -- the head axis
-      may be strided (a per-rank slice of the replicated V projection is), which
-      is why ``s_v_h`` is passed rather than assumed.
-    * a 1-D integer ``out_cache_loc`` of exactly ``num_tokens`` entries, and an
-      int64 ``full_to_swa`` when one is supplied. ``full_to_swa`` is indexed by
-      FULL-pool slot id, not by a row of ``k_cache`` (which is the SWA sub-pool
-      here), so its length is the caller's invariant to check, not this one's.
-
-    Like the rope gate, it answers with the reason so a decline is legible rather
-    than a bare False.
+    * **3-D ``[rows, heads, dim]`` K/V buffers only** -- the plain NHD layout,
+      where the write target is a flat slot row and needs no page arithmetic.
+      Requiring 3-D rejects the 5-D SHUFFLE, 4-D HND and page-major strided
+      layouts by construction. The caller pins the other half of that invariant
+      by checking ``rows == pool.size + pool.page_size``, which makes the flat
+      slot index correct for any page size.
+    * **matching dtypes** -- an fp8/fp4 pool stores under a different
+      ``store_dtype`` and needs scales this kernel does not apply.
+    * unit innermost strides; the head axis may be strided (a per-rank slice of
+      the replicated V projection is), hence ``s_v_h`` is passed, not assumed.
+    * ``full_to_swa`` is indexed by FULL-pool slot id, not by a row of
+      ``k_cache``, so its length is the caller's invariant to check.
     """
     for name, t in (
         ("value", value),
@@ -612,10 +534,8 @@ def store_decline_reason(
             )
         if not full_to_swa.is_contiguous() or full_to_swa.numel() == 0:
             return "full_to_swa empty or not contiguous"
-    # ``device`` is required rather than inferred: the accelerator check already
-    # happened in ``covered()`` (which gates this one), so what is left to catch
-    # is a buffer that belongs to a *different* device than the inputs -- and
-    # making it explicit is also what lets these branches be tested on CPU.
+    # ``device`` is explicit rather than inferred: ``covered()`` already checked
+    # for an accelerator, and passing it lets these branches be tested on CPU.
     for name, t in (
         ("value", value),
         ("k_cache", k_cache),
@@ -682,19 +602,12 @@ def cca_qk_mix(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return ``(q, k)`` as ``[T, heads, head_dim]`` in ``out_dtype``.
 
-    Accumulation is always fp32 inside the kernel; ``out_dtype`` only picks the
-    store precision. Writing the model dtype directly saves the caller a cast --
-    and the cast is all it was, since the fp32 result was rounded to the model
-    dtype immediately afterwards.
-
-    Passing ``positions`` / ``cos_sin_cache`` / ``rotary_dim`` also applies the
-    neox partial rotary to both outputs, removing the separate rotary launch.
-    Passing ``value`` / ``k_cache`` / ``v_cache`` / ``out_cache_loc`` also
-    scatters k and v into the paged buffers, removing the ``set_kv_buffer``
-    launch; ``full_to_swa`` adds the hybrid-pool slot indirection.
-
-    Caller must have checked :func:`covered`, plus :func:`rope_covered` and
-    :func:`store_covered` for whichever extra arguments it passes.
+    Accumulation is always fp32; ``out_dtype`` only picks the store precision.
+    ``positions`` / ``cos_sin_cache`` / ``rotary_dim`` also apply the neox partial
+    rotary; ``value`` / ``k_cache`` / ``v_cache`` / ``out_cache_loc`` also scatter
+    k and v into the paged buffers, with ``full_to_swa`` adding the hybrid-pool
+    slot indirection. Caller must have checked :func:`covered`, plus
+    :func:`rope_covered` / :func:`store_covered` for the extra arguments.
     """
     num_tokens = conv_qk.shape[0]
     q_out = torch.empty(
@@ -763,12 +676,9 @@ def cca_qk_mix(
         BLOCK_P=block_p,
         HAS_STORE=has_store,
         HAS_SWA=(has_store and full_to_swa is not None),
-        # One warp, not four. The reductions are over the head dim (ZAYA1: 128
-        # elements), so 4 warps is 256 ROCm lanes per 128-element row: half of
-        # them idle, and each ``tl.sum`` becomes a cross-wavefront LDS reduction
-        # with the barriers that implies. At one warp the block is 64 lanes and
-        # the reduction stays inside the wavefront. Worth re-sweeping now that a
-        # program carries a [G, HD] tile rather than a single row.
+        # One warp keeps each tl.sum inside a single ROCm wavefront; at four the
+        # 128-element head dim leaves lanes idle and the reduction goes via LDS.
+        # Measured on ZAYA1's head_dim=128; re-sweep if the tile shape changes.
         num_warps=1,
     )
     return q_out, k_out

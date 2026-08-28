@@ -240,38 +240,19 @@ def _rocm_cuda_graph_custom_ar_unsafe() -> bool:
     """Whether custom/quick all-reduce must be avoided during CUDA graph capture.
 
     ROCm <= 7.2.0 ships a HIP runtime bug (pytorch#177309, ROCm/aiter#2857,
-    sglang#24011): the RCCL ProcessGroup watchdog polls completion with
-    ``hipEventQuery`` from a side thread, which ignores the THREAD_LOCAL
-    stream-capture mode and either aborts the in-flight capture
-    (``hipErrorCapturedEvent`` / ``hipErrorStreamCaptureUnsupported``) or
-    silently corrupts it so a later replay raises ``HSA_STATUS_ERROR_EXCEPTION``
-    0x1016. Custom all-reduce and quick all-reduce launch small helper kernels
-    while a capture is active, which is exactly what trips the watchdog. On
-    affected ROCm we therefore force the capture-safe pynccl path inside
-    ``graph_capture`` (eager keeps using custom all-reduce, as it does not
-    capture). The ROCm 7.2.1 HIP runtime corrects hipEventQuery/Synchronize
-    capture handling, so newer runtimes are unaffected.
+    sglang#24011): the RCCL watchdog polls with ``hipEventQuery`` from a side
+    thread, ignoring the THREAD_LOCAL capture mode, and either aborts the
+    in-flight capture or silently corrupts it so a later replay raises
+    ``HSA_STATUS_ERROR_EXCEPTION`` 0x1016. Custom and quick all-reduce launch
+    helper kernels while a capture is active, which is what trips it. Drop this
+    guard once ROCm < 7.2.1 is no longer supported.
 
-    DEFAULT OFF, opt in via ``SGLANG_ROCM_CUDA_GRAPH_FORCE_PYNCCL=1``, because the
-    evidence for needing it did not hold up:
-
-    * The crashes originally attributed to this on ZAYA1 were root-caused
-      elsewhere -- unclamped ``-1`` mamba slot ids fed to ``index_select`` (an
-      out-of-bounds gather that surfaces as HSA 0x1016, exactly like the capture
-      bug) and a SIGFPE from the ROCm rotary kernel on zero-token idle DP
-      forwards. Both are fixed; neither involved custom all-reduce.
-    * Measured on HIP 7.2.26015 (the exact build pytorch#177309 reports), ROCm
-      7.0.2 / gfx950, tp=8/dp=4 on ZAYA1-74B: forcing pynccl costs **5.3% at
-      C=32 and 6.5% at C=128** (TPOT 21.07 -> 20.00 and 25.25 -> 23.73), because
-      it pushes every collective in the captured region -- 120+ per decode step
-      under DP attention -- off custom/quick AR, which is far faster at these
-      message sizes. ~650k tokens generated with correct output and no aborts.
-    * Upstream main carries no such guard, so defaulting it off matches upstream.
-
-    Residual risk: the bug this guards against is *silent* capture corruption that
-    surfaces later, so absence over a few hundred thousand tokens is evidence, not
-    proof. Set ``SGLANG_ROCM_CUDA_GRAPH_FORCE_PYNCCL=1`` to restore the
-    conservative path if a ROCm build does exhibit it.
+    DEFAULT OFF: measured on ROCm 7.0.2 / gfx950 at tp=8/dp=4, forcing pynccl
+    costs 5.3-6.5% TPOT because it pushes every collective in the captured region
+    off custom/quick AR, and the ZAYA1 crashes originally attributed to this were
+    root-caused elsewhere. The failure it guards against is *silent* capture
+    corruption, so set ``SGLANG_ROCM_CUDA_GRAPH_FORCE_PYNCCL=1`` to restore the
+    conservative path on a build that does exhibit it.
     """
     override = envs.SGLANG_ROCM_CUDA_GRAPH_FORCE_PYNCCL.get()
     if override is not None:
@@ -643,10 +624,9 @@ class GroupCoordinator:
         # is already collected in init() and we can capture the quick allreduce directly.
         ca_comm = self.ca_comm
         # ROCm <= 7.2.0 corrupts captures that launch custom/quick all-reduce
-        # helper kernels (see ``_rocm_cuda_graph_custom_ar_unsafe``). On affected
-        # ROCm, skip the custom-AR capture context and disable custom + quick AR
-        # for the captured region below, so the captured all-reduces fall through
-        # to the capture-safe pynccl path. Eager is unaffected.
+        # helper kernels (see ``_rocm_cuda_graph_custom_ar_unsafe``); skip the
+        # custom-AR capture context there so the captured all-reduces fall
+        # through to pynccl. Eager is unaffected.
         rocm_force_pynccl = _rocm_cuda_graph_custom_ar_unsafe()
         maybe_ca_context = (
             nullcontext() if ca_comm is None or rocm_force_pynccl else ca_comm.capture()
@@ -696,15 +676,12 @@ class GroupCoordinator:
             else:
                 maybe_pymscclpp_context = pymscclpp_comm.change_state(enable=True)
             if not rocm_force_pynccl:
-                # NVIDIA and ROCm 7.2.1+ keep the original capture path verbatim:
-                # custom/quick all-reduce stay enabled and are captured directly.
+                # NVIDIA and ROCm 7.2.1+: custom/quick AR stay enabled.
                 with maybe_pynccl_context, maybe_pymscclpp_context:
                     yield graph_capture_context
             else:
-                # ROCm <= 7.2.0 only: disable custom & quick all-reduce for the
-                # captured region so ``all_reduce`` falls through to the
-                # capture-safe pynccl path. Restored on exit so eager keeps
-                # custom AR. This branch is unreachable on non-ROCm platforms.
+                # ROCm <= 7.2.0 only: disable custom & quick AR for the
+                # captured region, restored on exit so eager keeps custom AR.
                 with contextlib.ExitStack() as comm_stack:
                     for comm in (self.ca_comm, self.qr_comm):
                         if comm is not None:
@@ -2622,8 +2599,6 @@ def initialize_model_parallel(
             max_world_size=max_world_size,
         )
 
-    from sglang.srt.layers.sampler import SYNC_TOKEN_IDS_ACROSS_TP
-
     global _ATTN_TP
     assert (
         _ATTN_TP is None
@@ -2649,16 +2624,12 @@ def initialize_model_parallel(
             group_ranks,
             get_world_group().local_rank,
             backend,
-            # Always create a pynccl communicator for the attention-TP group.
-            # #31629 made ``graph_capture`` enter this group's capture context and
-            # allowed MSCCL++ on it, but MSCCL++ is opt-in (--enable-mscclpp, off
-            # by default) and the previous ``SYNC_TOKEN_IDS_ACROSS_TP or
-            # enable_symm_mem`` condition leaves the group with no capture-safe
-            # all-reduce otherwise. A model that all-reduces on attn-TP inside the
-            # captured region (ZAYA1, MiniMax-M2) then falls back to
-            # torch.distributed.all_reduce, which cannot be captured. pynccl stays
-            # disabled in eager mode and is only enabled inside ``graph_capture``
-            # (see its allreduce mode table), so eager behaviour is unchanged.
+            # Always create a pynccl communicator for the attention-TP group:
+            # MSCCL++ is opt-in, so without this the group has no capture-safe
+            # all-reduce and a model that all-reduces on attn-TP inside the
+            # captured region (ZAYA1, MiniMax-M2) falls back to
+            # torch.distributed.all_reduce, which cannot be captured. pynccl is
+            # enabled only inside ``graph_capture``, so eager is unchanged.
             use_pynccl=True,
             use_custom_allreduce=False,
             use_torch_symm_mem_allreduce=False,

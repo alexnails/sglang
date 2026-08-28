@@ -508,10 +508,10 @@ def _dp_gather_via_all_reduce(
 ) -> torch.Tensor:
     """Gather by all-reducing a zero-padded sum_len buffer.
 
-    Returns the tensor that holds the gathered rows -- ``global_tokens`` when the
-    collective reduced in place, otherwise the collective's own (out-of-place)
-    output. Callers that need the result *in* ``global_tokens`` go through
-    :func:`_dp_gather_in_place`, which copies back only when the two differ.
+    Returns the tensor holding the gathered rows: ``global_tokens`` when the
+    collective reduced in place, otherwise the collective's own output. Callers
+    needing the result *in* ``global_tokens`` go through
+    :func:`_dp_gather_in_place`.
     """
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
@@ -525,9 +525,7 @@ def _dp_gather_via_all_reduce(
             local_tokens.untyped_storage() is not global_tokens.untyped_storage()
         ), "aliasing between global_tokens and local_tokens not allowed"
 
-        # One kernel places this rank's rows and zeros the rest, so the separate
-        # ``global_tokens.fill_(0)`` is gone: one launch per gather instead of
-        # two, and the rows the copy covers are written once rather than twice.
+        # One kernel places this rank's rows and zeros the rest.
         memcpy_scatter_zero_rest(
             global_tokens, local_tokens, 0, local_start_pos, local_num_tokens
         )
@@ -822,10 +820,8 @@ def _dp_gather(
 ) -> torch.Tensor:
     """Dispatch a gather and return the tensor holding the gathered rows.
 
-    Every path but the sum_len all-reduce fills ``global_tokens`` itself and so
-    returns it; the all-reduce path may return the collective's out-of-place
-    output instead. Use :func:`_dp_gather_in_place` unless you can consume the
-    returned tensor.
+    Every path but the sum_len all-reduce fills ``global_tokens`` itself; that
+    one may return the collective's out-of-place output instead.
     """
     if (
         is_dp_gatherv_active()
@@ -889,16 +885,12 @@ def dp_gather_partial_out(
 ) -> torch.Tensor:
     """:func:`dp_gather_partial` that returns where the result actually landed.
 
-    The sum_len path all-reduces through the custom (out-of-place) collective, so
-    its output buffer already holds the gathered rows and the copy back into
-    ``global_tokens`` is pure overhead -- one launch per gather, and under
-    dp-attention that is one gather per attention layer. Callers MUST use the
-    returned tensor and treat ``global_tokens`` as scratch: on this path it is
-    left holding the pre-reduce (zero-padded, local-rows-only) staging content.
-
-    Every other path (max_len all_gather, gatherv, an in-place all-reduce
-    fallback) returns ``global_tokens`` itself, so a caller written against this
-    signature stays correct under every padding mode.
+    On the sum_len path the out-of-place collective's output already holds the
+    gathered rows, so the copy back into ``global_tokens`` is pure overhead.
+    Callers MUST use the returned tensor and treat ``global_tokens`` as scratch:
+    it is left holding the pre-reduce staging content. Every other path returns
+    ``global_tokens`` itself, so a caller written against this signature stays
+    correct under every padding mode.
     """
     return _dp_gather(global_tokens, local_tokens, forward_batch, is_partial=True)
 

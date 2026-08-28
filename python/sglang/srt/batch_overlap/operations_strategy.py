@@ -76,18 +76,11 @@ class OperationsStrategy:
         elif layer_name in ("ZayaDecoderATTLayer", "ZayaDecoderMLPLayer"):
             # Deliberately unimplemented, with the arithmetic recorded so it is
             # not re-derived. TBO splits the batch in two, doubling collective
-            # count -- and ZAYA1 tp8/dp4 decode is collective-LATENCY bound, so
-            # payload halving buys nothing while the extra operations cost full
-            # price. Both sides were measured on MI350X: cutting collective bytes
-            # 40% (reduce-scatter combine) gained 0 to -3%, and adding 60 barriers
-            # (per-layer comm overlap) cost a flat +3.5 ms/step. Going from 120 to
-            # 240 collectives per step is therefore worth roughly -7 ms, which is
-            # about all the compute there is to hide at C=128 (TPOT 20.2 ms,
-            # majority collectives). It cannot pay, and that is before the work:
-            # ZAYA1 alternates two layer classes, so it also breaks the
-            # homogeneous-layer assumption above, and its MoE combine is an
-            # all-reduce rather than the dispatch/combine pair the operation
-            # vocabulary below is built around.
+            # count, and ZAYA1 tp8/dp4 decode is collective-LATENCY bound: on
+            # MI350X, cutting collective bytes 40% gained 0 to -3% while adding
+            # 60 barriers cost a flat +3.5 ms/step, so 120 -> 240 collectives is
+            # worth roughly -7 ms against a 20.2 ms TPOT. ZAYA1 also alternates
+            # two layer classes, breaking the homogeneous-layer assumption above.
             raise NotImplementedError(
                 "TBO is not implemented for ZAYA1 on purpose: it doubles "
                 "collective count, and this model's decode is collective-latency "

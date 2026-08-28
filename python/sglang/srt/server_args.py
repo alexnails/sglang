@@ -410,18 +410,14 @@ except ImportError:
 def _max_conv_state_window(hf_config: Any) -> int:
     """Widest conv sliding window over a hybrid model's conv states, or 0.
 
-    The window is the trailing axis of each entry of
-    ``mamba2_cache_params.shape.conv`` (``conv_kernel - 1`` for a depthwise
-    short conv; ZAYA1 carries two entries, ``total_padding`` and ``1``). It is
-    deliberately the ONLY thing read here, because it is the one part of the
-    conv-state shape that does not depend on the TP width -- only the channel
-    axis is sharded. That is what makes this safe to consult from a memoized
-    property that may be first touched either side of distributed init: the
-    answer cannot change once the process has a real ``attn_tp_size``.
+    The window is the trailing axis of each ``mamba2_cache_params.shape.conv``
+    entry, and deliberately the ONLY thing read here: it is the one part of the
+    conv-state shape that does not depend on the TP width, so a memoized property
+    gets the same answer either side of distributed init.
 
-    Returns 0 when the model exposes no conv state, or when the shape cannot be
-    built yet; callers must treat 0 as "unknown" and fall back to the generic
-    chunk, never to a smaller one.
+    Returns 0 when there is no conv state or the shape cannot be built yet;
+    callers must treat 0 as "unknown" and fall back to the generic chunk, never
+    to a smaller one.
     """
     for cfg in (hf_config, getattr(hf_config, "text_config", None)):
         if cfg is None:
@@ -439,19 +435,14 @@ def _max_conv_state_window(hf_config: Any) -> int:
 def _short_conv_cache_chunk_size(hf_config: Any) -> int:
     """Radix caching granularity for a model with no chunked recurrence.
 
-    A short-conv model (ZAYA1 CCA, LFM2) reports ``mamba_chunk_size == 1``,
-    which is honest about the model -- there is no chunked scan -- but says
-    nothing about how often the radix cache should checkpoint state. Taking it
-    as the caching granularity makes every single token a caching point, which
-    (a) lets the tree adopt a neighbour's state at a one-token shared prefix
-    and (b) is below the conv window, so a checkpoint cannot even be built.
+    A short-conv model reports ``mamba_chunk_size == 1``, honest about the model
+    but useless as a caching granularity: it makes every token a caching point,
+    and it is below the conv window, so a checkpoint cannot even be built.
 
-    Use the generic FLA chunk instead, raised to clear the widest conv window:
-    the extend-side snapshot gathers ``window`` input rows ending at the
-    aligned position, so the granularity must exceed the window. Round the
-    floor up to a whole number of ``FLA_CHUNK_SIZE`` so the result keeps
-    dividing (or being divided by) every page size in use, which the caller's
-    divisibility assert requires.
+    Use the generic FLA chunk instead, raised to clear the widest conv window --
+    the extend-side snapshot gathers ``window`` rows ending at the aligned
+    position -- and rounded up to a whole number of ``FLA_CHUNK_SIZE`` so the
+    caller's page-size divisibility assert still holds.
     """
     fla_chunk_size = FLA_CHUNK_SIZE
     floor = _max_conv_state_window(hf_config) + 1
@@ -10295,21 +10286,16 @@ class ServerArgs:
     def mamba_cache_chunk_size(self) -> int:
         """Radix caching-point granularity for hybrid linear-attention models.
 
-        This is the *caching* chunk: how often a prefill may checkpoint the
-        per-request state, and therefore at what boundary a cached prefix may
-        be trimmed. It is NOT the model's chunk-scan length, even though for an
-        SSM the two coincide -- a scan checkpoints at chunk boundaries anyway,
-        so reusing that length costs nothing.
+        The *caching* chunk: how often a prefill may checkpoint the per-request
+        state, and so at what boundary a cached prefix may be trimmed. NOT the
+        model's chunk-scan length, though for an SSM the two coincide, since a
+        scan checkpoints at chunk boundaries anyway.
 
-        For a conv-only model the two come apart. ZAYA1 and LFM2 report
-        ``mamba_chunk_size == 1`` because they have no chunked recurrence at
-        all, which is honest about the model but useless as a caching
-        granularity, and below their conv window besides. Those take the
-        short-conv derivation instead; every model with a real scan
-        (``mamba_chunk_size > 1``) and every model that declares none
-        (defaulting to ``FLA_CHUNK_SIZE``) keeps the historical
-        ``max(scan_chunk, page_size)`` exactly.
-        
+        For a conv-only model they come apart: ``mamba_chunk_size == 1`` means
+        "no chunked recurrence", not "cache every token", so those take the
+        short-conv derivation. Every model with a real scan, and every model that
+        declares none, keeps the historical ``max(scan_chunk, page_size)``.
+
         The memo is only kept once the record is resolved, because ``page_size``
         is resolution-written; a pre-seeded ``_mamba_cache_chunk_size`` (fixtures
         supply one so a dummy model never loads an HF config) is honored as-is.

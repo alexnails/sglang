@@ -79,11 +79,9 @@ def memcpy_scatter_zero_rest_kernel(
 def memcpy_scatter_zero_rest_triton(dst, src, dim, offset, sz):
     """``dst[offset:offset+sz] = src[:sz]``, and zero every other row of ``dst``.
 
-    The fused form of ``dst.fill_(0)`` followed by
-    :func:`memcpy_triton` with ``offset_src=False``: one launch instead of two,
-    and strictly less traffic, because the rows the copy would overwrite are no
-    longer written twice. ``offset`` and ``sz`` are device scalars (read on the
-    device, so this stays CUDA-graph capturable); ``dst`` must not alias ``src``.
+    The fused form of ``dst.fill_(0)`` plus :func:`memcpy_triton` with
+    ``offset_src=False``. ``offset`` and ``sz`` are device scalars, so this stays
+    CUDA-graph capturable; ``dst`` must not alias ``src``.
     """
     assert dim == 0, "dim != 0 unsupported"
     assert src.shape[1:] == dst.shape[1:], "src and dst must have same shape"

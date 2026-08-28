@@ -44,10 +44,9 @@ logger = logging.getLogger(__name__)
 
 class MambaAttnBackendBase(AttentionBackend):
     # Whether this backend's per-request state has an SSM/temporal component.
-    # Pure short-conv models (ZAYA1 CCA, LFM2) allocate a zero-element
-    # ``temporal`` tensor, so the radix track has nothing to snapshot there and
-    # the SSM track-index build -- five device->host copies per extend step --
-    # is skipped entirely. Every SSM backend leaves this True and is unaffected.
+    # Pure short-conv models allocate a zero-element ``temporal`` tensor, so the
+    # radix track has nothing to snapshot there and the SSM track-index build --
+    # five device->host copies per extend step -- is skipped entirely.
     has_temporal_state: bool = True
 
     def __init__(self, model_runner: ModelRunner):
@@ -249,14 +248,11 @@ class MambaAttnBackendBase(AttentionBackend):
                     tail := extend_buf.shape[0]
                 ):
                     # A captured prefill graph bakes its grid from the batch size
-                    # seen at CAPTURE, which is larger than most replays. Give
-                    # every request slot past this batch a zero length by
-                    # flooding the tail with the final offset, so a kernel that
-                    # walks the captured request count sees start == end and does
-                    # nothing for them. Left stale, those slots would still hold
-                    # capture-time offsets and (valid, clamped) pool slot ids, and
-                    # a per-request state write would scribble on another
-                    # request's conv state.
+                    # seen at CAPTURE. Flood the tail with the final offset so a
+                    # kernel walking the captured request count sees start == end
+                    # for every slot past this batch; left stale they would hold
+                    # capture-time offsets and valid pool slot ids, and a
+                    # per-request write would scribble on another request.
                     extend_buf[bs + 1 : tail] = query_start_loc[bs]
                 if has_mamba_track_mask:
                     track_conv_indices = self._init_track_conv_indices(
@@ -512,10 +508,9 @@ class MambaAttnBackendBase(AttentionBackend):
             dtype=torch.int32,
             device=self.device,
         )
-        # Extend needs a stable address too once the PREFILL graph is captured:
-        # the cu-seqlens are per-batch data (not an arange like decode's), and a
-        # kernel reading them from inside a captured graph would otherwise bake
-        # the address of a per-step temporary and read freed memory at replay.
+        # Extend needs a stable address once the PREFILL graph is captured: the
+        # cu-seqlens are per-batch data, not an arange like decode's, so a kernel
+        # reading them from inside a graph would bake a per-step temporary.
         self.cached_cuda_graph_extend_query_start_loc = torch.empty(
             (max_bs + 1,), dtype=torch.int32, device=self.device
         )

@@ -23,19 +23,17 @@ state* (stored in the centralized ``MambaPool``) with softmax attention layers:
   conv plus a one-token ``val_proj2`` value lag, preprocessing q/k for the
   softmax attention.
 
-These share the *state plumbing* -- resolving the per-request slot indices, the
-``has_initial_state`` prefix mask, the ``query_start_loc`` cu-seqlens, and the
-cuda-graph static index buffers, all once per forward step -- but NOT the conv
-kernel itself. ``ShortConvAttnBackend`` owns only the plumbing and hands it out
-via :meth:`conv_state_metadata` as a :class:`ShortConvMetadata`; each model runs
-its own conv kernel against that handle, so the model definition holds no pool
-access.
+These share the *state plumbing* -- the per-request slot indices, the
+``has_initial_state`` prefix mask, the ``query_start_loc`` cu-seqlens and the
+cuda-graph static index buffers, all resolved once per forward step -- but NOT
+the conv kernel itself. This backend owns only the plumbing and hands it out via
+:meth:`conv_state_metadata`; each model runs its own conv against that handle.
 
-The backend is a *sidecar*: it is invoked directly by the model (through
+It is a *sidecar*: invoked directly by the model (through
 :class:`ShortConvHybridAttnBackend
 <sglang.srt.layers.attention.hybrid_linear_attn_backend.ShortConvHybridAttnBackend>`),
 never through the full-vs-linear ``forward_decode`` / ``forward_extend``
-dispatch. Metadata + cuda-graph capture/replay come from
+dispatch. Metadata and cuda-graph capture/replay come from
 :class:`MambaAttnBackendBase`.
 """
 
@@ -105,12 +103,10 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
         mamba_cache = self.req_to_token_pool.mamba_pool.mamba_cache
         # conv[0] == conv_state: [n_layers, n_slots, conv_dim, conv_kernel - 1]
         self.conv_states_shape = mamba_cache.conv[0].shape
-        # Sliding-window length of EVERY conv entry (its trailing axis). ZAYA1
-        # has two: conv[0] is the conv_qk left padding (window ==
-        # total_padding) and conv[1] is the one-token ``prev_hs`` lag (window
-        # == 1). LFM2 has one (window == conv_L_cache - 1). Each entry's state
-        # at length L is exactly that entry's last ``window`` INPUT rows, which
-        # is what makes the extend-side snapshot a plain gather.
+        # Sliding-window length of EVERY conv entry (its trailing axis): ZAYA1
+        # has two (the conv_qk left padding and the one-token lag), LFM2 one.
+        # Each entry's state at length L is exactly that entry's last ``window``
+        # INPUT rows, which makes the extend-side snapshot a plain gather.
         self.conv_window_lens: List[int] = [int(c.shape[-1]) for c in mamba_cache.conv]
 
         # Per-step state, resolved ONCE per step in init_forward_metadata /
@@ -144,31 +140,25 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
         """Validate + precompute the radix track plumbing (extra_buffer only).
 
         The decode snapshot is a pure row copy (live slot -> track slot) that
-        every conv layer needs on the same step. ZAYA1 runs dozens of conv
-        layers and its decode is launch-bound, so instead of one per layer this
-        flattens the pool's ``[n_layers, n_slots, ...]`` conv tensors to
-        ``[n_layers * n_slots, ...]`` and does the whole model in ONE launch,
-        with row ids ``layer * n_slots + slot``. ``_track_layer_row_base`` is
-        the constant ``[n_layers, 1]`` column of ``layer * n_slots``.
+        every conv layer needs on the same step, so instead of one launch per
+        layer this flattens the pool's ``[n_layers, n_slots, ...]`` conv tensors
+        to ``[n_layers * n_slots, ...]`` and does the whole model in one, with row
+        ids ``layer * n_slots + slot``.
         """
-        # Speculative decoding needs a per-draft-token track (the snapshot has
-        # to land on the accepted step, not the last verified one), and the
-        # decode cuda-graph runner disables its mamba-track buffers outright
-        # when a spec algorithm is set -- the snapshot would then silently
-        # never happen. Refuse the combination instead.
+        # Speculative decoding needs a per-draft-token track (the snapshot has to
+        # land on the accepted step), and the decode graph runner disables its
+        # mamba-track buffers outright when a spec algorithm is set, so the
+        # snapshot would silently never happen. Refuse the combination.
         if getattr(server_args, "speculative_algorithm", None) is not None:
             raise NotImplementedError(
                 "mamba extra_buffer for short-conv models does not support "
                 "speculative decoding; use --mamba-radix-cache-strategy "
                 "no_buffer."
             )
-        # The extend-side snapshot is a gather whose row count is
-        # mamba_track_mask.sum() -- data dependent, so a captured prefill graph
-        # would bake in whatever count capture happened to see (zero, since the
-        # capture mask buffer is all-False) and never snapshot again. Unlike
-        # the decode side there is no inert-buffer form of this, so refuse the
-        # combination instead of shipping a graph that silently drops every
-        # prefill checkpoint.
+        # The extend-side snapshot's row count is mamba_track_mask.sum(), data
+        # dependent, so a captured prefill graph would bake in the count capture
+        # saw (zero, the capture mask is all-False) and never snapshot again.
+        # There is no inert-buffer form of this as there is on the decode side.
         prefill_graph = getattr(
             getattr(server_args, "cuda_graph_config", None), "prefill", None
         )
@@ -182,11 +172,10 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
             )
         chunk = server_args.mamba_cache_chunk_size
         max_window = max(self.conv_window_lens)
-        # The extend snapshot gathers the ``window`` input rows ending at the
-        # chunk-aligned track position, which is >= mamba_cache_chunk_size into
-        # the current extend (mamba_track_mask is only set when the extend is
-        # at least one chunk long). A window that long would have to reach back
-        # into the cached prefix, which the gather cannot express.
+        # The extend snapshot gathers the ``window`` rows ending at the
+        # chunk-aligned track position, at least mamba_cache_chunk_size into the
+        # current extend. A longer window would have to reach back into the
+        # cached prefix, which the gather cannot express.
         assert max_window < chunk, (
             f"short-conv extra_buffer needs every conv window "
             f"({self.conv_window_lens}) < mamba_cache_chunk_size ({chunk}); "
@@ -245,10 +234,8 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
         # Refilled in place per step so a captured graph reads a stable address.
         # Grow-only, never reallocated at the same size: the cuda- and cpu-graph
         # hooks can both run, in either order, after another phase captured.
-        # ``_has_initial_state_buf`` matters once the PREFILL graph is captured: a
-        # fused extend conv reads the prefix mask from inside the graph, and the
-        # eager path derives it freshly each step, so without a stable home the
-        # graph would bake the address of a per-step temporary.
+        # ``_has_initial_state_buf`` matters once the PREFILL graph is captured:
+        # a fused extend conv reads the prefix mask from inside the graph.
         buf = self._cache_indices_buf
         if buf is not None and buf.shape[0] >= max_bs:
             return
@@ -270,19 +257,14 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
         md = self.forward_metadata
         idx = md.mamba_cache_indices if md is not None else None
         buf = self._cache_indices_buf
-        # Batch padding poisons unused rows' slot ids to -1 (see
-        # MambaAttnBackendBase._forward_metadata: "padded rows are then poisoned
-        # to -1"). Padding appears under cuda-graph bs rounding and, notably,
-        # whenever DP attention pads a replica's batch. Clamp ONCE per step, here
-        # where the shared int64 view is resolved, so every conv layer's
-        # index_select / index_copy_ is in bounds without a per-layer clamp:
-        # MambaPool reserves slot 0 (MambaSlotAllocator hands out 1..size), so
-        # padded rows land on that scratch slot -- they can neither read out of
-        # bounds nor clobber a live request's state, and the model discards their
-        # outputs anyway. An unclamped -1 is an out-of-bounds device gather; on
-        # ROCm it aborts the queue with HSA_STATUS_ERROR_EXCEPTION 0x1016 rather
-        # than raising, which surfaced as a hard crash on ZAYA1 at attn_tp > 1
-        # under DP attention.
+        # Batch padding poisons unused rows' slot ids to -1, under cuda-graph bs
+        # rounding and whenever DP attention pads a replica's batch. Clamp ONCE
+        # per step, here where the shared int64 view is resolved, so every conv
+        # layer's index_select / index_copy_ is in bounds: MambaPool reserves
+        # slot 0, so padded rows land on that scratch slot and can neither read
+        # out of bounds nor clobber a live request's state. An unclamped -1 is an
+        # out-of-bounds device gather, which on ROCm aborts the queue with
+        # HSA_STATUS_ERROR_EXCEPTION 0x1016 rather than raising.
         if idx is None:
             self._cache_indices = None
         elif buf is not None and idx.shape[0] <= buf.shape[0]:
@@ -325,14 +307,12 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
         """Flattened input positions to snapshot, ONE tensor per conv entry.
 
         Overrides the single-conv base implementation: a short-conv model may
-        carry several conv entries with different window lengths (ZAYA1:
-        ``[total_padding, 1]``), and each entry's snapshot is its own window of
-        its own input tensor. The window for every entry ENDS at the same
-        chunk-aligned track position, so ``indices[j][:, -1]`` is the same
-        column for every ``j``.
-
-        Returned tensors are ``[n_tracked, window_j]`` and index the flattened
-        token axis; rows are restricted to ``mamba_track_mask``.
+        carry several conv entries with different window lengths, each snapshot
+        being its own window of its own input tensor. Every entry's window ENDS
+        at the same chunk-aligned track position, so ``indices[j][:, -1]`` is the
+        same column for every ``j``. Returned tensors are ``[n_tracked,
+        window_j]`` over the flattened token axis, restricted to
+        ``mamba_track_mask``.
         """
         lens_to_track = (
             forward_batch.mamba_track_seqlens - forward_batch.extend_prefix_lens
@@ -388,10 +368,8 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
 
     def init_forward_metadata_capture_cpu_graph(self, *args, **kwargs):
         # Decode CPU-graph capture path. The base fills forward_metadata but not
-        # the int64 view; without this the conv layers would capture a ``None``
-        # index (crash / corrupt state). Replay goes through init_forward_metadata
-        # and refills the SAME buffer, so the captured cpu graph reads a stable
-        # address kept current at replay.
+        # the int64 view, so without this the conv layers capture a ``None``
+        # index. Replay refills the SAME buffer through init_forward_metadata.
         super().init_forward_metadata_capture_cpu_graph(*args, **kwargs)
         self._reset_step_state()
         self._refresh_cache_indices()
@@ -426,15 +404,12 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
     # Mamba radix cache, extra_buffer strategy: the track snapshot
     # ------------------------------------------------------------------
     # Under `no_buffer` the radix tree is handed the request's LIVE state slot,
-    # which is only ever current at the exact token count the scheduler last
-    # saw -- hence page_size == 1 and no overlap schedule. `extra_buffer` gives
-    # each request one or two extra pool slots (the ping-pong track buffer) and
-    # snapshots the state into them at KNOWN, chunk-aligned sequence lengths.
-    # That snapshot is what lets the cached key length and the cached state
-    # agree while the scheduler runs a step ahead of the GPU, and what lets the
-    # cached prefix be trimmed to a page boundary. Without it, enabling
-    # extra_buffer would insert `token_ids[:mamba_last_track_seqlen]` against a
-    # never-written slot -- a prefix hit that restores garbage conv state.
+    # current only at the exact token count the scheduler last saw -- hence
+    # page_size == 1 and no overlap schedule. `extra_buffer` gives each request
+    # extra pool slots (the ping-pong track buffer) and snapshots the state into
+    # them at KNOWN, chunk-aligned lengths, which is what lets the cached key
+    # length and the cached state agree while the scheduler runs a step ahead of
+    # the GPU. Without the snapshot, a prefix hit restores garbage conv state.
 
     def track_conv_states_extend(
         self,
@@ -443,23 +418,19 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
     ) -> None:
         """Snapshot this layer's conv entries at the chunk-aligned track point.
 
-        ``conv_states[j]`` must be the EXACT tensor view the conv wrote its
-        state through -- not ``layer_cache.conv[j]`` re-derived here. A rank may
-        own only a leading sub-slice of a pool entry (ZAYA1's lag entry is
-        rank-uniform in the pool but each rank narrows it to its own
-        ``val_proj2`` output width), and the snapshot has to land in the same
-        slice or a prefix restore reloads a row the decode path never wrote.
-        Taking the view from the caller is what keeps the two in lockstep.
+        ``conv_states[j]`` must be the EXACT tensor view the conv wrote its state
+        through, not ``layer_cache.conv[j]`` re-derived here: a rank may own only
+        a leading sub-slice of a rank-uniform pool entry, and the snapshot has to
+        land in the same slice or a prefix restore reloads a row the decode path
+        never wrote.
 
         ``conv_inputs[j]`` is the ``[T, C_j]`` tensor whose last ``window_j``
-        rows ARE that state after the conv runs, in the flattened token layout.
-        A pair is skipped when either side is ``None`` -- at ZAYA1's attn_tp=2
-        rank 0 owns no lag stream at all, so it neither computes nor stores
-        that entry and there is nothing to snapshot.
+        rows ARE that state after the conv runs. A pair is skipped when either
+        side is ``None`` -- a rank owning no lag stream has nothing to snapshot.
 
         Call once per conv layer on the extend path; the state slot the conv
-        itself writes is a different row, so before-or-after the conv is
-        equivalent. A no-op unless this step tracks something.
+        itself writes is a different row, so before-or-after is equivalent. A
+        no-op unless this step tracks something.
         """
         index_list = self._track_conv_indices
         if index_list is None:
@@ -472,10 +443,9 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
         for conv_state, x, indices in zip(conv_states, conv_inputs, index_list):
             if conv_state is None or x is None:
                 continue
-            # Width contract, checked against the state the conv actually wrote
-            # rather than trusted from the caller: a channel mismatch here means
-            # the snapshot and the live state are different quantities, and the
-            # scatter below would either raise or silently write the wrong rows.
+            # Checked against the state the conv actually wrote: a channel
+            # mismatch means the snapshot and the live state are different
+            # quantities, and the scatter below would write the wrong rows.
             assert conv_state.shape[-2] == x.shape[-1], (
                 f"conv state has {conv_state.shape[-2]} channels but its input "
                 f"tensor has {x.shape[-1]}; the snapshot must cache exactly "
@@ -497,18 +467,13 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
         so the row is tracked on the step whose output makes the length a
         multiple of ``mamba_track_interval``.
 
-        CUDA-graph contract. Every tensor read here is either a persistent
-        buffer refilled in place before replay (``_cache_indices`` and
-        ``forward_metadata.mamba_track_indices``, both backend-owned; and
-        ``forward_batch.mamba_track_mask``, the graph registry slot) or a
-        constant allocated at init. Capture therefore MUST reach this call and
-        record the scatter: during capture the mask buffer is all-False, so the
-        kernel is inert and copies nothing, but the launch is in the graph and
-        the refilled mask makes it fire at replay. Skipping the launch at
-        capture time because "nothing is tracked right now" would silently drop
-        every snapshot for the life of the graph. The intermediate index
-        tensors below are allocated inside the captured region, so they come
-        from the graph's private pool and are reused verbatim on replay.
+        CUDA-graph contract. Every tensor read here is either a persistent buffer
+        refilled in place before replay or a constant allocated at init, so
+        capture MUST reach this call and record the scatter: during capture the
+        mask buffer is all-False and the kernel is inert, but the launch is in
+        the graph and the refilled mask makes it fire at replay. Skipping the
+        launch because "nothing is tracked right now" silently drops every
+        snapshot for the life of the graph.
         """
         if self._track_pairs is None:
             return
@@ -526,11 +491,10 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
 
         row_ok = mask[:bs]
         if self.enable_unified_memory:
-            # The unified pool's v2p translate tombstones freed slots with -1;
-            # folded into the mask (not left to the kernel's own check) because
-            # `layer_base + -1` would alias the previous layer's last slot.
-            # `_cache_indices` has already clamped its own -1s away, so the
-            # source sentinel is read off the untouched metadata tensor.
+            # The unified pool's v2p translate tombstones freed slots with -1.
+            # Folded into the mask rather than left to the kernel's own check,
+            # because `layer_base + -1` aliases the previous layer's last slot.
+            # `_cache_indices` already clamped its -1s, hence the raw tensor.
             raw_src = md.mamba_cache_indices
             row_ok = row_ok & (dst[:bs] >= 0) & (raw_src[:bs] >= 0)
         base = self._track_layer_row_base  # [n_layers, 1]

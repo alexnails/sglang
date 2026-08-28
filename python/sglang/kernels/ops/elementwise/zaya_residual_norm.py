@@ -14,14 +14,9 @@ precomputes, and only the normalized output is rounded to the model dtype -- the
 same single rounding the torch chain performs at its ``.to()``.
 
 sglang's ``RMSNorm.forward(x, residual)`` already offers a fused add+norm, but
-ZAYA1 cannot use it: it would have to run at the model dtype, discarding the fp32
+ZAYA1 cannot use it: it would run at the model dtype, discarding the fp32
 residual, and it has no notion of the per-channel residual scaling that comes
 first.
-
-Motivation: this chain was ~25% of decode GPU time in an op-level profile of
-ZAYA1-base (addcmul 9.1%, add 6.6%, rmsnorm 3.9%, plus the casts inside a 12.0%
-aten::copy_). It matters most where decode is launch-bound rather than
-bandwidth-bound -- bs=1 sits at ~16% of the measured memory roofline.
 
 Follows ``kda_fused_decode``'s structure: a ``covered()`` predicate gates
 supported inputs and the caller falls back to the torch chain. Triton, so it runs
@@ -105,12 +100,8 @@ def covered(
     norm_weight: Optional[torch.Tensor],
     folded: bool,
 ) -> bool:
-    """Whether the fused chain can serve these inputs.
-
-    Requires the folded ``bias * scale`` constants to exist (``fold_scales`` has
-    run), a hidden dim that fits one Triton block, an fp32 residual, and unit
-    innermost strides.
-    """
+    """Whether the fused chain can serve these inputs. ``folded`` says the
+    ``bias * scale`` constants exist, i.e. ``fold_scales`` has run."""
     if not folded or norm_weight is None:
         return False
     if not hidden_states.is_cuda or hidden_states.ndim != 2:
@@ -123,8 +114,7 @@ def covered(
     if residual is not None:
         if residual.shape != hidden_states.shape:
             return False
-        # The fp32 residual stream is the whole reason this kernel exists; a
-        # non-fp32 residual means the caller is not the path we modelled.
+        # The fp32 residual stream is the whole reason this kernel exists.
         if residual.dtype != torch.float32 or residual.stride(-1) != 1:
             return False
     return hidden_states.dtype in (torch.float32, torch.float16, torch.bfloat16)

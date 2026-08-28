@@ -1375,28 +1375,19 @@ def _zaya_overrides(server_args: Any, hf_config: Any) -> dict:
 
     ``mamba_full_memory_ratio``: the global 0.9 default assumes the linear-attn
     state dominates the cache, which holds for models with only a few
-    full-attention layers (Qwen3-Next et al). ZAYA1 is half full-attention, so
-    its KV is the dominant consumer and the ratio badly over-allocates: 0.9
-    spends ~47% of the post-weights budget on conv states. One CCA slot costs
-    ``num_attn_layers * ((q+kv)*head_dim*2 + hidden) * 2`` bytes -- 360 KB on
-    ZAYA1-base, 1.0 MB on 74B -- i.e. 9 (base) to 17 (74B) tokens of KV each,
-    and only a few thousand slots are ever reachable (``max_running_requests *
-    mamba ratio`` live, plus the radix tree's tracked states). Measured on
-    ZAYA1-base / MI350X: 0.9 allocated 214,758 slots = 73.7 GB of conv state for
-    a server capped at 8 concurrent requests; dropping the ratio leaves the slot
-    count comfortable and grows the KV cache ~1.8-1.9x. Yields to an explicit
+    full-attention layers. ZAYA1 is half full-attention, so its KV is the
+    dominant consumer and 0.9 spends ~47% of the post-weights budget on conv
+    states -- measured on ZAYA1-base / MI350X, 214,758 slots (73.7 GB) for a
+    server capped at 8 concurrent requests. Yields to an explicit
     --mamba-full-memory-ratio.
 
-    ``enable_dp_lm_head``: ZAYA1 checkpoints tie the LM head to the input
-    embedding. Under DP attention ``embed_tokens`` must shard its vocab over the
-    attention-TP sub-group (each replica embeds only its own tokens), so the tied
-    head inherits that shard group -- ``vocab/attn_tp`` rows. ``LogitsProcessor``
-    all-gathers logits over the attention-TP group iff ``enable_dp_lm_head``, and
-    over the *global* TP group otherwise, so leaving it off would gather a
-    ``vocab/attn_tp``-wide logit slice across ``tp_size`` ranks and produce
-    garbage. Turning it on is also the faster path (no cross-DP gather before a
-    262k-row head), so pin it whenever DP attention is active on a tied
-    checkpoint.
+    ``enable_dp_lm_head``: ZAYA1 ties the LM head to the input embedding, and
+    under DP attention ``embed_tokens`` shards its vocab over the attention-TP
+    sub-group, so the tied head inherits ``vocab/attn_tp`` rows.
+    ``LogitsProcessor`` all-gathers over the attention-TP group iff
+    ``enable_dp_lm_head`` and over the *global* TP group otherwise, so leaving it
+    off gathers a ``vocab/attn_tp``-wide slice across ``tp_size`` ranks and
+    produces garbage.
     """
     from sglang.srt.server_args import ServerArgs
 
@@ -1405,15 +1396,11 @@ def _zaya_overrides(server_args: Any, hf_config: Any) -> dict:
     if server_args.mamba_full_memory_ratio == ServerArgs.mamba_full_memory_ratio:
         overrides["mamba_full_memory_ratio"] = 0.05
 
-    # ``swa_full_tokens_ratio`` sizes the sliding-window sub-pool as a fraction of
-    # the full sub-pool. The 0.8 global default assumes the two pools serve
-    # comparable residency, which is badly wrong for ZAYA1-74B: its window is 4096
-    # against a 262144 context, so a request needs 64x fewer slots in the SWA
-    # layers than in the full ones. Measured on 8x MI350X at tp=8/dp=4, 0.8 gave
-    # the SWA pool 6.37M tokens (91 GiB) to hold what ~4096/request needs, capping
-    # the full pool at 7.96M; dropping the ratio moves that memory to the full
-    # pool, which is what actually bounds long-context concurrency. Matches the
-    # value Inkling pins for the same reason. Yields to an explicit
+    # ``swa_full_tokens_ratio`` sizes the sliding-window sub-pool as a fraction
+    # of the full one. The 0.8 default assumes comparable residency, but ZAYA1's
+    # 4096 window against a 262144 context needs 64x fewer SWA slots: measured at
+    # tp=8/dp=4, 0.8 gave the SWA pool 91 GiB to hold what ~4096/request needs.
+    # Matches the value Inkling pins. Yields to an explicit
     # --swa-full-tokens-ratio.
     if server_args.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
         overrides["swa_full_tokens_ratio"] = 0.1
@@ -1878,14 +1865,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         # slots hold real states for prefix-cache restores.
         "KimiK3ForConditionalGeneration",
         # Short-conv hybrid served by ShortConvAttnBackend, which implements the
-        # track snapshot for both of ZAYA1's conv entries. Two things had to be
-        # true first: mamba_cache_chunk_size must be derived from the conv window
-        # rather than the model's scan length (ZAYA1 reports mamba_chunk_size 1,
-        # which is honest -- CCA has no chunked recurrence -- but is below its
-        # conv window), and the snapshot must cache the PROJECTED lag that
-        # conv[1] actually holds, not the raw hidden state. The extend hook now
-        # takes the conv's own state views so the two cannot describe different
-        # tensors, and asserts the widths agree per entry. LFM2 rides the same
+        # track snapshot for both of ZAYA1's conv entries. LFM2 rides the same
         # backend and derivation but is deliberately NOT listed: unvalidated on
         # hardware, and no_buffer is a safe default for it.
         "ZayaForCausalLM",

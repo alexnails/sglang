@@ -62,13 +62,10 @@ def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
                 # Mamba layer with split op support - store the layer itself
                 attn_layer = layer
 
-        # Always append, so both lists stay indexable by layer id -- which is
-        # what the consumers require: ``radix_attention`` reads
-        # ``context.attention_layers[layer_id]``. Layers that hold no attention
-        # at all (a MoE-only layer in an alternating stack, a mamba mixer)
-        # contribute a None placeholder that no attention layer's forward ever
-        # reads. Appending only when attention was found would shorten the list
-        # and silently shift every entry past the first such layer.
+        # Always append: consumers index by layer id (``radix_attention`` reads
+        # ``context.attention_layers[layer_id]``), so a layer holding no
+        # attention contributes a None placeholder. Appending only when attention
+        # was found shortens the list and shifts every entry past that layer.
         attention_layers.append(attn_layer)
         mha_companion_layers.append(mha_companion_layer)
 

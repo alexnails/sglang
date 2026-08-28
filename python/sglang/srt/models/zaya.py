@@ -17,27 +17,23 @@
 Architecture summary (see docs/supported_models/text_generation/zaya_design.md
 for the full design notes):
 
-- Even-indexed layers run :class:`ZayaAttention`, which feeds hidden states to
-  the :class:`CCA` (Compressed Convolutional Attention) projection. CCA emits
-  q/k/v via two small (``kernel_size=2``) depthwise + grouped 1D convolutions
-  over the time axis plus a learnable per-K-head temperature. The conv needs a
-  two-token left padding that is sourced from a per-request state cache owned
-  by the CCA module itself. The q/k/v then go through partial rotary embedding
-  (``partial_rotary_factor=0.5``) and SGLang's :class:`RadixAttention` for the
-  softmax MHA. The implementation only uses ``torch`` / ``torch.nn`` ops, so the
-  same code runs on NVIDIA and AMD GPUs.
+- Even-indexed layers run :class:`ZayaAttention`, feeding hidden states to the
+  :class:`CCA` (Compressed Convolutional Attention) projection: q/k/v from two
+  small (``kernel_size=2``) depthwise + grouped 1D convolutions over the time
+  axis plus a learnable per-K-head temperature, then partial rotary embedding
+  (``partial_rotary_factor=0.5``) and :class:`RadixAttention`. The conv's
+  two-token left padding comes from a per-request state cache.
 - Odd-indexed layers run :class:`ZayaBlock`, an MoE mixer built around SGLang's
   :class:`FusedMoE`. Expert routing uses a 3-layer MLP with EDA (depth-wise
   averaging across MoE layers) and MOD (mixture-of-depths skip expert).
 - Per-layer :class:`ResidualScaling` keeps the residual stream in fp32 with
   affine scale/bias both on the residual and on the post-mixer hidden states.
-- Per-request CCA state (``conv_state`` + the ``val_proj2`` lag) lives in
-  SGLang's centralized ``MambaPool`` inside ``HybridReqToTokenPool``. The
-  state plumbing (slot indices, prefix mask, cuda-graph buffers) is owned by
-  ``ShortConvAttnBackend`` and reached via
-  ``get_attn_backend().conv_state_metadata()``, so the model holds no pool
-  access; CCA runs its own conv (:func:`cca_extend` / :func:`cca_decode`)
-  against the returned handle.
+- Per-request CCA state (``conv_state`` + the ``val_proj2`` lag) lives in the
+  centralized ``MambaPool`` inside ``HybridReqToTokenPool``. Its plumbing (slot
+  indices, prefix mask, cuda-graph buffers) is owned by ``ShortConvAttnBackend``
+  and reached via ``get_attn_backend().conv_state_metadata()``, so the model
+  holds no pool access; CCA runs its own conv (:func:`cca_extend` /
+  :func:`cca_decode`) against the returned handle.
 """
 
 from __future__ import annotations
@@ -129,11 +125,9 @@ class ResidualScaling(nn.Module):
             self.residual_scale = nn.Parameter(torch.ones(self.hidden_size))
             self.residual_bias = nn.Parameter(torch.zeros(self.hidden_size))
         # Folded constants, recomputed after every weight load by
-        # ``fold_scales``. Explicitly fp32 (not the ambient default dtype, which
-        # model loading sets to the checkpoint dtype): the original formulation
-        # cast scale/bias up to fp32 before the arithmetic, and these buffers
-        # are what preserve that accumulation precision in the fused form.
-        # Non-persistent -- derived from parameters, never part of a checkpoint.
+        # ``fold_scales``. Explicitly fp32, not the ambient default dtype (which
+        # model loading sets to the checkpoint dtype): fp32 is the accumulation
+        # precision the unfused form used. Non-persistent, derived from params.
         for name in (
             ("hidden_states", "residual") if self.has_residual else ("hidden_states",)
         ):
@@ -175,12 +169,9 @@ class ResidualScaling(nn.Module):
         hidden_states: torch.Tensor,
     ) -> tuple[Optional[torch.Tensor], torch.Tensor]:
         # ``(x + b) * s == x * s + (b * s)``. ``b`` and ``s`` are load-time
-        # constants, so the ``b * s`` product is folded once (``fold_scales``)
-        # and each stream costs a single fused multiply-add instead of a
-        # cast + add + mul chain. ZAYA1 runs this twice per layer over 120
-        # layers, so the saved launches are the single largest elementwise
-        # contributor in a decode step (measured: 274-624 us/step on MI350X,
-        # and bit-comparable at fp32 -- rel err ~1e-7).
+        # constants, so ``b * s`` is folded once (``fold_scales``) and each
+        # stream costs one fused multiply-add instead of cast + add + mul.
+        # Not bit-identical to the unfused chain; rel err ~1e-7 at fp32.
         hidden_states = torch.addcmul(
             self.hidden_states_bias_scaled, hidden_states, self.hidden_states_scale_f32
         )
@@ -200,11 +191,9 @@ def _apply_norm_with_fp32_residual(
 ) -> torch.Tensor:
     """Normalize ``residual`` (typically fp32) and cast back to ``target_dtype``.
 
-    The fp32 residual stream is preserved by the caller (the residual tensor
-    is kept around for the next accumulation), so the norm itself can run at
-    ``target_dtype`` -- this lets us hit the fused sgl_kernel rmsnorm path
-    instead of the eager ``forward_native`` fallback (5+ kernel launches per
-    call, ×120 norms per step).
+    The caller keeps the fp32 residual for the next accumulation, so the norm
+    itself can run at ``target_dtype`` and hit the fused sgl_kernel rmsnorm path
+    rather than the eager ``forward_native`` fallback.
     """
     return norm(residual.to(target_dtype))
 
@@ -212,21 +201,16 @@ def _apply_norm_with_fp32_residual(
 # ---------------------------------------------------------------------------
 # CCA conv-state kernels (v1 torch)
 #
-# ZAYA1-specific conv step: the CCA conv is a causal two-stage conv over
-# ``qk = [W_q hs || W_k hs]`` plus a one-token lag for the ``val_proj2`` value
-# stream. The per-request conv state lives in the centralized MambaPool; the
-# backend (ShortConvAttnBackend) hands out the slot indices + prefix flags and
-# CCA runs these functions against them. ``conv_qk`` is the module's two-stage
-# conv; both functions mutate ``conv_state`` / ``lag_state`` in place and return
-# ``(qk_out, lag_prev)`` -- the conv output ``[T, in_out_ch]`` and the
-# right-shifted lag stream ``[T, lag_dim]``.
+# A causal two-stage conv over ``qk = [W_q hs || W_k hs]`` plus a one-token lag
+# for the ``val_proj2`` value stream. The per-request state lives in the
+# centralized MambaPool; ShortConvAttnBackend hands out the slot indices and
+# prefix flags. Both functions mutate ``conv_state`` / ``lag_state`` in place and
+# return ``(qk_out [T, in_out_ch], lag_prev [T, lag_dim])``.
 #
-# The lag stream carries the *projected* value ``W_v2 . hs`` rather than the raw
-# hidden state. ``val_proj2`` is linear and bias-free, so ``W_v2 . shift(hs) ==
-# shift(W_v2 . hs)``: projecting before the state write is the same function and
-# the cached quantity shrinks from ``hidden_size`` to ``latent_k_dim / 2`` (4096
-# -> 128 on ZAYA1-74B). See ``CCA.__init__`` for the gate and
-# ``ZayaConfig.cca_cache_projected_v2`` for the pool-shape side of it.
+# The lag stream carries the *projected* value ``W_v2 . hs``: ``val_proj2`` is
+# linear and bias-free, so ``W_v2 . shift(hs) == shift(W_v2 . hs)`` and the
+# cached quantity shrinks from ``hidden_size`` to ``latent_k_dim / 2``. See
+# ``CCA.__init__`` and ``ZayaConfig.cca_cache_projected_v2`` for the pool shape.
 #
 # ``lag_now`` / ``lag_state`` are ``None`` on a rank whose K heads all come from
 # ``val_proj1``: it never reads the lag, so it neither computes nor stores it.
@@ -248,9 +232,6 @@ def _shift_lag_into(
     the request's cached slot when it resumes a prefix and from zero when it does
     not (a fresh request's first ``val_proj2`` input is defined to be zero, which
     is exactly what MambaPool's zeroed slot holds).
-
-    Two slice copies rather than ``cat`` + one copy: the same launch count with
-    half the bytes, since the concatenate's temporary is never materialized.
     """
     if end <= start:
         return
@@ -279,21 +260,17 @@ def cca_extend(
     Walks each request in the batch, applies ``conv_fn`` with the request's own
     initial state (zeros on a fresh first chunk, the cached ``conv_state`` slot
     otherwise), writes the updated ``conv_state`` / ``lag_state`` back, and
-    returns ``(qk_out, lag_prev)`` in the original token layout.
-
-    ``lag_now`` is this chunk's ``val_proj2`` value at each token and ``lag_prev``
-    is that stream shifted right by one, sourced across a chunk boundary from the
-    cached slot. Both are ``None`` when the rank does not use the lag.
+    returns ``(qk_out, lag_prev)`` in the original token layout. ``lag_prev`` is
+    this chunk's ``val_proj2`` stream shifted right by one, sourced across a chunk
+    boundary from the cached slot; both are ``None`` when the rank has no lag.
 
     ``conv_fn`` maps ``[N, C, S + total_padding] -> [N, C, S]``; callers pass
-    :meth:`CCA._conv_qk_run` so the folded single grouped conv is used when it is
-    available.
+    :meth:`CCA._conv_qk_run`. ``slot_ids`` is the host mirror of the per-request
+    MambaPool slot indices and ``has_prefix[i]`` is ``True`` when request ``i``
+    resumes a cached prefix.
 
-    ``slot_ids`` is the host mirror of the per-request MambaPool slot indices and
-    ``has_prefix[i]`` is ``True`` when request ``i`` resumes a cached prefix.
-
-    The launch count here grows with the batch and the loop trip count comes from
-    ``extend_seq_lens_cpu``, which is also what blocks the prefill CUDA graph;
+    The loop trip count comes from ``extend_seq_lens_cpu``, which is also what
+    blocks the prefill CUDA graph;
     :func:`cca_conv1d_fn <sglang.kernels.ops.attention.cca_conv1d.cca_conv1d_fn>`
     is the device-driven replacement.
     """
@@ -365,9 +342,8 @@ def cca_extend(
             if lag_now is not None:
                 # Chunked prefill: the boundary row carries the PROJECTED value
                 # the previous chunk left behind, so a resumed prefix reads the
-                # same v2 it would have seen in a single-chunk run. Writing the
-                # raw hidden state here instead would silently degrade the
-                # resumed tokens with no shape or dtype error to catch it.
+                # same v2 a single-chunk run would have seen. The raw hidden
+                # state here would degrade resumed tokens with no error.
                 _shift_lag_into(lag_prev, lag_now, start, end, prefix, lag_state, slot)
             start = end
 
@@ -388,12 +364,11 @@ def cca_decode(
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Single-token decode conv-state step (v1, pure torch).
 
-    Gathers each request's cached ``conv_state`` / ``lag_state`` via
-    ``index_select``, applies the conv over the ``[T, C, total_padding + 1]``
-    window, and scatters the updated state back with ``index_copy_``. All ops are
-    on-device (``mamba_indices`` is a device ``long`` tensor), so this stays
-    CUDA-graph capturable. Returns ``(qk_out, lag_prev)`` where ``lag_prev`` is
-    the previous step's ``val_proj2`` value (``None`` when unused by this rank).
+    Gathers each request's cached ``conv_state`` / ``lag_state``, applies the
+    conv over the ``[T, C, total_padding + 1]`` window, and scatters the updated
+    state back. Every op is on-device, so this stays CUDA-graph capturable.
+    Returns ``(qk_out, lag_prev)`` where ``lag_prev`` is the previous step's
+    ``val_proj2`` value (``None`` when unused by this rank).
 
     When ``decode_conv_weight`` / ``_bias`` / ``_groups`` are supplied (see
     :meth:`CCA.fold_decode_conv`) the two conv stages are evaluated as a single
@@ -408,11 +383,9 @@ def cca_decode(
     if _state_step.covered(
         qk, lag_now, conv_state, lag_state, mamba_indices, total_padding
     ):
-        # One kernel for the gathers, the concat and the scatters. When the
-        # folded weight is available it carries the conv bias in a trailing
-        # column, so ask for the matching constant-1.0 tap and let the bias land
-        # in the matmul accumulator instead of a separate add (see
-        # ``fold_decode_conv``).
+        # One kernel for the gathers, the concat and the scatters. A folded
+        # weight carries the conv bias in a trailing column, so ask for the
+        # matching constant-1.0 tap (see ``fold_decode_conv``).
         padded, lag_prev = _state_step.cca_state_step(
             qk,
             lag_now,
@@ -451,13 +424,9 @@ def cca_decode(
     return qk_out, lag_prev
 
 
-# Fused kernel seam (TODO) -- perf swap for the v1 torch paths above. These
-# mirror the ``causal_conv1d_fn`` / ``causal_conv1d_update`` contract but for
-# CCA's two-stage *grouped* conv (conv_qk[0] depthwise + conv_qk[1] grouped
-# per-head), which the stock depthwise ``causal_conv1d`` cannot express. Once
-# implemented they replace the per-request loop in ``cca_extend`` and the
-# separate gather/conv/scatter launches in ``cca_decode`` with a single
-# index-driven kernel. Same ``(qk_out, lag_prev)`` return contract.
+# Fused kernel seam: Triton replacements for the v1 torch paths above, with the
+# same ``(qk_out, lag_prev)`` contract. The stock depthwise ``causal_conv1d``
+# cannot express CCA's two-stage grouped conv, hence the dedicated kernels.
 
 
 def cca_conv1d_fn(*args, **kwargs):
@@ -477,24 +446,21 @@ def _cca_decode_conv(
     """Apply the decode conv to a ``[T, C, taps]`` window, returning ``[T, C]``.
 
     Prefers the load-time-folded single grouped matmul (see
-    :meth:`CCA.fold_decode_conv`) and falls back to running the real two-stage
-    ``conv_qk``, which is what an unfolded module (e.g. a CPU unit test) gets.
+    :meth:`CCA.fold_decode_conv`) and falls back to the real two-stage
+    ``conv_qk``, which is what an unfolded module (a CPU unit test) gets.
 
-    The folded weight spans ``taps + 1`` inputs per channel: the extra one is the
-    bias, activated by a constant-1.0 column in the window. ``cca_state_step``
-    writes that column for free; a window that arrives without it (the unfused
-    gather/concat fallback) gets it appended here, which is one extra op on a
-    path that is already off the fast one.
+    The folded weight spans ``taps + 1`` inputs per channel; the extra one is the
+    bias, activated by a constant-1.0 column that ``cca_state_step`` writes. A
+    window arriving without it gets it appended here.
     """
     if decode_conv_weight is not None:
         num_tokens, num_channels = padded.shape[0], padded.shape[1]
         taps_ext = decode_conv_weight.shape[-1] // (num_channels // decode_conv_groups)
         if padded.shape[-1] != taps_ext:
             padded = F.pad(padded, (0, taps_ext - padded.shape[-1]), value=1.0)
-        # [T, C, taps_ext] -> [T, G, Cg*taps_ext] (the trailing (Cg, taps_ext)
-        # dims flatten in place, matching how fold_decode_conv laid out the
-        # weight) -> one grouped matmul -> [T, C]. The bias is already inside the
-        # accumulator, so there is nothing to add afterwards.
+        # [T, C, taps_ext] -> [T, G, Cg*taps_ext] (the trailing dims flatten in
+        # place, matching fold_decode_conv's layout) -> one grouped matmul ->
+        # [T, C], with the bias already inside the accumulator.
         grouped = padded.reshape(num_tokens, decode_conv_groups, -1)
         return torch.einsum("tgk,gok->tgo", grouped, decode_conv_weight).reshape(
             num_tokens, -1
@@ -506,23 +472,15 @@ class CCARope(NamedTuple):
     """The layer's rotary inputs, handed to ``CCA.forward`` for in-kernel RoPE.
 
     ZAYA1-74B builds TWO rotary caches -- a full-attention one keyed on
-    ``rope_theta`` (1e7) and a sliding-window one keyed on ``swa_rotary_base``
-    (10000) -- and picks per layer, so the fused path must read *this* layer's
-    buffer rather than a model-wide one. ``get_rope`` keys its process-wide cache
-    on ``base`` among other things, so the two are distinct modules with distinct
-    buffers (pinned by ``TestZayaSlidingWindowAttention``'s
-    ``test_attention_selects_window_and_rope_base_per_layer``).
+    ``rope_theta`` and a sliding-window one keyed on ``swa_rotary_base`` -- and
+    picks per layer, so the fused path must read *this* layer's buffer rather
+    than a model-wide one.
 
-    CUDA-graph safety: ``cos_sin_cache`` is a plain ``register_buffer`` allocated
-    once in ``RotaryEmbedding.__init__`` at ``max_position_embeddings`` rows. The
-    only thing that can move it is ``_ensure_cos_sin_cache_length``, whose sole
-    caller is ``reserve_rope_cache_for_long_sequences``, which ``ModelRunner``
-    runs *before* ``init_cuda_graphs`` -- so no reallocation can happen after
-    capture. ``forward_cuda``'s ``self.cos_sin_cache.to(device, dtype)`` is a
-    no-op on ROCm (the cache is already stored in the model dtype) and returns
-    the same tensor, so the baseline rotary launch relies on exactly the same
-    guarantee. The pointer is read fresh from the module on every forward, so an
-    eager run picks up any move regardless.
+    CUDA-graph safety: ``cos_sin_cache`` is allocated once at
+    ``max_position_embeddings`` rows, and the only thing that can move it
+    (``_ensure_cos_sin_cache_length``, via
+    ``reserve_rope_cache_for_long_sequences``) runs before ``init_cuda_graphs``,
+    so no reallocation can happen after capture.
     """
 
     positions: torch.Tensor
@@ -535,16 +493,11 @@ class CCARope(NamedTuple):
         """Snapshot a ``RotaryEmbedding``, or ``None`` if it is not the plain kind.
 
         Exact-type, not isinstance: every subclass changes something the fused
-        kernel does not model -- a per-scaling-factor cache offset
-        (``LinearScalingRotaryEmbedding``), a second cache
-        (``DualChunkRotaryEmbedding``), a 2-D position layout
-        (``MRotaryEmbedding``). ZAYA1 passes no ``rope_scaling``, so ``get_rope``
-        always hands it the base class; anything else falls back to a separate
-        rotary launch rather than to a guess.
-
-        ``_force_native`` (deterministic RL replay) also declines: that mode
-        deliberately pins the eager torch rotary, and this kernel is not
-        bit-identical to it.
+        kernel does not model (a per-scaling-factor cache offset, a second cache,
+        a 2-D position layout), so anything but the base class falls back to a
+        separate rotary launch rather than to a guess. ``_force_native``
+        (deterministic RL replay) declines too -- this kernel is not
+        bit-identical to the eager torch rotary that mode pins.
         """
         if type(rotary_emb) is not RotaryEmbedding:
             return None
@@ -568,21 +521,18 @@ class CCAKVStore(NamedTuple):
 
     Lets the fused head-mix kernel scatter the post-rope ``k`` and the ``v`` it
     already has straight into the pool, so ``RadixAttention`` runs with
-    ``save_kv_cache=False`` and the per-layer ``set_kv_buffer`` launch (60 per
-    decode step) disappears.
+    ``save_kv_cache=False`` and the per-layer ``set_kv_buffer`` launch disappears.
 
     ``k_cache`` / ``v_cache`` are the plain 3-D NHD ``[size + page_size, H, D]``
     pool buffers, indexed flat by slot -- the same rows ``_set_kv_buffer_impl``
     writes, so no page arithmetic is involved and the write is correct for any
-    page size. ``full_to_swa`` is the hybrid pool's slot indirection, present
-    only on a sliding-window layer.
+    page size. ``full_to_swa`` is the hybrid pool's slot indirection, present only
+    on a sliding-window layer.
 
-    CUDA-graph safety: all four tensors are allocated once and mutated in place
-    (the pool buffers at startup, ``full_to_swa_index_mapping`` at allocator
-    construction, ``out_cache_loc`` as the graph's own stable input buffer), so
-    nothing here can be a stale address after capture. This is the same set of
+    CUDA-graph safety: all four tensors are allocated once and mutated in place,
+    so none of them can be a stale address after capture -- the same set of
     pointers ``create_fused_set_kv_buffer_arg`` bakes into the shared ROCm fused
-    rope+store path for the other models that use it.
+    rope+store path.
     """
 
     k_cache: torch.Tensor
@@ -614,13 +564,11 @@ class CCA(nn.Module):
     prefill or for decode it is read from a per-request cache that this module
     maintains internally.
 
-    Parallelism: when ``tp_size > 1`` the CCA is head-parallel. Both the
-    grouped-mean step and the second ``conv_qk`` stage with
-    ``groups=num_q_heads+num_k_heads`` are head-local (each GQA group lives on
-    a single rank), so the entire QKV projection runs without any cross-rank
-    collective. The QKV projections become ``ColumnParallelLinear`` and the
-    two ``nn.Conv1d`` layers are sized per-rank with custom weight loaders
-    that slice the HF checkpoint rows into ``[rank's q heads, rank's k heads]``.
+    Parallelism: at ``tp_size > 1`` the CCA is head-parallel. The grouped-mean
+    step and the second ``conv_qk`` stage are both head-local (each GQA group
+    lives on one rank), so the QKV projection needs no cross-rank collective.
+    The two ``nn.Conv1d`` layers are sized per-rank with custom weight loaders
+    that slice the HF rows into ``[rank's q heads, rank's k heads]``.
     """
 
     def __init__(
@@ -649,10 +597,9 @@ class CCA(nn.Module):
         self.padding1 = self.cca_time1 - 1
         self.total_padding = self.padding0 + self.padding1
 
-        # CCA is head-parallel over the *attention* TP group. That group equals
-        # the global TP group unless DP attention is enabled, in which case it is
-        # the per-DP-replica sub-group (tp_size / dp_size). Tests pass explicit
-        # tp_rank/tp_size; production leaves them None and resolves here.
+        # CCA is head-parallel over the *attention* TP group: the global TP
+        # group unless DP attention is on, else the per-replica sub-group.
+        # Tests pass tp_rank/tp_size explicitly; production resolves here.
         if tp_rank is None:
             tp_rank = get_parallel().attn_tp_rank
         if tp_size is None:
@@ -695,23 +642,13 @@ class CCA(nn.Module):
         self.clamp_temp = bool(getattr(config, "clamp_temp", False))
 
         bias = bool(getattr(config, "attention_bias", False))
-        # ``linear_q`` / ``linear_k`` outputs are laid out as a contiguous head
-        # sequence in the HF checkpoint, so the natural ColumnParallel shard
-        # (``tp_rank * shard``) lands rank ``r`` on the head set
-        # ``[r * heads_per_rank, (r+1) * heads_per_rank)``.
-        #
-        # At ``tp_size == 1`` there is nothing to shard, and on ROCm/aiter the
-        # ColumnParallelLinear path selects a slower GEMM for the large-M prefill
-        # (1.6-2.25x slower than ReplicatedLinear in bench_one_batch), so the
-        # single-GPU case uses ReplicatedLinear. ``tp_size > 1`` keeps
-        # ColumnParallelLinear for the per-rank head shard.
-        # q and k read the same ``hidden_states`` and their outputs are
-        # immediately concatenated, so they are one projection: a single wider
-        # GEMM replaces two skinny ones and the ``cat`` disappears. Decode is
-        # launch-bound on exactly these -- a profile of ZAYA1-base put the skinny
-        # GEMV kernel at 280 launches per step (7 per attention layer) and the
-        # concatenates at 80 -- and the k half is tiny (num_query_groups *
-        # head_dim), so on its own it is nearly all overhead.
+        # The HF checkpoint lays q/k out as a contiguous head sequence, so the
+        # natural ColumnParallel shard lands rank ``r`` on head set
+        # ``[r * heads_per_rank, (r+1) * heads_per_rank)``. q and k read the same
+        # ``hidden_states`` and are concatenated immediately, so they are merged
+        # into one wider GEMM. At ``tp_size == 1`` there is nothing to shard and
+        # ROCm/aiter picks a slower large-M GEMM for ColumnParallelLinear
+        # (measured 1.6-2.25x, bench_one_batch), so tp=1 stays replicated.
         if self.tp_size > 1:
             self.linear_qk = MergedColumnParallelLinear(
                 self.hidden_size,
@@ -724,11 +661,8 @@ class CCA(nn.Module):
                 tp_size=self.tp_size,
             )
         else:
-            # ColumnParallelLinear measured 1.6-2.25x slower than
-            # ReplicatedLinear at tp=1 (bench_one_batch), so the single-GPU case
-            # keeps a plain replicated projection; ``_merged_qk_row_loader``
-            # gives it the same shard-id loading contract as the merged
-            # column-parallel one.
+            # ``_merged_qk_row_loader`` gives the replicated tp=1 projection
+            # the same shard-id loading contract as the column-parallel one.
             self.linear_qk = ReplicatedLinear(
                 self.hidden_size,
                 self.latent_q_dim_full + self.latent_k_dim_full,
@@ -737,14 +671,11 @@ class CCA(nn.Module):
                 prefix=add_prefix("linear_qk", prefix),
             )
             self._install_merged_qk_loader(bias=bias)
-        # The HF V-projection layout maps val_proj1 to the FIRST half of K
-        # heads and val_proj2 to the SECOND half (after ``cat([v1, v2]).view(
-        # T, num_k_heads_full, head_dim)``). That doesn't align with a simple
-        # output-dim ColumnParallel shard, so val_proj1 / val_proj2 are kept
-        # Replicated and the per-rank K-head slice is taken in the forward
-        # passes after ``cat + view``. The replicated weight memory is small
-        # (~0.5 MB / layer) and the wasted compute is negligible compared to
-        # linear_q / linear_k / o_proj.
+        # The HF V layout maps val_proj1 to the FIRST half of K heads and
+        # val_proj2 to the SECOND half (after ``cat([v1, v2]).view(T,
+        # num_k_heads_full, head_dim)``), which no output-dim ColumnParallel
+        # shard expresses. Both stay Replicated and the per-rank K-head slice is
+        # taken after ``cat + view``; the duplicated weight is ~0.5 MB/layer.
         self.val_proj1 = ReplicatedLinear(
             self.hidden_size,
             self.latent_k_dim_full // 2,
@@ -766,36 +697,24 @@ class CCA(nn.Module):
 
         # ----- v2 lag stream (conv[1]) ------------------------------------
         # ``val_proj2`` consumes the PREVIOUS token's hidden state, which is why
-        # CCA carries a second per-request state entry at all.
-        #
-        # Which of the two V projections this rank actually reads. ``val_proj1``
+        # CCA carries a second per-request state entry at all. ``val_proj1``
         # supplies K heads ``[0, v1_heads)`` and ``val_proj2`` the rest, so a
-        # rank's contiguous K-head range can fall entirely inside one of them --
-        # the common ZAYA1 case, where ``num_query_groups`` is 2 and attn_tp is
-        # 2, giving rank 0 only val_proj1 and rank 1 only val_proj2. A rank that
-        # does not read val_proj2 needs no lag stream at all: no projection, no
-        # pool read, no pool write.
+        # rank's contiguous K-head range can fall entirely inside one of them.
+        # A rank that never reads val_proj2 needs no lag stream at all.
         v1_heads = self.num_k_heads_full // 2
         v_head_aligned = self.num_k_heads_full % 2 == 0
         self.v_uses_val1 = (not v_head_aligned) or self.k_head_start < v1_heads
         self.v_uses_val2 = (not v_head_aligned) or self.k_head_end > v1_heads
 
-        # ``val_proj2`` is linear, so ``W_v2 . shift(hs) == shift(W_v2 . hs)``:
-        # applying it before the state write caches ``latent_k_dim / 2`` channels
-        # (128 on ZAYA1-74B) instead of ``hidden_size`` (4096) with no change to
-        # the function computed. Two conditions gate it, mirrored by
-        # ``ZayaConfig.cca_cache_projected_v2``, which sizes the pool entry:
-        #
-        #  * no bias -- a freshly allocated slot is zero and the first token's
-        #    val_proj2 input is defined to be zero, and only ``W . 0 == 0``
-        #    reproduces that. With a bias the cached zero would have to stand
-        #    for ``b``, so a biased checkpoint keeps caching the raw hidden
-        #    state and re-projecting after the read.
-        #  * an even K-head count -- otherwise val_proj1 / val_proj2 split
-        #    inside a head and the per-rank slice below is not head-aligned.
-        #
-        # Read the bias off the constructed module rather than the config flag:
-        # it is the thing the forward pass would actually add.
+        # ``val_proj2`` is linear, so ``W_v2 . shift(hs) == shift(W_v2 . hs)``
+        # and projecting before the state write caches ``latent_k_dim / 2``
+        # channels instead of ``hidden_size``. Two conditions gate it, mirrored
+        # by ``ZayaConfig.cca_cache_projected_v2``, which sizes the pool entry:
+        # no bias (a fresh slot is zero and the first val_proj2 input is defined
+        # to be zero, which only ``W . 0 == 0`` reproduces), and an even K-head
+        # count (otherwise the val_proj1/val_proj2 split is not head-aligned).
+        # Read the bias off the constructed module, not the config flag: it is
+        # what the forward pass would actually add.
         self.cache_projected_v2 = (
             getattr(self.val_proj2, "bias", None) is None and v_head_aligned
         )
@@ -810,11 +729,9 @@ class CCA(nn.Module):
         else:
             self.v2_lag_dim = self.hidden_size
 
-        # Two-stage depthwise + grouped conv along the time axis, sized for
-        # this rank's head subset. Wrapping the two nn.Conv1d modules in
-        # nn.Sequential makes the HF checkpoint keys ``conv_qk.{0,1}.weight``
-        # / ``conv_qk.{0,1}.bias`` map onto submodules 1:1, with TP slicing
-        # handled by the custom weight_loader attached below.
+        # Two-stage depthwise + grouped conv along the time axis, sized for this
+        # rank's head subset. nn.Sequential is what maps the HF keys
+        # ``conv_qk.{0,1}.{weight,bias}`` onto submodules 1:1.
         self.conv_qk = nn.Sequential(
             nn.Conv1d(
                 in_channels=self.in_out_ch,
@@ -834,19 +751,14 @@ class CCA(nn.Module):
             ),
         )
 
-        # Decode-time fold of the two conv stages into one grouped matmul.
-        # Filled by ``fold_decode_conv`` after weight load; see that method and
-        # ``cca_decode`` for the derivation. Non-persistent (derived from the
-        # conv_qk parameters, and those are already TP-sliced per rank, so the
-        # fold is automatically per-rank correct).
+        # Decode-time fold of the two conv stages into one grouped matmul,
+        # filled by ``fold_decode_conv`` after weight load. Non-persistent, and
+        # per-rank correct because conv_qk's parameters are already TP-sliced.
         self.decode_conv_groups = self.num_q_heads + self.num_k_heads
         self.decode_conv_taps = self.total_padding + 1
-        # The matmul's window carries one extra constant-1.0 tap per channel so
-        # the conv bias can ride in the weight instead of a separate add -- see
-        # ``fold_decode_conv``. Only the last of those columns holds the bias;
-        # the other ``ch_per_group - 1`` are zero, which costs a wider K on a
-        # GEMM that is launch-bound anyway and buys back one launch per
-        # attention layer (60 per decode step on ZAYA1-74B).
+        # The window carries one extra constant-1.0 tap per channel so the conv
+        # bias rides in the weight instead of a separate add (see
+        # ``fold_decode_conv``). Only the last column holds the bias.
         self.decode_conv_taps_ext = self.decode_conv_taps + 1
         ch_per_group = self.in_out_ch // self.decode_conv_groups
         self.register_buffer(
@@ -859,30 +771,25 @@ class CCA(nn.Module):
             persistent=False,
         )
         # Kept alongside the folded weight even though the einsum path no longer
-        # adds it: ``_conv_qk_run`` hands it to ``F.conv1d`` and the fused prefill
-        # conv takes it as a kernel argument, both of which absorb a bias for
-        # free.
+        # adds it: ``_conv_qk_run`` and the fused prefill conv both take a bias.
         self.register_buffer(
             "decode_conv_bias",
             torch.zeros(self.decode_conv_groups, ch_per_group),
             persistent=False,
         )
-        # Same folded coefficients, laid out as a grouped ``conv1d`` weight
-        # ``[C_out, C_in/groups, kernel]``. The fold is a convolution -- the same
-        # 3-tap kernel applies at every output position -- so it serves the
-        # multi-timestep extend path as well as the single-step decode one,
-        # replacing conv_qk's two MIOpen grouped convs with one.
+        # Same folded coefficients as a grouped ``conv1d`` weight
+        # ``[C_out, C_in/groups, kernel]``. The fold is itself a convolution, so
+        # it serves the multi-timestep extend path as well as decode.
         self.register_buffer(
             "fold_conv1d_weight",
             torch.zeros(self.in_out_ch, ch_per_group, self.decode_conv_taps),
             persistent=False,
         )
-        # The folded buffers are only valid once ``fold_decode_conv`` has run
-        # against loaded weights. Until then ``forward`` must keep using the real
-        # ``conv_qk`` -- consuming the zero-initialized buffers would silently
-        # emit bias-only output. Folding is done eagerly at load time rather than
-        # lazily in ``forward``, because a lazy fold would execute inside CUDA
-        # graph capture and bake stale constants into the replayed graph.
+        # Until ``fold_decode_conv`` has run against loaded weights, ``forward``
+        # must keep using the real ``conv_qk``: the zero-initialized buffers
+        # would silently emit bias-only output. Folding at load time rather than
+        # lazily in ``forward`` keeps it out of CUDA-graph capture, which would
+        # bake stale constants into the replayed graph.
         self._decode_conv_folded = False
 
         # Tri-state cache for ``_fused_prefill_conv_allowed``; None == not yet
@@ -893,8 +800,7 @@ class CCA(nn.Module):
         self.temp = nn.Parameter(torch.zeros(self.num_k_heads))
 
         # ``sqrt(head_dim) * temperature`` per k head, folded once after weight
-        # load for the fused q/k head-mix kernel (see fold_qk_scales). fp32 to
-        # match the accumulation precision of the torch path it replaces.
+        # load (see fold_qk_scales). fp32 to match the torch path it replaces.
         self.register_buffer(
             "qk_k_scale",
             torch.zeros(self.num_k_heads, dtype=torch.float32),
@@ -904,9 +810,7 @@ class CCA(nn.Module):
 
         # Set by every ``_mix_and_normalize_qk``: True when the fused kernel also
         # applied the rotary, so ``ZayaAttention`` skips its own rotary launch.
-        # A python bool, like qwen3_moe's ``_used_fused_qk_norm_rope_last_call``:
-        # it is decided from static properties (shapes, dtypes, devices) so it is
-        # stable across a CUDA-graph capture and its replays.
+        # Decided from static properties, so it is stable across graph replays.
         self.rope_fused = False
         # Likewise for the fused KV scatter: True when the kernel already wrote
         # k/v into the pool, so ``ZayaAttention`` passes save_kv_cache=False.
@@ -915,21 +819,18 @@ class CCA(nn.Module):
         self._last_fusion_state: Optional[tuple] = None
 
         # Attach TP-aware weight loaders to conv_qk weights/biases and ``temp``
-        # so the existing ``load_weights`` dispatch (``getattr(param,
-        # "weight_loader", default_weight_loader)``) automatically slices the
-        # HF checkpoint into rank-local rows.
+        # so ``load_weights``' existing dispatch slices the HF checkpoint into
+        # rank-local rows.
         if self.tp_size > 1:
             self._install_tp_weight_loaders()
 
     # ----- TP weight loaders ----------------------------------------------
 
     def _install_tp_weight_loaders(self) -> None:
-        """Attach TP-aware ``weight_loader`` attributes to parameters whose
-        full-tensor → per-rank slicing cannot be expressed by a generic
-        ColumnParallelLinear loader: the two ``conv_qk`` Conv1d weights and
-        biases (where the per-rank "row" set is the discontiguous union of
-        this rank's q heads and this rank's k heads) and the per-K-head
-        ``temp`` parameter.
+        """Attach ``weight_loader`` attributes to the parameters a generic
+        ColumnParallelLinear loader cannot shard: the ``conv_qk`` Conv1d weights
+        and biases, whose per-rank rows are the discontiguous union of this
+        rank's q heads and k heads, and the per-K-head ``temp``.
         """
         head_dim = self.head_dim
         latent_q_dim_full = self.latent_q_dim_full
@@ -946,10 +847,8 @@ class CCA(nn.Module):
 
         def conv_row_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
             # Both Conv1d.weight ([C_out, in_per_group, K]) and Conv1d.bias
-            # ([C_out]) slice along the leading (output channel) dim. The
-            # per-rank rows are the rank's q heads (contiguous) followed by
-            # the rank's k heads (contiguous in the second half of the full
-            # tensor).
+            # ([C_out]) slice along the leading dim: this rank's q heads, then
+            # its k heads from the second half of the full tensor.
             sliced = torch.cat(
                 [loaded_weight[q_start:q_end], loaded_weight[k_start:k_end]],
                 dim=0,
@@ -975,10 +874,9 @@ class CCA(nn.Module):
     def _install_merged_qk_loader(self, *, bias: bool) -> None:
         """Give the tp=1 replicated q/k projection a shard-id weight loader.
 
-        ``MergedColumnParallelLinear`` already accepts ``(param, weight,
-        loaded_shard_id)``; ``ReplicatedLinear`` does not, so attach an
-        equivalent that writes shard 0 (q) then shard 1 (k) into the merged rows.
-        Keeps ``load_weights`` free of a tp==1 special case.
+        ``ReplicatedLinear`` does not accept ``(param, weight,
+        loaded_shard_id)``, so attach an equivalent that writes shard 0 (q) then
+        shard 1 (k), keeping ``load_weights`` free of a tp==1 special case.
         """
         q_rows = self.latent_q_dim_full
 
@@ -995,11 +893,9 @@ class CCA(nn.Module):
             )
             param.data[start:end].copy_(loaded_weight)
 
-        # Assigned directly rather than through ``set_weight_attrs``:
-        # ReplicatedLinear already installs its own single-shard weight_loader,
-        # and set_weight_attrs asserts against overwriting an existing attribute.
-        # Replacing it is the point here -- the merged parameter needs the
-        # shard-aware loader.
+        # Assigned directly, not via ``set_weight_attrs``: that asserts against
+        # overwriting, and replacing ReplicatedLinear's own single-shard
+        # weight_loader is exactly the point here.
         self.linear_qk.weight.weight_loader = merged_row_loader
         if bias:
             self.linear_qk.bias.weight_loader = merged_row_loader
@@ -1036,14 +932,9 @@ class CCA(nn.Module):
         query_pre: torch.Tensor,
         key_base: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Blend the post-conv q/k with the per-GQA-group mean of the
-        pre-conv (raw projection) q/k, matching the ZAYA1 training formula.
-
-        Shapes (T = num_tokens):
-            query_conv : [T, num_q_heads, head_dim]      (fp32, post conv)
-            key_conv   : [T, num_k_heads, head_dim]      (fp32, post conv)
-            query_pre  : [T, num_q_heads, head_dim]      (raw W_q hs)
-            key_base   : [T, num_k_heads, head_dim]      (raw W_k hs)
+        """Blend the post-conv q/k with the per-GQA-group mean of the pre-conv
+        (raw projection) q/k, matching the ZAYA1 training formula. All four
+        inputs are ``[T, heads, head_dim]``; the ``_conv`` pair is fp32.
         """
         num_k_heads = key_base.shape[-2]
         key_base_fp32 = key_base.to(torch.float32)
@@ -1070,10 +961,8 @@ class CCA(nn.Module):
     def fold_qk_scales(self) -> None:
         """Fold ``sqrt(head_dim) * temperature`` into one fp32 vector.
 
-        ``_normalize_qk`` applies both factors to k (and the ``clamp_temp``
-        exponential) on every forward; they depend only on loaded weights, so the
-        fused kernel takes the product precomputed. Refreshed by
-        ``ZayaForCausalLM.fold_decode_constants`` after every weight load.
+        Both factors depend only on loaded weights, so the fused kernel takes the
+        product precomputed. Refreshed after every weight load.
         """
         temp = self.temp.detach().to(torch.float32)
         if self.clamp_temp:
@@ -1101,11 +990,10 @@ class CCA(nn.Module):
         when it cannot serve the shapes (see ``cca_qk_mix.covered``) -- notably
         before ``fold_qk_scales`` has run, so CPU unit tests keep the torch path.
 
-        ``rope`` and ``kv_store`` are two further, independent gates on top of
-        ``covered()``: an input the mix can serve but one of them cannot still
-        gets the fused mix, and ``self.rope_fused`` / ``self.kv_store_fused``
-        tell the caller which launches it still owes. ``rope`` must win for
-        ``kv_store`` to be offered -- storing an un-rotated k would be silent KV
+        ``rope`` and ``kv_store`` are two further independent gates on top of
+        ``covered()``, reported by ``self.rope_fused`` / ``self.kv_store_fused``
+        so the caller knows which launches it still owes. ``rope`` must win for
+        ``kv_store`` to be offered: storing an un-rotated k would be silent KV
         corruption, and the rotation happens inside this same kernel.
         """
         from sglang.kernels.ops.attention import cca_qk_mix as _cca_qk_mix
@@ -1125,11 +1013,8 @@ class CCA(nn.Module):
         ):
             mix_fused = True
             extra = {}
-            # ``*_decline_reason`` rather than ``*_covered``: same checks, but a
-            # decline arrives with the reason attached so ``_note_fusion`` can
-            # say WHY the fusion is off instead of just that it is. The string is
-            # built only when a gate rejects, and a rejecting gate has already
-            # cost a whole extra kernel launch.
+            # ``*_decline_reason`` rather than ``*_covered``: same checks, but
+            # a decline arrives with the reason attached for ``_note_fusion``.
             rope_reason = "no rotary offered"
             if rope is not None:
                 rope_reason = _cca_qk_mix.rope_decline_reason(
@@ -1205,18 +1090,10 @@ class CCA(nn.Module):
     ) -> None:
         """Log which of the three fusions took -- and why not -- once per outcome.
 
-        Every gate here declines by *falling back*, so a precondition that stops
-        matching costs launches and nothing else -- which is exactly how an
-        earlier step of this campaign produced baseline-identical numbers that
-        read as a clean null result. Naming the gate that said no turns that into
-        an observation instead of a mystery. Grep a run for
-        ``mix=True rope=True kv_store=True`` before trusting an A/B.
-
-        Cost on the hot path is a tuple compare per forward: the reasons are
-        ``None`` when everything fused, and a rejecting gate has already cost an
-        extra launch. The message is built only when the outcome changes, and
-        ``_log_dataflow_decision`` dedupes across layers, so a uniform model logs
-        one line rather than sixty.
+        Every gate declines by *falling back*, so a precondition that stops
+        matching costs launches and nothing else: an A/B then reads as a clean
+        null result. Grep a run for ``mix=True rope=True kv_store=True`` before
+        trusting one. Cost on the hot path is a tuple compare per forward.
         """
         state = (mix_fused, rope_reason, store_reason)
         if state == self._last_fusion_state:
@@ -1247,20 +1124,16 @@ class CCA(nn.Module):
             A[co,ci,m] = sum_{j+k=m} w1[co,ci,j] * w0[ci,k]
 
         The depthwise bias passes through every tap of the grouped stage, hence
-        ``b = b1 + sum_ci (sum_j w1[co,ci,j]) * b0[ci]``. Folding turns two
-        MIOpen grouped convs into one einsum: measured 1.9x (T=1) to 4.6x (T=32)
-        on MI350X under graph replay. Extend still uses the real two-stage conv,
-        which produces many timesteps and cannot be folded this way.
+        ``b = b1 + sum_ci (sum_j w1[co,ci,j]) * b0[ci]``.
 
-        ``decode_conv_weight`` additionally carries that bias as a trailing
-        column, matched by the constant-1.0 tap ``cca_state_step`` appends to the
-        window. The affine map becomes a pure linear one over ``taps + 1`` inputs,
-        so the bias is summed inside the matmul's fp32 accumulator instead of
-        being added to an already-rounded bf16 output. That removes a launch per
-        attention layer AND drops a rounding step, so the decode conv output is
-        *closer* to the fp32 reference than before, not bit-identical to it. The
-        column lands at ``ci == ch_per_group - 1`` and the other ``ci`` slots of
-        that tap are zero, so each output gets the bias exactly once.
+        ``decode_conv_weight`` carries that bias as a trailing column, matched by
+        the constant-1.0 tap ``cca_state_step`` appends to the window, making the
+        map a pure linear one over ``taps + 1`` inputs. The bias is then summed
+        inside the matmul's fp32 accumulator rather than added to an
+        already-rounded bf16 output, so the result is *closer* to the fp32
+        reference, not bit-identical to the two-stage form. The column lands at
+        ``ci == ch_per_group - 1`` and the other ``ci`` slots of that tap are
+        zero, so each output gets the bias exactly once.
         """
         t0, t1 = self.cca_time0, self.cca_time1
         groups = self.decode_conv_groups
@@ -1284,10 +1157,7 @@ class CCA(nn.Module):
         bias = b1 + (w1.sum(dim=3) * b0[:, None, :]).sum(dim=2)  # [G, Cg]
 
         # [G, Co_g, Ci_g, taps] -> [G, Co_g, Ci_g, taps + 1], the extra tap
-        # holding the bias on the last input channel and zero on the rest. The
-        # window's matching column is a constant 1.0, so the matmul contracts to
-        # ``sum_ci sum_m A[co,ci,m] x[ci,m] + b[co]`` with the bias inside the
-        # fp32 accumulator.
+        # holding the bias on the last input channel and zero on the rest.
         folded_ext = torch.zeros(
             groups, cg, cg, taps + 1, device=w0.device, dtype=torch.float32
         )
@@ -1309,19 +1179,15 @@ class CCA(nn.Module):
         """Whether the fused varlen prefill conv may run, resolved once.
 
         The fused conv and the prefill CUDA graph are each correct alone and
-        corrupt together: under capture the fused path yields all-zero logits,
-        meaning the conv state it writes is wrong, and the cause is not yet
-        understood. The graph is the larger win and works with the reference host
-        loop, so it takes precedence.
+        corrupt together: under capture the fused path yields all-zero logits.
+        Cause not yet understood; the graph is the larger win and works with the
+        reference host loop, so it takes precedence.
 
-        Resolved lazily rather than in ``__init__`` because the config bag it reads
-        is not published that early, and reached only once the env flag is on so a
-        module built outside a server (a CPU unit test) never touches it.
-
-        Reads the resolved leaf from the exec bag, NOT the published ServerArgs
-        record: ``cuda_graph_config`` is filled in by resolution, so on the record
-        it is whatever the operator typed -- ``None`` unless they passed
-        ``--cuda-graph-backend-prefill`` explicitly, which crashed here.
+        Resolved lazily because the config bag it reads is not published in
+        ``__init__``, and only once the env flag is on, so a module built outside
+        a server never touches it. Reads the resolved leaf from the exec bag, NOT
+        the published ServerArgs record, where ``cuda_graph_config`` is whatever
+        the operator typed (``None`` unless they passed the flag explicitly).
         """
         if self._fused_prefill_conv_ok is None:
             from sglang.srt.model_executor.cuda_graph_config import Backend
@@ -1351,12 +1217,9 @@ class CCA(nn.Module):
 
         The fused path needs the folded single grouped weight and the backend's
         device-side request metadata; when either is missing it falls back to the
-        reference host loop in :func:`cca_extend`.
-
-        ``lag_now`` is the projected ``val_proj2`` value stream (or the raw hidden
-        state on a checkpoint that cannot cache the projection), and ``None`` on a
-        rank that never reads the lag. Both paths carry it at whatever width they
-        are handed, so the 32x narrowing is entirely in what the caller passes.
+        reference host loop in :func:`cca_extend`. ``lag_now`` is the projected
+        ``val_proj2`` stream (or the raw hidden state on a checkpoint that cannot
+        cache the projection), and ``None`` on a rank that never reads the lag.
         """
         from sglang.kernels.ops.attention import cca_conv1d as _conv1d
 
@@ -1418,9 +1281,8 @@ class CCA(nn.Module):
 
         Uses the single folded grouped conv when the weights have been folded,
         which is exactly equivalent to the two-stage ``conv_qk`` (see
-        :meth:`fold_decode_conv`) and halves the number of grouped-conv launches
-        in the extend path. Falls back to the real two stages otherwise, so an
-        unfolded module -- a CPU unit test -- still exercises the reference.
+        :meth:`fold_decode_conv`). Falls back to the real two stages otherwise,
+        so an unfolded module -- a CPU unit test -- exercises the reference.
         """
         if self._decode_conv_folded:
             return F.conv1d(
@@ -1436,11 +1298,9 @@ class CCA(nn.Module):
     def _slice_v_per_rank(self, value_full: torch.Tensor) -> torch.Tensor:
         """Take this rank's K-head slice of the full ``value`` tensor.
 
-        Returns a no-op view when ``tp_size == 1``. For ``tp_size > 1`` the
-        full V tensor is computed on every rank (see the comment on
-        ``val_proj1`` / ``val_proj2``) and the rank's contiguous K-head range
-        is selected here, leaving the downstream RadixAttention call with a
-        per-rank shape ``[T, num_k_heads_per_rank, head_dim]``.
+        A no-op view at ``tp_size == 1``. Above that the full V tensor is
+        computed on every rank (see ``val_proj1`` / ``val_proj2``) and the rank's
+        contiguous K-head range is selected here.
         """
         if self.tp_size == 1:
             return value_full
@@ -1452,11 +1312,10 @@ class CCA(nn.Module):
         ``None`` when the rank's K heads all come from ``val_proj1`` -- it never
         reads the lag, so it neither projects nor stores anything. Otherwise the
         rank's slice of ``val_proj2(hidden_states)`` when the projection is
-        cached, and the raw hidden state when it is not (biased or
-        non-head-aligned checkpoint).
+        cached, and the raw hidden state when it is not.
 
-        Note the argument: ``val_proj2`` runs on the CURRENT hidden state here,
-        not the shifted one. The shift is what the pool slot provides.
+        ``val_proj2`` runs on the CURRENT hidden state here, not the shifted one:
+        the shift is what the pool slot provides.
         """
         if not self.v_uses_val2:
             return None
@@ -1471,11 +1330,9 @@ class CCA(nn.Module):
     def _lag_state(self, pool_entry: torch.Tensor) -> Optional[torch.Tensor]:
         """This rank's view of the conv[1] pool entry, or ``None`` if unused.
 
-        The pool entry is rank-uniform (``val_proj2`` is replicated, and an
-        asymmetric per-slot size would desync ``max_mamba_cache_size`` across the
-        attention-TP group). A rank that owns only part of ``val_proj2``'s output
-        uses a leading sub-slice; the offset convention only has to be
-        self-consistent because nothing else reads the entry.
+        The pool entry is rank-uniform: an asymmetric per-slot size would desync
+        ``max_mamba_cache_size`` across the attention-TP group. A rank owning only
+        part of ``val_proj2``'s output uses a leading sub-slice.
         """
         if self.v2_lag_dim == 0:
             return None
@@ -1489,17 +1346,15 @@ class CCA(nn.Module):
         """This rank's V heads, running only the projections that feed them.
 
         ``val_proj1`` supplies the first ``num_k_heads_full // 2`` K heads and
-        ``val_proj2`` the rest (the HF layout, see their construction). When this
-        rank's head range falls entirely inside one of those, the other
-        projection is dead work: skipping it drops a GEMM, the ``cat`` and the
-        ``contiguous`` copy that slicing the concatenated tensor needed. That is
-        the common case for ZAYA1 -- ``num_query_groups`` is 2, so at
-        ``attn_tp == 2`` each rank owns exactly one projection's output.
+        ``val_proj2`` the rest (the HF layout). When this rank's head range falls
+        entirely inside one of those, the other projection is dead work and is
+        skipped, along with the ``cat`` and the ``contiguous`` copy that slicing
+        the concatenated tensor needed.
 
-        ``lag_prev`` is what came back from the state step. Under
-        ``cache_projected_v2`` it is already this rank's slice of the previous
-        token's ``val_proj2`` output and goes straight through; otherwise it is
-        the previous raw hidden state and still has to be projected here.
+        ``lag_prev`` is what came back from the state step: already this rank's
+        slice of the previous token's ``val_proj2`` output under
+        ``cache_projected_v2``, otherwise the previous raw hidden state, which
+        still has to be projected here.
 
         Falls back to computing both and slicing when the range straddles the
         boundary (or the split is not head-aligned), which is also the tp=1 path.
@@ -1547,10 +1402,10 @@ class CCA(nn.Module):
         a zero initial conv state and a zero ``val_proj2`` lag.
 
         Test-only, and deliberately so: it has no caller in ``srt/`` and is not
-        dead code. The prefill and decode paths are checked against it, which
-        only means anything while it shares no implementation with them -- so
-        do not refactor the common algebra out of here into a helper they also
-        call, and do not delete it for want of a caller.
+        dead code. The prefill and decode paths are checked against it, which only
+        means anything while it shares no implementation with them -- so do not
+        hoist the common algebra into a helper they also call, and do not delete
+        it for want of a caller.
         """
         S = hs.shape[0]
         hs_3d = hs.unsqueeze(1)  # [S, 1, H]
@@ -1609,28 +1464,18 @@ class CCA(nn.Module):
         cuda-graph buffers) is owned by :class:`ShortConvAttnBackend
         <sglang.srt.layers.attention.linear.short_conv_backend.ShortConvAttnBackend>`,
         reached via ``get_attn_backend().conv_state_metadata``; CCA runs its own
-        two-stage grouped conv (:func:`cca_extend` / :func:`cca_decode`) against
-        that handle, so this module holds no pool access. Those functions return
-        the conv output ``qk_out`` and the one-token-lagged ``val_proj2`` value
-        stream ``lag_prev``, updating the ``conv_state`` / lag pool slots in
-        place.
+        conv (:func:`cca_extend` / :func:`cca_decode`) against that handle, so
+        this module holds no pool access.
 
-        ``q`` / ``k`` / ``v`` are all returned in ``hidden_states``' dtype. The
-        blend and normalize still accumulate in fp32 internally, but the result is
-        stored at model precision: the caller rounded it there immediately anyway,
-        so materializing an fp32 copy first only cost a per-layer ``copy_``.
+        ``q`` / ``k`` / ``v`` all come back in ``hidden_states``' dtype; the blend
+        and normalize still accumulate in fp32 internally.
 
         ``rope`` (this layer's :class:`CCARope`) additionally folds the neox
-        partial rotary into the same kernel, so ``q`` / ``k`` come back already
-        rotated. ``self.rope_fused`` reports whether that happened; when it is
-        False the caller still owes a rotary launch. Under the global-residual
-        dataflow ``rope.positions`` is already the replica-local view, matching
-        ``hidden_states``.
-
-        ``kv_store`` (this layer's :class:`CCAKVStore`) further folds the paged
-        KV scatter in, reported by ``self.kv_store_fused``. That is why ``v`` is
-        computed *before* the mix here rather than after: the mix kernel is what
-        writes it into the pool.
+        partial rotary into the same kernel; ``self.rope_fused`` reports whether
+        that happened, and when it is False the caller still owes a rotary launch.
+        ``kv_store`` (this layer's :class:`CCAKVStore`) folds the paged KV scatter
+        in, reported by ``self.kv_store_fused`` -- which is why ``v`` is computed
+        *before* the mix: the mix kernel is what writes it into the pool.
 
         Shapes::
 
@@ -1660,10 +1505,9 @@ class CCA(nn.Module):
         query_pre = q_raw.view(T, self.num_q_heads, self.head_dim)
         key_base = k_raw.view(T, self.num_k_heads, self.head_dim)
 
-        # The backend hands out the per-request conv-state handle (slot indices,
-        # prefix mask, cuda-graph buffers); CCA runs its own two-stage grouped
-        # conv against it and gets back the conv output + the lagged val_proj2
-        # value, with the conv_state / lag pool slots updated in place.
+        # The backend hands out the per-request conv-state handle; CCA runs its
+        # own conv against it and gets back the conv output plus the lagged
+        # val_proj2 value, with both pool slots updated in place.
         backend = get_attn_backend()
         meta = backend.conv_state_metadata(self.layer_id, forward_batch)
         conv_state = meta.layer_cache.conv[0]
@@ -1695,16 +1539,12 @@ class CCA(nn.Module):
             )
             # Radix mamba-cache checkpoint (extra_buffer strategy only). Both
             # conv entries are trailing windows of the streams the conv just
-            # consumed -- conv[0] is the last ``total_padding`` rows of ``qk``,
-            # the lag entry is the last row of ``lag_now`` -- so the snapshot at
-            # the chunk-aligned track position is a gather over them. Hand the
-            # state VIEWS the conv wrote through, not ``meta.layer_cache.conv``:
-            # ``lag_state`` may be a narrowed sub-slice of the rank-uniform pool
-            # entry, and is ``None`` on a rank with no lag stream at all (at
-            # attn_tp=2 rank 0 reads only ``val_proj1``). Passing ``lag_now``
-            # rather than ``hidden_states`` is load-bearing: the pool caches the
-            # PROJECTED value ``W_v2 . hs``, which is 32x narrower and a
-            # different quantity. No-op under ``no_buffer``.
+            # consumed, so the snapshot at the chunk-aligned track position is a
+            # gather over them. Hand the state VIEWS the conv wrote through, not
+            # ``meta.layer_cache.conv``: ``lag_state`` may be a narrowed
+            # sub-slice, and is ``None`` on a rank with no lag stream. Passing
+            # ``lag_now`` rather than ``hidden_states`` is load-bearing -- the
+            # pool caches the PROJECTED value. No-op under ``no_buffer``.
             backend.track_conv_states_extend((conv_state, lag_state), (qk, lag_now))
 
         query_conv = qk_out[:, : self.latent_q_dim].view(
@@ -1715,11 +1555,8 @@ class CCA(nn.Module):
         )
 
         # Emit the model dtype straight away: the caller rounded the fp32 result
-        # to it immediately, so this is the same single rounding minus two
-        # per-layer copies (aten::copy_ was the largest single op in the profile).
-        # V before the mix: the mix kernel is what scatters it into the KV pool
-        # when the fused store is available. The two have no data dependency in
-        # either direction, so the reorder is free.
+        # to it immediately, so this is the same single rounding minus two copies.
+        # V before the mix: the mix kernel is what scatters it into the KV pool.
         value = self._compute_value_per_rank(hidden_states, lag_prev)
 
         query, key = self._mix_and_normalize_qk(
@@ -1759,18 +1596,12 @@ class ZayaAttention(nn.Module):
         self.num_k_heads_full = config.num_query_groups
         self.head_dim = config.head_dim
 
-        # Head-parallel TP: split both Q and KV heads across ranks. Since the
-        # grouped-mean and conv_qk.1 are head-local, no cross-rank collective
-        # is required inside the QKV projection. Both head counts must be
-        # divisible by tp_size; the KV-replicated GQA-TP variant (tp_size >
-        # num_k_heads) is intentionally rejected with a clear error message
-        # because both per-K-head paths assume each rank holds whole K heads.
-        # Head-parallel attention runs on the *attention* TP group. With plain
-        # tensor parallelism this is the global TP group; with DP attention
-        # (``enable_dp_attention``) it is the per-DP-replica sub-group of size
-        # ``tp_size / dp_size``. CCA, ``o_proj`` and ``ZayaConfig.
-        # mamba2_cache_params`` are all organized on this same group, so they
-        # stay consistent in either mode.
+        # Head-parallel TP over the *attention* TP group (the global TP group
+        # under plain TP, the per-replica sub-group under DP attention). CCA,
+        # ``o_proj`` and ``ZayaConfig.mamba2_cache_params`` all use that same
+        # group. Both head counts must divide tp_size; the KV-replicated GQA-TP
+        # variant is rejected, since every per-K-head path here assumes a rank
+        # holds whole K heads.
         self.tp_rank = get_parallel().attn_tp_rank
         self.tp_size = get_parallel().attn_tp_size
         assert self.num_q_heads_full % self.tp_size == 0, (
@@ -1778,11 +1609,9 @@ class ZayaAttention(nn.Module):
             f"by attention tp_size ({self.tp_size}) for ZAYA1 head-parallel "
             "attention"
         )
-        # ZAYA1's grouped-mean and ``conv_qk.1`` keep whole GQA groups on each
-        # rank, so attention TP cannot exceed ``num_query_groups`` (KV-head
-        # replication would need a cross-rank reduction inside CCA). To use more
-        # GPUs than that, enable DP attention so the extra ranks form additional
-        # data-parallel replicas while attention TP stays <= num_query_groups.
+        # Whole GQA groups stay on one rank, so attention TP cannot exceed
+        # ``num_query_groups``. To use more GPUs than that, enable DP attention
+        # so the extra ranks form additional replicas instead.
         assert self.num_k_heads_full % self.tp_size == 0, (
             f"num_query_groups ({self.num_k_heads_full}) must be divisible by "
             f"attention tp_size ({self.tp_size}); attention TP cannot exceed "
@@ -1812,10 +1641,9 @@ class ZayaAttention(nn.Module):
             tp_size=self.tp_size,
         )
 
-        # RowParallel o_proj on the attention-TP group: per-rank input is the
-        # rank's q heads. The cross-rank reduction is deferred to ``forward``
-        # via ``attn_tp_all_reduce`` so it targets the attention-TP group rather
-        # than the global TP group (the two coincide when DP attention is off).
+        # RowParallel o_proj on the attention-TP group. The cross-rank reduction
+        # is deferred to ``forward`` via ``attn_tp_all_reduce`` so it targets the
+        # attention-TP group rather than the global one.
         self.o_proj = RowParallelLinear(
             self.q_dim_full,
             self.hidden_size,
@@ -1850,11 +1678,9 @@ class ZayaAttention(nn.Module):
             partial_rotary_factor=partial_rotary_factor,
         )
 
-        # Store ``window - 1`` (exclusive boundary -- the convention the SGLang
-        # attention backends expect via ``layer.sliding_window_size``); full
-        # attention layers pass -1. The backends pick the window per layer from
-        # this attribute, and ``ModelRunner`` learns the global window from
-        # ``ZayaForCausalLM.get_attention_sliding_window_size``.
+        # Store ``window - 1``: the exclusive-boundary convention the SGLang
+        # attention backends expect via ``layer.sliding_window_size``. Full
+        # attention layers pass -1.
         self.sliding_window_size = (swa_window - 1) if self.is_sliding else -1
         self.attn = RadixAttention(
             num_heads=self.num_q_heads,
@@ -1870,12 +1696,11 @@ class ZayaAttention(nn.Module):
     def _kv_store(self, forward_batch: ForwardBatch) -> Optional[CCAKVStore]:
         """This layer's paged KV write target, or ``None`` to keep the unfused store.
 
-        Resolving this per forward rather than caching it is deliberate: the pool
-        can be re-backed after capture (``post_capture_active``) and the SWA
-        mapping is registered by the allocator, so the answer is read from the
-        live objects. Under a captured CUDA graph the whole method runs once, at
-        capture; every tensor it returns is allocated once and mutated in place,
-        so the captured addresses stay valid on replay.
+        Resolved per forward rather than cached: the pool can be re-backed after
+        capture (``post_capture_active``) and the SWA mapping is registered by the
+        allocator, so the answer is read from the live objects. Under a captured
+        graph this runs once, at capture, and every tensor it returns is allocated
+        once and mutated in place, so the addresses stay valid on replay.
 
         Rejects, in order (all fall back to ``set_kv_buffer``):
 
@@ -1883,14 +1708,11 @@ class ZayaAttention(nn.Module):
         * DCP or prefill context parallelism -- both rewrite the write loc;
         * any pool type other than a plain ``MHATokenToKVPool``, a ``SWAKVPool``
           of two of them, or a ``HybridLinearKVPool`` fronting one. Exact-type
-          checks, so every subclass (the unified pools, FP4/MXFP8, page-major,
-          the no-op embedding pool) declines rather than being assumed
-          compatible;
-        * a quantized pool, a ``store_dtype`` that differs from ``dtype``, or a
-          non-NHD physical layout (HND, vectorized_5d);
+          checks, so every subclass declines rather than being assumed compatible;
+        * a quantized pool, a ``store_dtype`` differing from ``dtype``, or a
+          non-NHD physical layout;
         * a buffer whose row count is not ``size + page_size`` -- the invariant
-          that makes a flat slot index correct for any page size, and the check
-          that rejects a no-op pool's placeholder buffers.
+          that makes a flat slot index correct for any page size.
         """
         out_cache_loc = getattr(forward_batch, "out_cache_loc", None)
         if out_cache_loc is None:
@@ -1953,29 +1775,20 @@ class ZayaAttention(nn.Module):
         forward_batch: ForwardBatch,
         reduce_output: bool = True,
     ) -> torch.Tensor:
-        # Idle forward: under DP attention a replica with no requests this step
-        # still runs a forward (to join the MoE layers' gather/scatter) with T=0.
-        # Every op below is a no-op on an empty batch, but the ROCm rotary kernel
-        # derives its launch grid from the token count and raises SIGFPE on zero,
-        # so return the correctly-shaped empty output before touching any kernel.
-        # This is safe for collectives: an idle replica is idle on *all* of its
-        # attention-TP ranks, so they skip the o_proj all-reduce together, and the
-        # cross-replica gather/scatter that idle replicas must participate in
-        # lives in ``ZayaDecoderMLPLayer`` and still runs.
+        # Idle forward: under DP attention a replica with no requests still runs
+        # a T=0 forward to join the MoE gather/scatter. The ROCm rotary kernel
+        # derives its grid from the token count and raises SIGFPE on zero, so
+        # return early. Safe for collectives: a replica is idle on *all* of its
+        # attention-TP ranks, so they skip the o_proj all-reduce together, and
+        # the cross-replica gather/scatter lives in ``ZayaDecoderMLPLayer``.
         if hidden_states.shape[0] == 0:
             return hidden_states.new_zeros((0, self.hidden_size))
 
-        # CCA returns fp32 q/k and input-dtype v as ``[T, heads, head_dim]``
-        # tensors; flatten the head dim and cast all to the model dtype before
-        # rotary + RadixAttention.
-        #
         # The rotary is handed *into* CCA rather than run after it: the fused
         # head-mix kernel already holds the whole head in registers, so the
-        # rotation is free arithmetic there and the separate
-        # ``sgl_kernel.rotary_embedding`` launch (one per attention layer, 60 per
-        # decode step) disappears. ``qkv.rope_fused`` says whether it took the
-        # offer -- everything the fused path cannot serve (see
-        # ``cca_qk_mix.rope_covered``) falls back to the launch below.
+        # rotation is free arithmetic there. ``qkv.rope_fused`` says whether it
+        # took the offer; everything it cannot serve falls back to the launch
+        # below.
         q, k, v = self.qkv(
             hidden_states,
             forward_batch,
@@ -1983,44 +1796,33 @@ class ZayaAttention(nn.Module):
             kv_store=self._kv_store(forward_batch),
         )
         target_dtype = hidden_states.dtype
-        # ``flatten(1)`` rather than ``reshape(T, -1)``: under DP attention a
-        # replica with no requests this step runs an idle forward with T=0, and
-        # ``reshape(0, -1)`` raises (the ``-1`` is ambiguous for a 0-element
-        # tensor). ``flatten`` multiplies the head dims explicitly, so it yields
-        # ``[0, heads*head_dim]`` and is identical to the old reshape for T>0.
+        # ``flatten(1)`` rather than ``reshape(T, -1)``: on an idle T=0 forward
+        # ``reshape(0, -1)`` raises, since ``-1`` is ambiguous for a 0-element
+        # tensor. ``flatten`` multiplies the head dims explicitly.
         q = q.flatten(1).to(target_dtype)
         k = k.flatten(1).to(target_dtype)
         v = v.flatten(1).to(target_dtype)
 
         if not self.qkv.rope_fused:
             q, k = self.rotary_emb(positions, q, k)
-        # Some rotary backends (notably AITER on ROCm) hand back tensors with
-        # a different stride than the input. RadixAttention's KV-store kernel
-        # asserts contiguous layout, so normalize q/k/v before the attention.
-        # The fused path already returns freshly-allocated contiguous tensors,
-        # so these are no-op views there, not copies.
+        # Some rotary backends (notably AITER on ROCm) hand back a different
+        # stride than the input, and RadixAttention's KV-store kernel asserts
+        # contiguous. No-op views on the fused path, which allocates fresh.
         q = q.contiguous()
         k = k.contiguous()
         v = v.contiguous()
         # ``save_kv_cache=False`` when the mix kernel already scattered k/v into
-        # the pool -- the same handshake ``qwen3_moe`` uses with the shared fused
-        # rope+store path. The attention still needs k/v as arguments: the extend
-        # kernel reads the new tokens from them directly rather than from the
-        # pool.
+        # the pool. The attention still needs k/v as arguments: the extend kernel
+        # reads the new tokens from them directly rather than from the pool.
         attn_output = self.attn(
             q, k, v, forward_batch, save_kv_cache=not self.qkv.kv_store_fused
         )
         output, _ = self.o_proj(attn_output)
         # o_proj is RowParallel with ``reduce_results=False``; reduce the partial
-        # sums across the attention-TP group (equals the global TP group unless
-        # DP attention is enabled). A size-1 group makes this a no-op.
-        #
-        # ``reduce_output=False`` returns the per-rank partial instead. The
-        # global-residual dataflow uses it to fold this reduction into the DP
-        # gather: ``dp_gather_partial`` has every attention-TP rank memcpy its
-        # partial into the *same* slot of the global buffer, so the all-reduce
-        # that gathers across replicas sums the partials within each replica as a
-        # side effect -- one collective doing both jobs.
+        # sums across the attention-TP group. ``reduce_output=False`` returns the
+        # per-rank partial instead, which the global-residual dataflow folds into
+        # the DP gather: every attention-TP rank memcpys its partial into the
+        # *same* slot, so one all-reduce does both reductions.
         if reduce_output and self.tp_size > 1:
             output = attn_tp_all_reduce(output)
         return output
@@ -2034,24 +1836,23 @@ class ZayaAttention(nn.Module):
 class ZayaRouting(NamedTuple):
     """Everything :class:`ZayaBlock` needs out of one router forward.
 
-    ``moe_weight`` / ``moe_ids`` are the FusedMoE-ready pair: fp32 weights --
-    the dtype every other sglang top-k emits, so the MoE runner's opening
-    ``topk_weights.to(torch.float32)`` is a no-op rather than a launch -- and
-    int32 expert ids already clamped into ``[0, num_moe_experts - 1]``.
+    ``moe_weight`` / ``moe_ids`` are the FusedMoE-ready pair: fp32 weights (the
+    dtype every other sglang top-k emits) and int32 expert ids already clamped
+    into ``[0, num_moe_experts - 1]``.
 
-    ``route_prob`` is the same probability at the model dtype, which is what the
-    MOD residual blend multiplies the hidden state by. It stays separate from
-    ``moe_weight`` so fusing the tail does not quietly change the MOD
-    arithmetic's precision.
+    ``route_prob`` is the same probability at the model dtype, which the MOD
+    residual blend multiplies the hidden state by. It stays separate from
+    ``moe_weight`` so fusing the tail cannot change the MOD arithmetic's
+    precision.
 
-    ``skip_ids`` is the *unclamped* choice. MOD needs it: the clamp folds the
-    skip slot (``num_moe_experts``) onto real expert ``num_moe_experts - 1``, so
-    ``moe_ids`` can no longer distinguish a skipped token from one genuinely
-    routed to the last expert. Without MOD it aliases ``moe_ids``.
+    ``skip_ids`` is the *unclamped* choice, which MOD needs: the clamp folds the
+    skip slot onto real expert ``num_moe_experts - 1``, so ``moe_ids`` can no
+    longer tell a skipped token from one routed to the last expert. Without MOD
+    it aliases ``moe_ids``.
 
-    ``hidden_states_next`` is the POST-EDA, PRE-NORM router state that the next
-    MoE layer folds in. Publishing the normalized tensor instead would change
-    the EDA recursion in every downstream MoE layer without crashing.
+    ``hidden_states_next`` is the POST-EDA, PRE-NORM router state the next MoE
+    layer folds in. Publishing the normalized tensor instead would change the EDA
+    recursion in every downstream MoE layer without crashing.
     """
 
     moe_weight: torch.Tensor
@@ -2100,14 +1901,11 @@ class ZayaRouter(nn.Module):
         self.topk = int(moe_router_topk)
         self.mlp_expansion = int(mlp_expansion)
 
-        # The router is left unquantized. Its final projection is
-        # ``mlp_expansion -> num_experts (+1 for the MOD skip slot)``, which for
-        # ZAYA1 is 25 -- not a multiple of 16, so an FP8 GEMM rejects it outright
-        # ("mat2 shape (256x25) must be divisible by 16") and online
-        # --quantization fp8 fails at the first router forward. Quantizing it buys
-        # nothing anyway: the whole router is ~0.1% of the layer's weights, while
-        # the experts it selects are ~99%. Routing precision also feeds an argmax,
-        # where fp8 rounding could flip expert choice for near-ties.
+        # Left unquantized. The final projection is ``mlp_expansion ->
+        # num_experts + 1``, 25 wide on ZAYA1, and an FP8 GEMM rejects a K that
+        # is not a multiple of 16, so online fp8 fails at the first router
+        # forward. It is ~0.1% of the layer's weights, and its output feeds an
+        # argmax where fp8 rounding could flip expert choice on near-ties.
         router_quant_config = None
 
         self.down_proj = ReplicatedLinear(
@@ -2119,9 +1917,8 @@ class ZayaRouter(nn.Module):
         )
 
         # EDA threads router state from the previous MoE layer through
-        # ``router_states_scale``. The first MoE layer in the model has no
-        # previous state; whether to fold it in is decided at call time based on
-        # ``prev_router_hidden_states``.
+        # ``router_states_scale``; the first MoE layer has none, which is decided
+        # at call time from ``prev_router_hidden_states``.
         ln_eps = float(getattr(config, "norm_epsilon", 1e-5))
         self.use_eda = bool(getattr(config, "zaya_use_eda", False))
         self.rmsnorm_eda = RMSNorm(self.mlp_expansion, eps=ln_eps)
@@ -2167,17 +1964,16 @@ class ZayaRouter(nn.Module):
     def fold_mod_reachability(self) -> None:
         """Decide whether the MOD skip slot can ever win, from the loaded biases.
 
-        ``balancing_biases`` is added to a *softmax probability*, not to a logit, so
-        the skip slot's score is bounded by ``1 + b_skip`` while every real expert's
-        is at least ``b_j``. When
+        ``balancing_biases`` is added to a *softmax probability*, not to a logit,
+        so the skip slot's score is bounded by ``1 + b_skip`` while every real
+        expert's is at least ``b_j``. When
 
             1 + b_skip  <  max_j b_j        (j over the real experts)
 
         the skip score is strictly below the best real score for every possible
-        input, so no tie-breaking rule can select it and the whole MOD path is dead
-        work. ZAYA1-74B ships ``b_skip = -1.0`` on all 60 MoE layers against real
-        biases peaking around +0.03, so it is dead there -- which is worth two
-        kernel launches per MoE layer.
+        input, so no tie-breaking rule can select it and the MOD path is dead
+        work. ZAYA1-74B ships ``b_skip = -1.0`` against real biases peaking near
+        +0.03, so it is dead there.
 
         Deliberately conservative: any bias layout that does not prove
         unreachability keeps the MOD path.
@@ -2202,24 +1998,17 @@ class ZayaRouter(nn.Module):
             and prev_router_hidden_states is not None
             and hasattr(self, "router_states_scale")
         ):
-            # One fused multiply-add instead of a separate mul and add: 2
-            # launches become 1 on all but the first MoE layer (59 of 60 on the
-            # 74B, since the first has no previous router state). In-place is
-            # safe because ``hs`` is the freshly-allocated ``down_proj`` output
-            # that nothing else aliases, and it drops the temporary as well.
-            #
-            # NOT bit-identical: ``a + b * c`` rounds the product before the
-            # add, ``addcmul`` fuses them and rounds once. At bf16 that is up to
-            # one ULP on the EDA term, which then threads through the whole
-            # 60-layer recursion. Verified with assert_close, not assert_equal.
+            # In-place is safe: ``hs`` is the freshly-allocated ``down_proj``
+            # output that nothing else aliases. NOT bit-identical to a separate
+            # mul and add -- ``a + b * c`` rounds the product first, ``addcmul``
+            # rounds once -- which threads through the whole EDA recursion.
             hs.addcmul_(prev_router_hidden_states, self.router_states_scale)
 
-        # ``hs`` is a freshly-allocated tensor (output of ``down_proj``, updated
-        # in place by the EDA add above) and ``rmsnorm_eda`` is non-residual /
-        # out-of-place, so we can hand the same buffer to the next layer without
-        # cloning. This is the POST-EDA, PRE-NORM tensor: the EDA recursion is
-        # defined on the un-normalized state, so publishing ``hs_norm`` here
-        # instead would silently change routing in every downstream MoE layer.
+        # ``hs`` is freshly allocated and ``rmsnorm_eda`` is out-of-place, so the
+        # same buffer goes to the next layer without a clone. This is the
+        # POST-EDA, PRE-NORM tensor: the EDA recursion is defined on the
+        # un-normalized state, so publishing ``hs_norm`` would change routing in
+        # every downstream MoE layer.
         router_hidden_states_next = hs
 
         hs_norm = self.rmsnorm_eda(hs)
@@ -2249,12 +2038,11 @@ class ZayaRouter(nn.Module):
     ) -> ZayaRouting:
         """The torch chain that turns expert logits into a routing decision.
 
-        A fused Triton replacement for this was built, verified correct on
-        gfx950, and measured a LOSS (TPOT +7.8% at C=1, +6.3% at C=32 on
-        MI355X) despite removing 720 of ~2382 kernel launches per decode step.
-        The router works on a 25-wide expert axis, which is too little
-        arithmetic to pay for a kernel of its own. Removed in full; re-fusing
-        this needs a measurement, not a launch count.
+        A fused Triton replacement was built, verified correct, and measured a
+        LOSS (TPOT +7.8% at C=1, +6.3% at C=32 on MI355X) despite removing 720 of
+        ~2382 launches per decode step: a 25-wide expert axis is too little
+        arithmetic to pay for a kernel. Re-fusing this needs a measurement, not a
+        launch count.
         """
         if self.router_softmax_fp32:
             expert_prob = torch.softmax(logits, dim=-1, dtype=torch.float32)
@@ -2263,10 +2051,9 @@ class ZayaRouter(nn.Module):
 
         biased = expert_prob.detach().to(torch.float32) + self.balancing_biases
         if self.topk == 1:
-            # ZAYA1 ships moe_router_topk=1. argmax is the same selection without
-            # the sort/heap machinery a general top-k pays for, and it keeps the
-            # trailing dim that ``torch.gather`` below expects. Measured 1.9% of
-            # decode GPU time in aten::topk before this.
+            # ZAYA1 ships moe_router_topk=1, so argmax is the same selection
+            # without a general top-k's sort/heap, and it keeps the trailing dim
+            # ``torch.gather`` below expects.
             expert_choice = biased.argmax(dim=-1, keepdim=True)
         else:
             _, expert_choice = torch.topk(biased, self.topk, dim=-1)
@@ -2311,17 +2098,14 @@ def mod_premask_experts(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Mask the (per-rank, pre-all-reduce) expert output for the MOD skip path.
 
-    Returns ``(mod_mask, masked_experts)`` where ``mod_mask`` is ``1`` for
-    tokens routed to a real expert and ``0`` for tokens routed to the skip
-    slot (``indices == num_moe_experts``), and
-    ``masked_experts = mod_mask * experts_out``.
+    Returns ``(mod_mask, masked_experts)``, where ``mod_mask`` is ``1`` for
+    tokens routed to a real expert and ``0`` for the skip slot.
 
     The masking is applied *before* the cross-rank all-reduce so the single
-    reduction yields ``mask · sum_r(partial_r) = mask · experts_out_full``
-    without the replicated ``mod_out`` term being summed ``tp_size`` times.
-    Pairs with :func:`mod_blend`, which adds the skip-path term back after the
-    reduce. Kept as a free function so the MOD math is unit-testable without a
-    live ``torch.distributed`` group.
+    reduction yields ``mask . sum_r(partial_r)`` without the replicated
+    ``mod_out`` term being summed ``tp_size`` times. Pairs with :func:`mod_blend`,
+    which adds the skip-path term back after the reduce. A free function so the
+    MOD math is testable without a live ``torch.distributed`` group.
     """
     mod_mask = (indices != num_moe_experts).to(experts_out.dtype)
     return mod_mask, mod_mask * experts_out
@@ -2339,12 +2123,10 @@ def mod_blend(
     ``masked_experts`` -- weighted by ``(1 - mod_mask)``. See
     :func:`mod_premask_experts`.
 
-    The weighted add is one ``addcmul`` rather than a separate multiply and add,
-    which is exact (identical operations, just fused) and drops one launch per
-    MoE layer. Note the ``1.0 - mod_mask`` complement is NOT folded away by
-    rewriting this as ``masked + mod_out - mask*mod_out``: that form is not
-    exact, since ``(a + b) - b != a`` in floating point, and it must be for the
-    masked tokens where the skip term is supposed to vanish entirely.
+    The ``1.0 - mod_mask`` complement is deliberately NOT rewritten as
+    ``masked + mod_out - mask*mod_out``: that form is not exact, since
+    ``(a + b) - b != a`` in floating point, and it must be for the masked tokens
+    where the skip term has to vanish entirely.
     """
     return torch.addcmul(masked_experts_reduced, 1.0 - mod_mask, mod_out)
 
@@ -2366,11 +2148,9 @@ class ZayaBlock(nn.Module):
         self.mlp_expansion = int(config.zaya_mlp_expansion)
         self.topk = int(getattr(config, "moe_router_topk", 1))
 
-        # Reduce over the *MoE* parallel groups (not the global TP group) so the
-        # block is correct under expert parallelism (EP) and DP attention, where
-        # the experts are sharded across the EP group and/or each DP replica owns
-        # a different token slice. Under plain TP, ``moe_tp == global_tp`` and
-        # ``ep == 1``, so this is behaviour-preserving.
+        # Reduce over the *MoE* parallel groups, not the global TP group, so the
+        # block stays correct under EP and DP attention. Under plain TP,
+        # ``moe_tp == global_tp`` and ``ep == 1``.
         self.tp_size = get_parallel().moe_tp_size
         self.ep_size = get_parallel().moe_ep_size
         if self.tp_size > self.num_moe_experts:
@@ -2407,13 +2187,11 @@ class ZayaBlock(nn.Module):
             prefix=add_prefix("experts", prefix),
             activation="silu",
             reduce_results=False,
-            # FusedMoE defaults to inplace=True, which on the triton runner aliases
-            # the expert output onto ``hidden_states``. The MOD blend below reads
-            # ``hidden_states`` *after* the experts run, so aliasing would feed it
-            # the unreduced per-rank partial -- a different value on every TP rank,
-            # silently diverging the replicated residual stream. The aiter runner
-            # allocates a fresh output so this never fired in the measured config;
-            # pinned here so the triton runner is not a correctness trap.
+            # FusedMoE defaults to inplace=True, which on the triton runner
+            # aliases the expert output onto ``hidden_states``. The MOD blend
+            # below reads ``hidden_states`` *after* the experts run, so aliasing
+            # would feed it the unreduced per-rank partial and silently diverge
+            # the replicated residual stream.
             inplace=False,
         )
 
@@ -2441,23 +2219,15 @@ class ZayaBlock(nn.Module):
             router_logits=routing.moe_weight,
         )
 
-        # ``mod_reachable``, not ``zaya_use_mod``: a checkpoint whose skip bias puts
-        # the slot permanently out of reach turns this whole branch into two
-        # elementwise launches per MoE layer computing an always-false predicate
-        # (see ZayaRouter.fold_mod_reachability). The clamp that used to live here
-        # is now done inside the fused router tail, which emits both the clamped
-        # ``moe_ids`` and the unclamped ``skip_ids`` the predicate below needs.
+        # ``mod_reachable``, not ``zaya_use_mod``: a checkpoint whose skip bias
+        # puts the slot permanently out of reach turns this branch into an
+        # always-false predicate (see ZayaRouter.fold_mod_reachability).
         if self.router.mod_reachable:
             experts_out = self.experts(hidden_states, topk_out)
-            # ``mod_out`` is computed identically on every rank that owns this
-            # token (both ``hidden_states`` and ``probs`` are replicated across
-            # the MoE-TP / MoE-EP groups). Fold the skip mask into the per-rank
-            # partial experts output *before* the reduce so the reduction yields:
-            #   sum_r(mask · partial_r) + (1 - mask) · mod_out
-            # = mask · experts_out_full + (1 - mask) · mod_out
-            # without double-counting ``mod_out``. The two steps are
-            # ``mod_premask_experts`` / ``mod_blend`` so the math is testable
-            # without a live distributed group.
+            # ``mod_out`` is replicated across the MoE-TP / MoE-EP groups, so
+            # fold the skip mask into the per-rank partial *before* the reduce:
+            #   sum_r(mask . partial_r) + (1 - mask) . mod_out
+            # rather than double-counting ``mod_out`` once per rank.
             from sglang.kernels.ops.moe import zaya_mod as _mod
 
             if _mod.covered(experts_out, indices, hidden_states, probs):
@@ -2490,18 +2260,14 @@ class ZayaBlock(nn.Module):
     def _reduce_experts(self, experts_out: torch.Tensor) -> torch.Tensor:
         """Combine partial expert outputs over the MoE parallel groups.
 
-        Mirrors the canonical SGLang MoE reduce (cf. ``qwen3_moe``): first an
-        all-reduce over the expert-parallel (EP) group, then over the
-        MoE-tensor-parallel (TP) group. Under plain TP this is a single reduce
-        over the global TP group; under EP / DP attention it stays scoped to the
-        MoE groups and never spans the DP-attention replicas.
+        Mirrors the canonical SGLang MoE reduce (cf. ``qwen3_moe``): EP group
+        first, then MoE-TP. Under plain TP that is one reduce over the global TP
+        group; under EP / DP attention it stays scoped to the MoE groups and never
+        spans the DP-attention replicas.
 
-        Both legs go through ``should_skip_post_experts_all_reduce``, which is what
-        makes an A2A backend safe here: an a2a combine already reduces partial
-        expert outputs back to the source rank, so reducing again double-counts
-        (and overflows bf16). ``dp_gather_required()`` separately drops the DP
-        gather once a2a is on, so without this guard the two changes would not be
-        consistent with each other.
+        Both legs go through ``should_skip_post_experts_all_reduce``: an a2a
+        combine already reduces partial expert outputs back to the source rank, so
+        reducing again double-counts and overflows bf16.
         """
         if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=False
@@ -2523,17 +2289,15 @@ def dp_gather_required() -> bool:
     """Whether the MoE layers need to see the *global* token set.
 
     A token must be visible to every rank the expert reduce spans, so the gather
-    is needed exactly when that reduce is wider than the attention-TP group, i.e.
-    when it crosses DP replicas. When ``moe_tp == attn_tp`` (e.g. --moe-dp-size
-    equal to the attention DP size) each replica owns a self-contained MoE over
-    its own ranks, the token is already replicated across them by
-    ``attn_tp_all_reduce``, and the gather/scatter pair is pure overhead.
+    is needed exactly when that reduce is wider than the attention-TP group. When
+    ``moe_tp == attn_tp`` each replica owns a self-contained MoE over its own
+    ranks, the token is already replicated across them by ``attn_tp_all_reduce``,
+    and the gather/scatter pair is pure overhead.
 
     Compare against the width of the group ``ZayaBlock._reduce_experts`` actually
-    reduces over -- expert-parallel AND MoE-tensor-parallel -- not moe_tp alone.
-    Under EP (``--ep-size 8``) moe_tp collapses to 1 while the reduce still spans
-    all 8 ranks, so keying off moe_tp alone would skip a gather that is required
-    and silently drop every token the rank does not own.
+    reduces over -- EP *and* MoE-TP -- not moe_tp alone: under ``--ep-size 8``
+    moe_tp collapses to 1 while the reduce still spans all 8 ranks, so keying off
+    moe_tp would skip a required gather and silently drop tokens.
     """
     parallel = get_parallel()
     moe_reduce_width = parallel.moe_ep_size * parallel.moe_tp_size
@@ -2549,23 +2313,19 @@ class GlobalResidualLayout(msgspec.Struct, frozen=True):
 
     Present only on the global-residual dataflow (see
     ``SGLANG_OPT_ZAYA_GLOBAL_RESIDUAL``), where the fp32 residual stream and the
-    normed hidden states are held in the global layout -- every rank holds every
-    replica's rows -- rather than the DP-local one. That lets a single
-    ``dp_gather_partial`` of the o_proj partials do the work of both the
-    attention-TP all-reduce and the MoE layer's separate gather, and removes the
-    MoE scatter: three collectives per attention+MoE layer pair become two, and
-    the norms pay for it by running over every replica's rows.
+    normed hidden states are held in the global layout rather than the DP-local
+    one. A single ``dp_gather_partial`` of the o_proj partials then does the work
+    of both the attention-TP all-reduce and the MoE layer's gather, and the MoE
+    scatter disappears; the norms pay for it by running over every replica's rows.
     """
 
     local_start: int
     local_len: int
 
     def local_view(self, global_rows: torch.Tensor) -> torch.Tensor:
-        """This replica's rows of a global-layout tensor, as a view.
-
-        A row slice of a contiguous 2D tensor is itself contiguous, which the
-        attention kernels and the gather's ``local_tokens`` assert require.
-        """
+        """This replica's rows of a global-layout tensor, as a view. A row slice
+        of a contiguous 2D tensor is itself contiguous, which the attention
+        kernels and the gather's ``local_tokens`` assert require."""
         return global_rows[self.local_start : self.local_start + self.local_len]
 
 
@@ -2575,11 +2335,8 @@ _logged_dataflow_decisions: set[str] = set()
 def _log_dataflow_decision(message: str) -> None:
     """Log a dataflow decision once per distinct message.
 
-    Deduping on the *whole* message, shapes included, is deliberate: an earlier
-    A/B in this campaign was declined by a layout precondition and produced
-    baseline-identical numbers that read as a clean null result. A per-reason
-    dedupe would not have caught it either, because the decline happened first at
-    prefill and would have masked the decode decision behind it.
+    Deduping on the *whole* message, shapes included: a per-reason dedupe would
+    let a decline at prefill mask the decode decision behind it.
     """
     if message not in _logged_dataflow_decisions:
         _logged_dataflow_decisions.add(message)
@@ -2597,11 +2354,9 @@ def global_residual_layout() -> Optional[GlobalResidualLayout]:
         )
         return None
     # The padded per-rank token counts: the same list that sized the global
-    # buffer (``set_dp_buffer_len``) and that ``get_dp_local_info`` cumsums on
-    # the device to place the gather's memcpy. Deriving the CPU row arithmetic
-    # from that one source is what keeps it from drifting out of agreement with
-    # where the gather actually writes -- including inside a captured CUDA graph,
-    # where every rank is padded to the bucket's token count.
+    # buffer and that ``get_dp_local_info`` cumsums on the device to place the
+    # gather's memcpy. One source, so the CPU row arithmetic cannot drift out of
+    # agreement with where the gather actually writes.
     sizes = get_dp_global_num_tokens()
     if sizes is None:
         _log_dataflow_decision(
@@ -2627,8 +2382,8 @@ def _residual_scale_norm(
     """Run a layer's opening ``res_scale -> accumulate -> norm`` chain.
 
     Prefers the fused kernel and falls back to the torch chain when it cannot
-    serve the shapes -- notably before ``fold_scales`` has run, so CPU unit tests
-    keep exercising the reference path. Returns ``(normed_hidden, new_residual)``.
+    serve the shapes -- notably before ``fold_scales`` has run. Returns
+    ``(normed_hidden, new_residual)``.
     """
     from sglang.kernels.ops.elementwise import zaya_residual_norm as _rn
 
@@ -2719,18 +2474,14 @@ class ZayaDecoderATTLayer(nn.Module):
             hidden_states = self.self_attn(hidden_states, positions, forward_batch)
             return hidden_states, residual, prev_router_hidden_states
 
-        # Global-residual dataflow: the residual stream -- and so the normed
-        # hidden states just computed -- cover every replica's rows, but attention
-        # is DP-local, so it runs on this replica's slice against its own
-        # positions and conv state. The partial gather then both sums the
-        # attention-TP partials and lifts the result back to the global layout,
-        # which is what the next (MoE) layer needs, so it needs no gather of its
-        # own and no scatter afterwards.
+        # Global-residual dataflow: the residual stream covers every replica's
+        # rows, but attention is DP-local, so it runs on this replica's slice.
+        # The partial gather then both sums the attention-TP partials and lifts
+        # the result back to the global layout the next layer needs.
         #
-        # The gather sits here rather than inside ``ZayaAttention.forward``
-        # deliberately: a replica idle this step returns early from that function
-        # before o_proj, and it must still take part in the collective or the
-        # ranks that are busy hang.
+        # The gather sits here rather than inside ``ZayaAttention.forward``: an
+        # idle replica returns early from that function before o_proj, and it
+        # must still take part in the collective or the busy ranks hang.
         partial = self.self_attn(
             global_residual.local_view(hidden_states),
             positions,
@@ -2739,12 +2490,9 @@ class ZayaDecoderATTLayer(nn.Module):
         )
         #
         # ``dp_gather_partial_out`` rather than ``dp_gather_partial``: under
-        # sum_len padding the all-reduce is out-of-place, so its output buffer
-        # already holds the gathered rows and copying them back into the staging
-        # buffer is a wasted launch per attention layer (60 of them per decode
-        # step here, where every launch is ~1.5-2.5us of a launch-bound step).
-        # The staging buffer is a fresh per-layer allocation with no other
-        # reader, so nothing needs the result to land there.
+        # sum_len padding the all-reduce is out-of-place, so its output already
+        # holds the gathered rows and the copy back into the staging buffer is a
+        # wasted launch. The staging buffer has no other reader.
         staging = get_global_dp_buffer(get_tp_group())
         hidden_states = dp_gather_partial_out(staging, partial, forward_batch)
         return hidden_states, residual, prev_router_hidden_states
@@ -2796,37 +2544,26 @@ class ZayaDecoderMLPLayer(nn.Module):
         if global_residual is not None:
             # Global-residual dataflow: the preceding attention layer's partial
             # gather already left the hidden states in the global layout, so the
-            # experts can run on them directly. This is where that dataflow pays
-            # off -- no gather here, and no scatter after, because the residual
-            # this feeds back into is global too.
+            # experts run on them directly -- no gather here, and no scatter
+            # after, because the residual this feeds back into is global too.
             hidden_states, prev_router_hidden_states = self.zaya_block(
                 hidden_states, prev_router_hidden_states
             )
             return hidden_states, residual, prev_router_hidden_states
 
-        # DP attention: the attention layers kept each DP replica's tokens
-        # local, but the experts (and their EP / MoE-TP all-reduce) must run over
-        # the *full* token set. Gather the DP-local normed hidden states into the
-        # global sequence -- tokens then become replicated across the whole TP
-        # group, which is exactly the layout ``ZayaBlock``'s reduce expects --
-        # run the experts, then scatter the per-token result back to this
-        # replica's slice. The fp32 ``residual`` stays DP-local;
-        # ``prev_router_hidden_states`` stays in the gathered (global) layout and
-        # is threaded through the MoE layers (every gather uses the same global
-        # token order, so router state and hidden states stay aligned).
+        # DP attention: the attention layers kept each replica's tokens local,
+        # but the experts (and their EP / MoE-TP all-reduce) must run over the
+        # *full* token set. Gather, run the experts, scatter back. The fp32
+        # ``residual`` stays DP-local; ``prev_router_hidden_states`` stays in the
+        # gathered layout, and every gather uses the same global token order so
+        # router state and hidden states stay aligned.
         #
-        # Use the *replicate* gather (not ``dp_gather_partial``): ``self_attn``
-        # already ran ``attn_tp_all_reduce``, so within each DP replica the normed
-        # hidden states are identical across the attention-TP ranks. The replicate
-        # gather takes each replica's slice from its attn-TP rank 0 only; the
-        # partial gather instead sums every attn-TP rank into the same slot, which
-        # multiplies the tokens by ``attn_tp_size`` -- a no-op at attn_tp=1 (so
-        # tp=2/dp=2 was correct) but corrupting every value once attn_tp>1 (e.g.
-        # tp=4/dp=2 on 74B doubled them, producing garbage output).
-        # Whether the gather is needed at all is ``dp_gather_required``; skipping
-        # it when the MoE and attention groups coincide matters a lot, because
-        # profiling tp=8/dp=4 on the 74B put ~83% of decode GPU time in
-        # collectives, of which the per-MoE-layer all-gather alone was 29%.
+        # The *replicate* gather, not ``dp_gather_partial``: ``self_attn`` already
+        # ran ``attn_tp_all_reduce``, so the normed hidden states are identical
+        # across a replica's attention-TP ranks. The partial gather would sum
+        # every one of them into the same slot, multiplying the tokens by
+        # ``attn_tp_size`` -- inert at attn_tp=1, garbage above it.
+        # ``dp_gather_required`` decides whether the gather is needed at all.
         use_dp_gather = dp_gather_required()
         if use_dp_gather:
             hidden_states, local_hidden_states = (
@@ -2889,13 +2626,10 @@ class ZayaModel(nn.Module):
         self.pp_group = get_pp_group()
 
         if self.pp_group.is_first_rank:
-            # Under DP attention each replica embeds its own DP-local token slice,
-            # so the vocab is sharded over the *attention* TP sub-group (and
-            # replicated across DP replicas) via ``use_attn_tp_group``. Sharding
-            # over the global TP group instead would make the embedding reduce
-            # span DP ranks and sum embeddings of unrelated tokens. With DP
-            # attention off, ``use_attn_tp_group`` is False and this is the plain
-            # global-TP vocab-parallel path.
+            # Under DP attention each replica embeds its own token slice, so the
+            # vocab is sharded over the *attention* TP sub-group. Sharding over
+            # the global TP group would make the embedding reduce span DP ranks
+            # and sum embeddings of unrelated tokens.
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
@@ -2947,11 +2681,9 @@ class ZayaModel(nn.Module):
             residual = None
             if global_residual is not None:
                 # Seed the stream in the global layout. Layer 0 has no incoming
-                # residual, so its residual *is* these embeddings -- gathering
-                # them once here is what makes the residual global, and from then
-                # on each attention layer's partial gather keeps it that way at no
-                # extra cost. This is the one collective the dataflow adds, against
-                # the 60 attention-TP all-reduces it removes.
+                # residual, so its residual *is* these embeddings; each attention
+                # layer's partial gather then keeps it global. The one collective
+                # this dataflow adds, against the per-layer all-reduces it drops.
                 global_hidden = get_global_dp_buffer(get_tp_group())
                 dp_gather_replicate(global_hidden, hidden_states, forward_batch)
                 hidden_states = global_hidden
@@ -2972,12 +2704,10 @@ class ZayaModel(nn.Module):
                 global_residual=global_residual,
             )
 
-        # Radix mamba-cache checkpoint, decode side (extra_buffer strategy
-        # only). Snapshots every CCA layer's conv_state + prev_hs into the
-        # per-request track slots in ONE launch, and must run after the last
-        # layer has updated its state. It stays inside the captured decode
-        # graph -- see ShortConvAttnBackend.track_conv_states_decode. No-op
-        # under ``no_buffer``.
+        # Radix mamba-cache checkpoint, decode side (extra_buffer only).
+        # Snapshots every CCA layer's state into the per-request track slots in
+        # one launch, so it must run after the last layer updated its state. It
+        # stays inside the captured decode graph. No-op under ``no_buffer``.
         get_attn_backend().track_conv_states_decode(forward_batch)
 
         if not self.pp_group.is_last_rank:
@@ -3036,12 +2766,11 @@ class ZayaForCausalLM(nn.Module):
         if self.pp_group.is_last_rank:
             # The lm_head vocab shard group must match what ``LogitsProcessor``
             # gathers over, which is the attention-TP group iff
-            # ``enable_dp_lm_head``. ZAYA1 ties the head to ``embed_tokens``,
-            # whose shard group is the attention-TP group under DP attention, so
+            # ``enable_dp_lm_head``. ZAYA1 ties the head to ``embed_tokens``, so
             # the two only line up when ``enable_dp_lm_head`` tracks
             # ``enable_dp_attention`` -- ``_zaya_overrides`` forces that for tied
-            # checkpoints (otherwise ``tie_weights`` would alias a
-            # ``vocab/attn_tp``-row weight into a head sharded ``vocab/tp``).
+            # checkpoints, or ``tie_weights`` aliases a ``vocab/attn_tp``-row
+            # weight into a head sharded ``vocab/tp``.
             self.lm_head = ParallelLMHead(
                 config.vocab_size,
                 config.hidden_size,
@@ -3061,10 +2790,8 @@ class ZayaForCausalLM(nn.Module):
     def get_attention_sliding_window_size(self) -> Optional[int]:
         """Global sliding-window size for SWA-enabled checkpoints (else None).
 
-        ``ModelRunner`` calls this to size the attention backend's SWA metadata
-        buffers; returning None on base checkpoints leaves the runtime in the
-        plain full-attention path. The per-layer window is selected inside
-        ``ZayaAttention`` via ``RadixAttention.sliding_window_size``.
+        ``ModelRunner`` calls this to size the backend's SWA metadata buffers.
+        The per-layer window is selected inside ``ZayaAttention``.
         """
         return self.config.get_attention_sliding_window_size()
 
@@ -3209,9 +2936,8 @@ class ZayaForCausalLM(nn.Module):
             # matches our submodule registration, so no rename is needed.
             if ckpt_name not in params_dict:
                 # ``conv_qk`` is an ``nn.Sequential`` of two ``nn.Conv1d``,
-                # whose keys end in ``.0.{weight,bias}`` / ``.1.{weight,bias}``
-                # and are exposed through ``named_parameters()`` automatically.
-                # Anything else is genuinely unknown – warn and skip.
+                # exposed through ``named_parameters()``. Anything else is
+                # genuinely unknown -- warn and skip.
                 logger.warning(
                     "WARNING: checkpoint key %s has no matching parameter; skipping",
                     ckpt_name,
@@ -3230,10 +2956,9 @@ class ZayaForCausalLM(nn.Module):
         """Precompute the per-layer constants derived from loaded weights.
 
         Must run after every weight load (including reloads) and before the
-        first forward, since the forward paths read the folded buffers rather
-        than recomputing from the parameters. Kept separate from
-        ``load_weights`` so a caller that populates weights another way can
-        still refresh them.
+        first forward: the forward paths read the folded buffers rather than
+        recomputing. Separate from ``load_weights`` so a caller that populates
+        weights another way can still refresh them.
         """
         for module in self.modules():
             if isinstance(module, ResidualScaling):
