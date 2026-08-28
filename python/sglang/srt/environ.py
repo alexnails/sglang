@@ -1545,12 +1545,23 @@ class Envs:
     # kernels. Worth -720 launches/step of ~2382, the largest single reduction
     # available -- the router is 14 of the ~20 launches in a MoE layer.
     #
-    # DEFAULT OFF: as written, the tail kernel takes a DEVICE-SIDE FAULT on gfx950
-    # (surfaces as SIGABRT at the next sync, two tests after the offending
-    # launch), so the torch reference path runs until the indexing is fixed. Do
-    # not enable without running
-    # `pytest test/registered/unit/models/test_zaya_cca.py -k RouterFused`.
+    # STILL DEFAULT OFF, now pending validation rather than known-broken. The
+    # first version took a device-side fault on gfx950; both kernels have since
+    # been hardened so every load and store address is formed from a clamped
+    # index (in bounds whether or not the mask is honoured), all stores are
+    # masked, the chosen expert id is clamped on both sides, and the column block
+    # never goes below 16 lanes. None of that has run on a GPU. Flip this on only
+    # after `pytest test/registered/unit/models/test_zaya_cca.py -k Router`
+    # passes on the target hardware -- TestZayaRouterTailKernel runs first and
+    # touches no sglang module, so it isolates the kernel from the model path.
     SGLANG_OPT_ZAYA_FUSED_ROUTER = EnvBool(False)
+    # Compile the in-kernel index assertions into the fused router kernels, so a
+    # bad index aborts AT the kernel naming the violated invariant instead of
+    # surfacing as a SIGABRT at the next unrelated synchronisation point. Debug
+    # instrumentation only: it costs a branch and a trap per program. Use with
+    # TRITON_DEBUG=1 (Triton only emits device_assert when debug is on) and
+    # AMD_SERIALIZE_KERNEL=3 (attributes the fault to the launching kernel).
+    SGLANG_DEBUG_ZAYA_FUSED_ROUTER = EnvBool(False)
 
     # ===================================================================
     # Symmetric memory

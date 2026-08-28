@@ -67,6 +67,8 @@ CUDA-JIT, so it runs on ROCm -- ZAYA1's reference deployment is MI355X.
 
 from __future__ import annotations
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
@@ -75,6 +77,38 @@ import triton.language as tl
 # Triton block. ZAYA1 uses 25; 1024 is far more headroom than any MoE router
 # with top-1 routing plausibly needs.
 _MAX_EXPERTS = 1024
+
+# Never emit a block narrower than this. The expert axis is only 25 columns, and
+# a 2- or 4-wide 1-D tensor is a degenerate layout on a 64-lane wavefront -- far
+# off the path any in-tree kernel exercises, and not worth being the first to
+# find out about. Padding to 16 costs nothing: the extra lanes are masked, and
+# with the clamped addressing above they cannot even form an out-of-range
+# address.
+_MIN_BLOCK = 16
+
+
+def block_size(num_experts: int) -> int:
+    """Column block for ``num_experts``: a power of two, at least ``_MIN_BLOCK``."""
+    return max(triton.next_power_of_2(num_experts), _MIN_BLOCK)
+
+
+@functools.lru_cache(maxsize=1)
+def debug_asserts_enabled() -> bool:
+    """Whether to compile in the in-kernel index assertions.
+
+    Off by default -- they cost a branch and a trap per program. Turn them on
+    together with ``TRITON_DEBUG=1`` to have a bad index abort *at* this kernel
+    naming the violated invariant, instead of surfacing as a SIGABRT at the next
+    unrelated synchronisation point. Pair with ``AMD_SERIALIZE_KERNEL=3`` so the
+    fault is attributed to the launching kernel.
+
+    Cached: it is a process-lifetime debug switch, and this is read on every
+    launch -- 60 times per decode step on the 74B.
+    """
+    from sglang.srt.environ import envs
+
+    return bool(envs.SGLANG_DEBUG_ZAYA_FUSED_ROUTER.get())
+
 
 _FLOAT_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
@@ -88,22 +122,43 @@ def _router_tail_kernel(
     ids_ptr,  # [T, 1] int32          out (clamped)
     skip_ids_ptr,  # [T, 1] int32          out (raw), unused unless EMIT_SKIP_IDS
     s_logits_t,
+    num_tokens,
     NUM_EXPERTS: tl.constexpr,
     MAX_EXPERT_ID: tl.constexpr,
     SOFTMAX_FP32: tl.constexpr,
     EMIT_SKIP_IDS: tl.constexpr,
     BLOCK: tl.constexpr,
+    DEBUG_ASSERT: tl.constexpr,
 ):
     t = tl.program_id(0)
+    row_ok = t < num_tokens
+
     cols = tl.arange(0, BLOCK)
     mask = cols < NUM_EXPERTS
 
-    x = tl.load(logits_ptr + t * s_logits_t + cols, mask=mask, other=0.0).to(tl.float32)
-    # Padding lanes must not win the max nor add to the exp sum.
-    x = tl.where(mask, x, float("-inf"))
+    # Every address below is formed from a CLAMPED index, so it is inside the
+    # tensor whether or not the mask is honoured; the mask still decides which
+    # values participate. BLOCK is a power of two >= 16 while NUM_EXPERTS is 25
+    # on the 74B, so 7 of 32 lanes are padding and it is exactly those lanes'
+    # addresses that a mis-vectorized or dropped mask would let escape the row.
+    # Clamping makes the bound independent of that: a padding lane re-reads the
+    # last valid column instead of reading past it.
+    safe_cols = tl.minimum(cols, NUM_EXPERTS - 1)
+    safe_t = tl.minimum(t, num_tokens - 1)
 
-    row_max = tl.max(x, axis=0)
-    e = tl.exp(x - row_max)  # padding lanes: exp(-inf) == 0
+    x = tl.load(logits_ptr + safe_t * s_logits_t + safe_cols, mask=mask, other=0.0).to(
+        tl.float32
+    )
+
+    # Padding lanes must not win the max nor add to the exp sum. The -inf exists
+    # only inside this reduction, so exp() never sees -inf minus -inf.
+    row_max = tl.max(tl.where(mask, x, float("-inf")), axis=0)
+    # A padding lane holds ``other=0.0``, not -inf, so its exponent could
+    # overflow to +inf when row_max is very negative. The tl.where discards that
+    # value, but clamping the shift keeps infinities out of the arithmetic
+    # instead of relying on the select. Exact for the real lanes: row_max is
+    # their maximum, so x - row_max is already <= 0 and the clamp is a no-op.
+    e = tl.where(mask, tl.exp(tl.minimum(x - row_max, 0.0)), 0.0)
     prob = e / tl.sum(e, axis=0)
 
     if not SOFTMAX_FP32:
@@ -113,23 +168,41 @@ def _router_tail_kernel(
         # otherwise the biased comparison below sees different numbers.
         prob = prob.to(logits_ptr.dtype.element_ty).to(tl.float32)
 
-    biases = tl.load(biases_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    biases = tl.load(biases_ptr + safe_cols, mask=mask, other=0.0).to(tl.float32)
     biased = tl.where(mask, prob + biases, float("-inf"))
 
     best = tl.max(biased, axis=0)
     # Lowest index wins an exact tie. torch.argmax leaves this unspecified, and
-    # exact ties are reachable here (constant biases, equal logits).
-    idx = tl.min(tl.where(biased == best, cols, NUM_EXPERTS), axis=0)
+    # exact ties are reachable here (constant biases, equal logits). The mask is
+    # ANDed in so a padding lane can never be the winner even if its -inf
+    # somehow compared equal to ``best``.
+    idx = tl.min(tl.where(mask & (biased == best), cols, NUM_EXPERTS), axis=0)
+
+    if DEBUG_ASSERT:
+        # Deliberately asserted BEFORE the clamp below, so the assert fires on
+        # the real invariant rather than on its repaired form. Enable with
+        # SGLANG_OPT_ZAYA_FUSED_ROUTER_DEBUG=1 plus TRITON_DEBUG=1.
+        tl.device_assert(row_ok, "zaya_router_tail: token index past the rows")
+        tl.device_assert(idx >= 0, "zaya_router_tail: negative expert id")
+        tl.device_assert(idx < NUM_EXPERTS, "zaya_router_tail: expert id too big")
+
+    # Clamp on BOTH sides. ``tl.minimum`` alone bounds the top, but nothing
+    # bounded the bottom: ``idx`` comes out of a cross-lane reduction, and it is
+    # also the NUM_EXPERTS sentinel above when no lane compares equal to the max
+    # (reachable with a NaN logit). Either way an out-of-range id would leave
+    # this kernel silently and fault far away, inside FusedMoE, which uses these
+    # ids to index expert weights and to build the align/sort buffers.
+    idx = tl.maximum(tl.minimum(idx, NUM_EXPERTS - 1), 0)
 
     # Gather the *unbiased* probability of the winner. Exactly one lane is
     # non-zero, so the fp32 sum is exact.
     chosen = tl.sum(tl.where(cols == idx, prob, 0.0), axis=0)
 
-    tl.store(weight_ptr + t, chosen)
-    tl.store(prob_ptr + t, chosen.to(prob_ptr.dtype.element_ty))
-    tl.store(ids_ptr + t, tl.minimum(idx, MAX_EXPERT_ID).to(tl.int32))
+    tl.store(weight_ptr + safe_t, chosen, mask=row_ok)
+    tl.store(prob_ptr + safe_t, chosen.to(prob_ptr.dtype.element_ty), mask=row_ok)
+    tl.store(ids_ptr + safe_t, tl.minimum(idx, MAX_EXPERT_ID).to(tl.int32), mask=row_ok)
     if EMIT_SKIP_IDS:
-        tl.store(skip_ids_ptr + t, idx.to(tl.int32))
+        tl.store(skip_ids_ptr + safe_t, idx.to(tl.int32), mask=row_ok)
 
 
 def covered(
@@ -212,11 +285,13 @@ def router_tail(
         moe_ids,
         skip_ids,
         logits.stride(0),
+        num_tokens,
         NUM_EXPERTS=num_experts,
         MAX_EXPERT_ID=max_expert_id,
         SOFTMAX_FP32=bool(softmax_fp32),
         EMIT_SKIP_IDS=emit_skip_ids,
-        BLOCK=triton.next_power_of_2(num_experts),
-        num_warps=1,
+        BLOCK=block_size(num_experts),
+        DEBUG_ASSERT=debug_asserts_enabled(),
+        num_warps=4,
     )
     return moe_weight, moe_ids, route_prob, skip_ids
