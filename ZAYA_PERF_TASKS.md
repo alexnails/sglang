@@ -12,6 +12,33 @@ Baseline (measured, MI355X, tp8/dp4, ISL 1024/OSL 256, rep 1 discarded):
 
 `SGLANG_OPT_ZAYA_GLOBAL_RESIDUAL=1` is the reference config for every arm below.
 
+Concurrency scaling on the reference config (ISL 1024/OSL 256):
+
+| C | out tok/s | total tok/s | TPOT ms | scaling efficiency |
+|---|---|---|---|---|
+| 1 | 65.4 | 327 | 15.00 | - |
+| 32 | 1826.9 | 9128 | 16.45 | 87% |
+| 128 | 5306.2 | 26397 | 20.98 | 63% |
+| 512 | 10943 | 54674 | 35.80 | 33% |
+
+Still climbing at C=512 (2.06x throughput for 4x concurrency), so the fixed
+per-layer cost is amortizing rather than saturating. max_running_requests is
+170/replica = 680 total at `--max-mamba-cache-size 2048`.
+
+Prefill / TTFT reference (`--disable-radix-cache`, since bench_serving reuses
+its random prompts and the prefix cache otherwise skips prefill entirely):
+
+| cell | TTFT off | TTFT + prefill graph | delta |
+|---|---|---|---|
+| ISL 128, C=128 | 303.5 | 189.2 | **-37.7%** |
+| ISL 256, C=64 | 276.1 | 231.1 | **-16.3%** |
+| ISL 1024, C=128 | 811.7 | 851.8 | +4.9% |
+| ISL 4096, C=8 | 366.7 | - | - |
+| ISL 16384, C=4 | 850.9 | - | - |
+
+So `--cuda-graph-backend-prefill breakable` is a per-workload flag: a large win
+below ~256 ISL, a loss above ~1k. Decode is neutral (-0.5%).
+
 ## Launch census (static, brackets the measured ~2382/step)
 
 | cluster | /step | share | addressable |
@@ -70,6 +97,25 @@ Baseline (measured, MI355X, tp8/dp4, ISL 1024/OSL 256, rep 1 discarded):
       (2403 rows, 1357 gfx950). Clone the E=512/513 rows at the identical
       model_dim=4096/inter_dim=512 and point `AITER_CONFIG_FMOE` at the copy.
       **No code change.**
+      **RESULT: CONFIRMED WIN, prefill only.** The only *unquantized* gfx950 rows at
+      our model_dim=4096 sit at inter_dim=384/E=128/topk=8, and what they encode is a
+      block_m ladder (32 for token<=256, 64 at 512, 128 at 1024+, ksplit 0). At decode
+      M is small so the default already picks 32 -- hence no decode effect -- but on
+      long prefill:
+
+      | cell | baseline | + cloned table | delta |
+      |---|---|---|---|
+      | ISL 4096 C=8 TTFT | 366.7 ms | 339.6 ms | **-7.4%** |
+      | ISL 4096 C=8 total tok/s | 8292 | 8667 | **+4.5%** |
+      | ISL 16384 C=4 TTFT | 850.9 ms | 796.9 ms | **-6.3%** |
+      | ISL 16384 C=4 total tok/s | 13132 | 13696 | **+4.3%** |
+
+      Rep spread 0.06%, so real. This is a HEURISTIC transfer, not a tune: the E and
+      topk fields were rewritten and only block_m/ksplit carry over. A confirmed win
+      means the shape deserves a real tuning run
+      (`benchmark/kernels/fused_moe_triton/`-style sweep against aiter's own tuner),
+      and the row should be upstreamed into aiter's table rather than shipped as a
+      local CSV.
 - [ ] G3 `--quantization mxfp4`. Verified `mxfp4.py:367-368`: on HIP every LinearBase
       gets UnquantizedLinearMethod, only FusedMoE is quantized. Experts
       18.1 -> 4.5 GB/GPU, zero added launches. Step 0 first: read the fused_moe
