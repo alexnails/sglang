@@ -1860,7 +1860,9 @@ class ZayaBlock(nn.Module):
             is_tp_path=False
         ):
             experts_out = moe_expert_parallel_all_reduce(experts_out)
-        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(is_tp_path=True):
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True
+        ):
             experts_out = moe_tensor_model_parallel_all_reduce(experts_out)
         return experts_out
 
