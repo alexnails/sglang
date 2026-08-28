@@ -371,7 +371,7 @@ class ZayaConfig(PretrainedConfig):
         # ``in_out_ch`` stay in lockstep in either mode.
         try:
             tp_size = get_parallel().attn_tp_size
-        except (AssertionError, RuntimeError):
+        except (AssertionError, RuntimeError, ValueError):
             tp_size = 1
 
         in_out_ch_full = (
