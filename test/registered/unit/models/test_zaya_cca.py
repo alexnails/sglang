@@ -1982,9 +1982,16 @@ def _make_tiny_router(
     seed: int = 0,
     device: str = "cpu",
     dtype: torch.dtype = torch.float32,
+    std: float = 0.5,
     **config_overrides,
 ):
-    """A ``ZayaRouter`` with random weights, on ``device`` at ``dtype``."""
+    """A ``ZayaRouter`` with random weights, on ``device`` at ``dtype``.
+
+    ``std`` matters once ``mlp_expansion`` is realistic: three stacked dense
+    stages at std 0.5 and width 256 amplify by ~500x, which saturates the
+    downstream softmax and makes a numerical comparison meaningless. Pass
+    ``1 / sqrt(mlp_expansion)`` for the wide cases.
+    """
     from sglang.srt.models.zaya import ZayaRouter
 
     _ensure_dist_initialized()
@@ -2000,7 +2007,7 @@ def _make_tiny_router(
     router.eval()
     with torch.no_grad():
         for p in router.parameters():
-            p.data.normal_(mean=0.0, std=0.5)
+            p.data.normal_(mean=0.0, std=std)
     router = router.to(device=device, dtype=dtype)
     # ``.to(dtype)`` drags the fp32 balancing-bias buffer along with the weights.
     # The real weight loader leaves it fp32, so put it back rather than testing a
@@ -2305,6 +2312,326 @@ class TestZayaRouterFusedTail(CustomTestCase):
             raw, _ = router.down_proj(hidden)
         self.assertTrue(torch.equal(prev, prev_before))
         self.assertFalse(torch.allclose(routing.hidden_states_next, raw))
+
+
+# ---------------------------------------------------------------------------
+# ZayaRouter: fused router MLP (3 dense stages + 2 GELUs in one kernel)
+# ---------------------------------------------------------------------------
+
+
+class TestZayaRouterFusedMLP(CustomTestCase):
+    """The fused router MLP must reproduce the ``nn.Sequential`` it replaces.
+
+    Derived property. Five launches (Linear, GELU, Linear, GELU, Linear) become
+    one kernel that re-derives the weight transposes, the bias placement, the
+    rounding points and the activation from scratch. The activation is the
+    dangerous one: ``nn.GELU()`` is ``approximate='none'``, the erf form, and the
+    tanh approximation agrees with it to ~5e-4 absolute -- close enough to pass
+    for numerical noise, far enough to flip routing on near-ties in all 60 MoE
+    layers of the 74B. So the erf-vs-tanh guard gets tests of its own, on CPU,
+    where they run on every commit rather than only on GPU hardware.
+    """
+
+    def test_structural_guard_accepts_the_real_router(self):
+        from sglang.srt.models.zaya import fusable_router_mlp
+
+        router, _ = _make_tiny_router(num_moe_experts=4, seed=21)
+        self.assertTrue(fusable_router_mlp(router.router_mlp))
+        self.assertTrue(router.fused_router_mlp_ok)
+
+    def test_structural_guard_rejects_the_tanh_approximation(self):
+        """The one failure mode with no numerical signature loud enough to catch.
+
+        ``covered()`` sees only tensors, so nothing downstream can tell which
+        GELU the eager path was built with. If this guard regressed, the fused
+        kernel would compute the erf form while the module held the tanh one --
+        or the reverse -- and the only symptom would be slightly different
+        expert choices.
+        """
+        from sglang.srt.models.zaya import fusable_router_mlp
+
+        for idx in (1, 3):
+            for approximate in ("tanh",):
+                with self.subTest(activation_index=idx, approximate=approximate):
+                    router, _ = _make_tiny_router(num_moe_experts=4, seed=22)
+                    stages = list(router.router_mlp)
+                    stages[idx] = torch.nn.GELU(approximate=approximate)
+                    self.assertFalse(fusable_router_mlp(torch.nn.Sequential(*stages)))
+
+        # A different activation entirely is also refused.
+        router, _ = _make_tiny_router(num_moe_experts=4, seed=22)
+        stages = list(router.router_mlp)
+        stages[1] = torch.nn.SiLU()
+        self.assertFalse(fusable_router_mlp(torch.nn.Sequential(*stages)))
+
+        # And the erf form -- spelled out explicitly -- is still accepted.
+        router, _ = _make_tiny_router(num_moe_experts=4, seed=22)
+        stages = list(router.router_mlp)
+        stages[1] = torch.nn.GELU(approximate="none")
+        self.assertTrue(fusable_router_mlp(torch.nn.Sequential(*stages)))
+
+    def test_structural_guard_rejects_a_reshaped_mlp(self):
+        from sglang.srt.models.zaya import fusable_router_mlp
+
+        # A final projection carrying a bias the kernel would silently drop.
+        router, _ = _make_tiny_router(num_moe_experts=4, seed=23)
+        router.router_mlp[4].bias = torch.nn.Parameter(torch.zeros(router.num_experts))
+        self.assertFalse(fusable_router_mlp(router.router_mlp))
+
+        # A stage that returns its bias instead of applying it.
+        router, _ = _make_tiny_router(num_moe_experts=4, seed=23)
+        router.router_mlp[0].skip_bias_add = True
+        self.assertFalse(fusable_router_mlp(router.router_mlp))
+
+        # A different number of stages.
+        router, _ = _make_tiny_router(num_moe_experts=4, seed=23)
+        stages = list(router.router_mlp)[:3]
+        self.assertFalse(fusable_router_mlp(torch.nn.Sequential(*stages)))
+
+    def test_erf_and_tanh_gelu_actually_differ(self):
+        """Pin that the guard above is guarding something real.
+
+        Were the two GELU flavours interchangeable to within bf16 rounding there
+        would be no reason to check which one the module holds, and the guard
+        would be ceremony. They are not.
+        """
+        x = torch.linspace(-4.0, 4.0, 401)
+        erf_form = torch.nn.functional.gelu(x, approximate="none")
+        tanh_form = torch.nn.functional.gelu(x, approximate="tanh")
+        gap = (erf_form - tanh_form).abs().max().item()
+        # The magnitude the kernel docstring quotes, so the two stay in sync.
+        self.assertGreater(gap, 1e-4)
+        self.assertLess(gap, 1e-2)
+
+    def test_uncovered_inputs_fall_back(self):
+        from sglang.kernels.ops.moe import zaya_router_mlp as kernel
+
+        expansion, num_experts = 32, 5
+        dt = torch.bfloat16
+        x = torch.randn(6, expansion, dtype=dt)
+        w1 = torch.randn(expansion, expansion, dtype=dt)
+        w2 = torch.randn(expansion, expansion, dtype=dt)
+        w3 = torch.randn(num_experts, expansion, dtype=dt)
+        b1 = torch.zeros(expansion, dtype=dt)
+        b2 = torch.zeros(expansion, dtype=dt)
+        args = (x, w1, b1, w2, b2, w3)
+
+        # CPU tensors are not served by the Triton path.
+        self.assertFalse(kernel.covered(*args, num_experts=num_experts))
+        # A missing bias (bias=False on a stage the kernel assumes has one).
+        self.assertFalse(
+            kernel.covered(x, w1, None, w2, b2, w3, num_experts=num_experts)
+        )
+        # fp32 is excluded: tl.dot would pick a reduced-precision fp32 mode.
+        self.assertFalse(
+            kernel.covered(
+                x.float(),
+                w1.float(),
+                b1.float(),
+                w2.float(),
+                b2.float(),
+                w3.float(),
+                num_experts=num_experts,
+            )
+        )
+        # An expansion beyond the cap the K split imposes.
+        wide = 512
+        self.assertFalse(
+            kernel.covered(
+                torch.randn(6, wide, dtype=dt),
+                torch.randn(wide, wide, dtype=dt),
+                torch.zeros(wide, dtype=dt),
+                torch.randn(wide, wide, dtype=dt),
+                torch.zeros(wide, dtype=dt),
+                torch.randn(num_experts, wide, dtype=dt),
+                num_experts=num_experts,
+            )
+        )
+        # An odd expansion, which cannot be split in halves.
+        odd = 33
+        self.assertFalse(
+            kernel.covered(
+                torch.randn(6, odd, dtype=dt),
+                torch.randn(odd, odd, dtype=dt),
+                torch.zeros(odd, dtype=dt),
+                torch.randn(odd, odd, dtype=dt),
+                torch.zeros(odd, dtype=dt),
+                torch.randn(num_experts, odd, dtype=dt),
+                num_experts=num_experts,
+            )
+        )
+        # A shape disagreement between the stages.
+        self.assertFalse(
+            kernel.covered(
+                x,
+                w1,
+                b1,
+                torch.randn(expansion, expansion + 2, dtype=dt),
+                b2,
+                w3,
+                num_experts=num_experts,
+            )
+        )
+        # A final projection that does not match the declared expert count.
+        self.assertFalse(kernel.covered(*args, num_experts=num_experts + 1))
+        # Non-unit innermost stride on the activation.
+        self.assertFalse(
+            kernel.covered(
+                torch.randn(expansion, 6, dtype=dt).t(),
+                w1,
+                b1,
+                w2,
+                b2,
+                w3,
+                num_experts=num_experts,
+            )
+        )
+
+    def test_cpu_router_takes_the_reference_mlp(self):
+        """On CPU the fused branch is skipped before the kernel is imported."""
+        router, _ = _make_tiny_router(num_moe_experts=4, seed=24)
+        hs_norm = torch.randn(4, router.mlp_expansion)
+        with torch.no_grad():
+            got = router._router_logits(hs_norm)
+            ref = router._router_logits_reference(hs_norm)
+        self.assertTrue(torch.equal(got, ref))
+
+    def _operands(self, router, hs_norm):
+        first, second, last = (router.router_mlp[i] for i in (0, 2, 4))
+        return (
+            hs_norm,
+            first.weight,
+            first.bias,
+            second.weight,
+            second.bias,
+            last.weight,
+        )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused MLP is a GPU kernel")
+    def test_matches_the_unfused_sequential(self):
+        from sglang.kernels.ops.moe import zaya_router_mlp as kernel
+
+        # 256 / 24(+1) is ZAYA1-74B exactly; 32 / 4(+1) exercises a K split
+        # right at the tl.dot minimum and a padded expert axis.
+        for expansion, num_moe_experts, num_tokens in (
+            (256, 24, 1),
+            (256, 24, 33),
+            (256, 24, 130),
+            (32, 4, 7),
+        ):
+            with self.subTest(d=expansion, e=num_moe_experts, t=num_tokens):
+                router, _ = _make_tiny_router(
+                    num_moe_experts=num_moe_experts,
+                    mlp_expansion=expansion,
+                    seed=expansion,
+                    device="cuda",
+                    dtype=torch.bfloat16,
+                    std=1.0 / (expansion**0.5),
+                )
+                torch.manual_seed(num_tokens)
+                hs_norm = torch.randn(
+                    num_tokens, expansion, device="cuda", dtype=torch.bfloat16
+                )
+                operands = self._operands(router, hs_norm)
+                self.assertTrue(
+                    kernel.covered(*operands, num_experts=router.num_experts),
+                    "the fused path must be the one under test",
+                )
+                with torch.no_grad():
+                    got = kernel.router_mlp(*operands, num_experts=router.num_experts)
+                    ref = router._router_logits_reference(hs_norm)
+
+                self.assertEqual(got.shape, ref.shape)
+                self.assertEqual(got.dtype, ref.dtype)
+                # Two bf16 GEMM chains with different K-reduction orders, so
+                # close but not identical. bf16 carries ~3 decimal digits, so
+                # 3e-2 relative is a couple of ULP on these logits.
+                torch.testing.assert_close(
+                    got.float(), ref.float(), rtol=3e-2, atol=3e-2
+                )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused MLP is a GPU kernel")
+    def test_selected_expert_is_unchanged_end_to_end(self):
+        """The bar that matters: same expert, through the MLP *and* the tail.
+
+        assert_close on the logits is necessary but not sufficient. The logits
+        feed an argmax, and the point of the campaign is that greedy routing does
+        not move, so compare the fully fused router against the fully unfused
+        chain on a ZAYA1-shaped router.
+        """
+        router, config = _make_tiny_router(
+            num_moe_experts=24,
+            mlp_expansion=256,
+            seed=31,
+            device="cuda",
+            dtype=torch.bfloat16,
+            std=1.0 / 16.0,
+        )
+        torch.manual_seed(31)
+        hidden = torch.randn(
+            64, config.hidden_size, device="cuda", dtype=torch.bfloat16
+        )
+        with torch.no_grad():
+            fused = router(hidden)
+            hs, _ = router.down_proj(hidden)
+            logits = router._router_logits_reference(router.rmsnorm_eda(hs))
+            ref = router._routing_reference(logits, hidden.dtype, hs)
+
+        self.assertTrue(
+            torch.equal(fused.moe_ids.long(), ref.moe_ids.long()),
+            "greedy expert choice must survive both fusions",
+        )
+        self.assertTrue(torch.equal(fused.skip_ids.long(), ref.skip_ids.long()))
+        torch.testing.assert_close(
+            fused.moe_weight, ref.moe_weight, rtol=3e-2, atol=3e-2
+        )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused MLP is a GPU kernel")
+    def test_zero_tokens_is_a_no_op(self):
+        """Idle DP-attention forwards arrive with T == 0 and must not launch."""
+        from sglang.kernels.ops.moe import zaya_router_mlp as kernel
+
+        expansion, num_experts = 32, 5
+        dev, dt = "cuda", torch.bfloat16
+        out = kernel.router_mlp(
+            torch.randn(0, expansion, device=dev, dtype=dt),
+            torch.randn(expansion, expansion, device=dev, dtype=dt),
+            torch.zeros(expansion, device=dev, dtype=dt),
+            torch.randn(expansion, expansion, device=dev, dtype=dt),
+            torch.zeros(expansion, device=dev, dtype=dt),
+            torch.randn(num_experts, expansion, device=dev, dtype=dt),
+            num_experts=num_experts,
+        )
+        self.assertEqual(tuple(out.shape), (0, num_experts))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "fused MLP is a GPU kernel")
+    def test_partial_row_tile_matches(self):
+        """T not a multiple of BLOCK_M: the masked rows must not corrupt output."""
+        from sglang.kernels.ops.moe import zaya_router_mlp as kernel
+
+        expansion, num_moe_experts = 32, 4
+        router, _ = _make_tiny_router(
+            num_moe_experts=num_moe_experts,
+            mlp_expansion=expansion,
+            seed=41,
+            device="cuda",
+            dtype=torch.bfloat16,
+            std=1.0 / (expansion**0.5),
+        )
+        for num_tokens in (1, 31, 32, 33):
+            with self.subTest(tokens=num_tokens):
+                torch.manual_seed(num_tokens)
+                hs_norm = torch.randn(
+                    num_tokens, expansion, device="cuda", dtype=torch.bfloat16
+                )
+                operands = self._operands(router, hs_norm)
+                with torch.no_grad():
+                    got = kernel.router_mlp(*operands, num_experts=router.num_experts)
+                    ref = router._router_logits_reference(hs_norm)
+                self.assertEqual(tuple(got.shape), tuple(ref.shape))
+                torch.testing.assert_close(
+                    got.float(), ref.float(), rtol=3e-2, atol=3e-2
+                )
 
 
 if __name__ == "__main__":

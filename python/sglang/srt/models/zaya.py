@@ -1511,6 +1511,41 @@ class ZayaAttention(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def fusable_router_mlp(router_mlp: nn.Sequential) -> bool:
+    """Whether ``ZayaRouter.router_mlp`` has the shape the fused kernel assumes.
+
+    Structural, not numerical: exactly Linear / GELU / Linear / GELU / Linear,
+    no ``skip_bias_add``, no bias on the final projection, and -- the one thing
+    the kernel's own ``covered()`` cannot see from its tensors -- both
+    activations the *erf* GELU.
+
+    That last check is the point of this function. ``nn.GELU()`` is
+    ``approximate='none'``, i.e. ``0.5 * x * (1 + erf(x / sqrt(2)))``. The tanh
+    approximation differs from it by only ~5e-4 absolute: small enough to pass
+    for ordinary numerical noise in an end-to-end eval, large enough to flip
+    routing on near-ties, in every one of the 74B's 60 MoE layers. Fusing the
+    wrong flavour would be a silent accuracy regression, so nothing gets fused
+    until the flavour is verified.
+
+    Kept a free function -- like ``mod_premask_experts`` / ``mod_blend`` -- so
+    the guard is unit-testable without building a router.
+    """
+    if len(router_mlp) != 5:
+        return False
+    for i in (0, 2, 4):
+        stage = router_mlp[i]
+        if not isinstance(stage, ReplicatedLinear) or stage.skip_bias_add:
+            return False
+    for i in (1, 3):
+        activation = router_mlp[i]
+        if not isinstance(activation, nn.GELU):
+            return False
+        if getattr(activation, "approximate", "none") != "none":
+            return False
+    # The kernel folds no bias into the final projection.
+    return getattr(router_mlp[4], "bias", None) is None
+
+
 class ZayaRouting(NamedTuple):
     """Everything :class:`ZayaBlock` needs out of one router forward.
 
@@ -1631,6 +1666,10 @@ class ZayaRouter(nn.Module):
             ),
         )
 
+        # Checked once, here, because it is a property of the module graph
+        # rather than of the inputs.
+        self.fused_router_mlp_ok = fusable_router_mlp(self.router_mlp)
+
         self.register_buffer(
             "balancing_biases",
             torch.zeros(self.num_experts, dtype=torch.float32),
@@ -1718,7 +1757,34 @@ class ZayaRouter(nn.Module):
         )
 
     def _router_logits(self, hs_norm: torch.Tensor) -> torch.Tensor:
-        """Expert logits from the normalized router state, ``[T, num_experts]``."""
+        """Expert logits from the normalized router state, ``[T, num_experts]``.
+
+        The 3-stage MLP with its two GELUs is five launches as an
+        ``nn.Sequential`` and one as a fused kernel -- 240 per decode step across
+        the 74B's 60 MoE layers. The weights are only ~270 KB per layer, so this
+        is launch overhead, not bandwidth.
+        """
+        # ``.is_cuda`` gates the import as well as the dispatch: the kernel
+        # module imports ``triton`` at module scope.
+        if self.fused_router_mlp_ok and hs_norm.is_cuda:
+            from sglang.kernels.ops.moe import zaya_router_mlp as _mlp
+
+            first, second, last = (self.router_mlp[i] for i in (0, 2, 4))
+            operands = (
+                hs_norm,
+                first.weight,
+                first.bias,
+                second.weight,
+                second.bias,
+                last.weight,
+            )
+            if _mlp.covered(*operands, num_experts=self.num_experts):
+                return _mlp.router_mlp(*operands, num_experts=self.num_experts)
+
+        return self._router_logits_reference(hs_norm)
+
+    def _router_logits_reference(self, hs_norm: torch.Tensor) -> torch.Tensor:
+        """The unfused ``nn.Sequential``: reference semantics and fallback."""
         # Step through the Sequential manually so the ``(tensor, bias)`` tuple
         # returned by each ReplicatedLinear is unpacked correctly.
         out = hs_norm
