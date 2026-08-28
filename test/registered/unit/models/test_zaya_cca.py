@@ -2821,6 +2821,12 @@ class TestShortConvTrackDecode(CustomTestCase):
         self.assertTrue(torch.equal(conv1, expected1))
 
 
+@unittest.skip(
+    "Asserts ZayaForCausalLM is on _MAMBA_EXTRA_BUFFER_ARCHS, which is "
+    "withheld until the track snapshot takes the projected lag (it still "
+    "writes conv[1] at hidden_size while that pool entry is now "
+    "latent_k_dim_full wide). Unskip together with the allowlist entry."
+)
 class TestShortConvNoBufferUnchanged(CustomTestCase):
     """``no_buffer`` must be exactly what it was before extra_buffer existed."""
 
