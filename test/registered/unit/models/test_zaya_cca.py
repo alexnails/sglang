@@ -210,8 +210,8 @@ class _MockShortConvBackend:
     # The radix mamba-cache track hooks. Inert here (these tests run the
     # no_buffer equivalent), but CCA calls them unconditionally, so the mock
     # must carry them and record that it was reached.
-    def track_conv_states_extend(self, layer_cache, conv_inputs):
-        self.extend_track_calls.append((layer_cache, tuple(conv_inputs)))
+    def track_conv_states_extend(self, conv_states, conv_inputs):
+        self.extend_track_calls.append((tuple(conv_states), tuple(conv_inputs)))
 
     def track_conv_states_decode(self, forward_batch):
         self.decode_track_calls.append(forward_batch)
@@ -2538,7 +2538,7 @@ class TestShortConvTrackExtendSnapshot(CustomTestCase):
         qk = torch.randn(20, 3)
         hs = torch.randn(20, 4)
         layer_cache = harness.layer_cache(1)
-        harness.backend.track_conv_states_extend(layer_cache, (qk, hs))
+        harness.backend.track_conv_states_extend(tuple(layer_cache.conv), (qk, hs))
 
         # conv[0] slot 4 == qk rows [14, 16) laid out channel-major.
         self.assertTrue(
@@ -2568,7 +2568,7 @@ class TestShortConvTrackExtendSnapshot(CustomTestCase):
         qk = torch.randn(30, 3)
         hs = torch.randn(30, 4)
         layer_cache = harness.layer_cache(0)
-        harness.backend.track_conv_states_extend(layer_cache, (qk, hs))
+        harness.backend.track_conv_states_extend(tuple(layer_cache.conv), (qk, hs))
 
         self.assertTrue(
             torch.allclose(layer_cache.conv[0][5], qk[26:28].transpose(0, 1))
@@ -2595,7 +2595,7 @@ class TestShortConvTrackExtendSnapshot(CustomTestCase):
         qk = torch.randn(20, 3)
         hs = torch.randn(20, 4)
         layer_cache = harness.layer_cache(0)
-        harness.backend.track_conv_states_extend(layer_cache, (qk, hs))
+        harness.backend.track_conv_states_extend(tuple(layer_cache.conv), (qk, hs))
 
         aligned = 16
         self.assertTrue(
@@ -2618,7 +2618,7 @@ class TestShortConvTrackExtendSnapshot(CustomTestCase):
         harness = _TrackHarness(chunk_size=8, windows=(2, 1))
         layer_cache = harness.layer_cache(0)
         harness.backend.track_conv_states_extend(
-            layer_cache, (torch.randn(4, 3), torch.randn(4, 4))
+            tuple(layer_cache.conv), (torch.randn(4, 3), torch.randn(4, 4))
         )
         self.assertEqual(float(harness.mamba_cache.conv[0].abs().sum()), 0.0)
         self.assertEqual(float(harness.mamba_cache.conv[1].abs().sum()), 0.0)
@@ -2821,12 +2821,247 @@ class TestShortConvTrackDecode(CustomTestCase):
         self.assertTrue(torch.equal(conv1, expected1))
 
 
-@unittest.skip(
-    "Asserts ZayaForCausalLM is on _MAMBA_EXTRA_BUFFER_ARCHS, which is "
-    "withheld until the track snapshot takes the projected lag (it still "
-    "writes conv[1] at hidden_size while that pool entry is now "
-    "latent_k_dim_full wide). Unskip together with the allowlist entry."
-)
+class TestShortConvTrackWidthContract(CustomTestCase):
+    """The snapshot must cache exactly what the conv state holds.
+
+    Regression guard for a real integration break. ``conv[1]`` was narrowed from
+    ``hidden_size`` to ``cca_v2_state_dim`` when CCA started caching the
+    PROJECTED ``val_proj2`` value instead of the raw hidden state; the extend
+    snapshot kept handing ``hidden_states`` and blew up on the first prefill
+    with ``value tensor of shape [4096, 1] cannot be broadcast to indexing
+    result of shape [1, 128, 1]``. Wrong width AND wrong quantity: even had the
+    widths matched, a prefix restore would have reloaded a value the decode path
+    never writes.
+
+    What pins it now is that the model hands the backend the state VIEW it wrote
+    through, and the backend checks that view against the input it is told to
+    gather from.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        _ensure_dist_initialized()
+
+    def _cca_and_pool(self, tp_size: int, tp_rank: int):
+        config = _make_tiny_config()
+        cca, _ = _make_tiny_cca(
+            seed=0,
+            tp_rank=tp_rank if tp_size > 1 else None,
+            tp_size=tp_size if tp_size > 1 else None,
+            config=config,
+        )
+        pool = _MockReqToTokenPool(pool_size=4, cca_config=config, tp_size=tp_size)
+        return cca, pool, config
+
+    def _snapshot_pairs(self, cca, pool, num_tokens=6):
+        """Exactly what CCA.forward hands track_conv_states_extend."""
+        layer_cache = pool.mamba2_layer_cache(cca.layer_id)
+        hidden_states = torch.randn(num_tokens, cca.hidden_size)
+        qk, _ = cca.linear_qk(hidden_states)
+        conv_state = layer_cache.conv[0]
+        lag_state = cca._lag_state(layer_cache.conv[1])
+        lag_now = cca._lag_now(hidden_states)
+        return layer_cache, (conv_state, lag_state), (qk, lag_now), hidden_states
+
+    def test_state_and_input_widths_agree_at_every_tp(self):
+        # The assertion that would have caught the break at merge: for BOTH
+        # conv entries, the channel axis of the state the conv wrote equals the
+        # feature width of the stream the snapshot gathers from.
+        for tp_size, tp_rank in ((1, 0), (2, 0), (2, 1)):
+            with self.subTest(tp_size=tp_size, tp_rank=tp_rank):
+                cca, pool, config = self._cca_and_pool(tp_size, tp_rank)
+                _, states, inputs, _ = self._snapshot_pairs(cca, pool)
+                for entry, (state, x) in enumerate(zip(states, inputs)):
+                    if state is None or x is None:
+                        # Both sides must vanish together, or the pair is a
+                        # half-tracked state.
+                        self.assertIsNone(state, f"entry {entry}")
+                        self.assertIsNone(x, f"entry {entry}")
+                        continue
+                    self.assertEqual(
+                        state.shape[-2],
+                        x.shape[-1],
+                        f"tp{tp_size} rank{tp_rank} conv[{entry}] width",
+                    )
+
+    def test_pool_entry_widths_match_the_config(self):
+        # The pool side of the same contract: conv[0] shards with the rank,
+        # conv[1] is rank-uniform at cca_v2_state_dim.
+        for tp_size in (1, 2):
+            with self.subTest(tp_size=tp_size):
+                cca, pool, config = self._cca_and_pool(tp_size, 0)
+                layer_cache = pool.mamba2_layer_cache(cca.layer_id)
+                in_out_ch_full = (
+                    config.num_attention_heads + config.num_key_value_heads
+                ) * config.head_dim
+                self.assertEqual(
+                    layer_cache.conv[0].shape[-2], in_out_ch_full // tp_size
+                )
+                self.assertEqual(layer_cache.conv[1].shape[-2], config.cca_v2_state_dim)
+                self.assertLess(
+                    config.cca_v2_state_dim,
+                    config.hidden_size,
+                    "the projected lag must be narrower than the raw hidden "
+                    "state, or the narrowing did not take effect",
+                )
+
+    def test_rank_lag_view_is_a_leading_subslice_of_the_pool_entry(self):
+        # A rank may own only part of val_proj2's output. The snapshot has to
+        # land in the same sub-slice the conv wrote, which is why the model
+        # passes the view rather than the pool entry.
+        cca, pool, _ = self._cca_and_pool(tp_size=2, tp_rank=1)
+        entry = pool.mamba2_layer_cache(cca.layer_id).conv[1]
+        lag_state = cca._lag_state(entry)
+        if lag_state is None:
+            self.skipTest("this rank owns no lag stream")
+        self.assertLessEqual(lag_state.shape[-2], entry.shape[-2])
+        self.assertIs(lag_state.untyped_storage(), entry.untyped_storage())
+
+    def test_snapshot_writes_the_projected_lag_not_the_hidden_state(self):
+        # End to end through the backend: the tracked lag row must equal the
+        # projected value the state itself carries, not the raw hidden state.
+        cca, pool, config = self._cca_and_pool(tp_size=1, tp_rank=0)
+        layer_cache, states, inputs, hidden_states = self._snapshot_pairs(
+            cca, pool, num_tokens=20
+        )
+        conv_state, lag_state = states
+        qk, lag_now = inputs
+        if lag_state is None:
+            self.skipTest("this rank owns no lag stream")
+
+        harness = _TrackHarness(
+            windows=(conv_state.shape[-1], lag_state.shape[-1]),
+            num_channels=conv_state.shape[-2],
+            hidden_size=lag_state.shape[-2],
+            chunk_size=8,
+            track_interval=256,
+        )
+        fb = _track_forward_batch(
+            extend_seq_lens=[20],
+            prefix_lens=[0],
+            track_mask=[True],
+            track_indices=[4],
+        )
+        from sglang.srt.layers.attention.linear import short_conv_backend
+
+        with unittest.mock.patch.object(
+            short_conv_backend, "get_server_args", lambda: harness.server_args
+        ):
+            harness.backend._track_conv_indices = (
+                harness.backend._init_track_conv_indices(_query_start_loc([20]), fb)
+            )
+        harness.backend._track_dst = fb.mamba_track_indices[fb.mamba_track_mask]
+        harness.backend.track_conv_states_extend((conv_state, lag_state), (qk, lag_now))
+
+        aligned = 16
+        self.assertTrue(
+            torch.allclose(lag_state[4], lag_now[aligned - 1].unsqueeze(-1))
+        )
+        self.assertFalse(
+            torch.allclose(
+                lag_state[4],
+                hidden_states[aligned - 1, : lag_state.shape[-2]].unsqueeze(-1),
+            ),
+            "the snapshot cached the raw hidden state, not the projection",
+        )
+
+    def test_mismatched_width_is_rejected_loudly(self):
+        # Handing the old quantity (hidden_states) must fail at the assert, not
+        # silently scatter or broadcast.
+        harness = _TrackHarness(chunk_size=8, windows=(2, 1))
+        fb = _track_forward_batch(
+            extend_seq_lens=[20],
+            prefix_lens=[0],
+            track_mask=[True],
+            track_indices=[4],
+        )
+        from sglang.srt.layers.attention.linear import short_conv_backend
+
+        with unittest.mock.patch.object(
+            short_conv_backend, "get_server_args", lambda: harness.server_args
+        ):
+            harness.backend._track_conv_indices = (
+                harness.backend._init_track_conv_indices(_query_start_loc([20]), fb)
+            )
+        harness.backend._track_dst = fb.mamba_track_indices[fb.mamba_track_mask]
+        layer_cache = harness.layer_cache(0)
+        too_wide = torch.randn(20, layer_cache.conv[1].shape[-2] * 4)
+        with self.assertRaises(AssertionError) as caught:
+            harness.backend.track_conv_states_extend(
+                tuple(layer_cache.conv), (torch.randn(20, 3), too_wide)
+            )
+        self.assertIn("channels", str(caught.exception))
+
+    def test_absent_lag_entry_is_skipped(self):
+        # attn_tp=2 rank 0 reads only val_proj1: no lag stream, no pool write,
+        # nothing to snapshot. The hook must skip the entry, not crash and not
+        # write a zero-width row.
+        harness = _TrackHarness(chunk_size=8, windows=(2, 1))
+        fb = _track_forward_batch(
+            extend_seq_lens=[20],
+            prefix_lens=[0],
+            track_mask=[True],
+            track_indices=[4],
+        )
+        from sglang.srt.layers.attention.linear import short_conv_backend
+
+        with unittest.mock.patch.object(
+            short_conv_backend, "get_server_args", lambda: harness.server_args
+        ):
+            harness.backend._track_conv_indices = (
+                harness.backend._init_track_conv_indices(_query_start_loc([20]), fb)
+            )
+        harness.backend._track_dst = fb.mamba_track_indices[fb.mamba_track_mask]
+        layer_cache = harness.layer_cache(0)
+        qk = torch.randn(20, 3)
+        harness.backend.track_conv_states_extend(
+            (layer_cache.conv[0], None), (qk, None)
+        )
+        self.assertTrue(
+            torch.allclose(layer_cache.conv[0][4], qk[14:16].transpose(0, 1))
+        )
+        self.assertEqual(float(harness.mamba_cache.conv[1].abs().sum()), 0.0)
+
+    def test_decode_row_copy_is_width_agnostic(self):
+        # The decode side never sees a model tensor: it copies whole pool rows,
+        # so its widths come from the pool and the conv[1] narrowing could not
+        # desync it. Pin that by giving the two entries different widths and
+        # checking both are copied whole.
+        harness = _TrackHarness(
+            num_layers=2, num_slots=6, num_channels=7, hidden_size=3, windows=(2, 1)
+        )
+        conv0, conv1 = harness.mamba_cache.conv
+        self.assertNotEqual(conv0.shape[-2], conv1.shape[-2])
+        torch.manual_seed(9)
+        conv0.normal_()
+        conv1.normal_()
+        before0, before1 = conv0.clone(), conv1.clone()
+
+        from sglang.srt.layers.attention.linear import short_conv_backend
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        backend = harness.backend
+        backend._cache_indices = torch.tensor([1], dtype=torch.int64)
+        backend.forward_metadata = SimpleNamespace(
+            mamba_track_indices=torch.tensor([4], dtype=torch.int64),
+            mamba_cache_indices=torch.tensor([1], dtype=torch.int64),
+        )
+        with unittest.mock.patch.object(
+            short_conv_backend,
+            "track_mamba_states_if_needed",
+            _torch_track_reference,
+        ):
+            backend.track_conv_states_decode(
+                SimpleNamespace(
+                    forward_mode=ForwardMode.DECODE,
+                    mamba_track_mask=torch.tensor([True], dtype=torch.bool),
+                )
+            )
+        for layer in range(2):
+            self.assertTrue(torch.equal(conv0[layer, 4], before0[layer, 1]))
+            self.assertTrue(torch.equal(conv1[layer, 4], before1[layer, 1]))
+
+
 class TestShortConvNoBufferUnchanged(CustomTestCase):
     """``no_buffer`` must be exactly what it was before extra_buffer existed."""
 
@@ -2857,7 +3092,8 @@ class TestShortConvNoBufferUnchanged(CustomTestCase):
                 )
             )
         harness.backend.track_conv_states_extend(
-            harness.layer_cache(0), (torch.randn(4, 3), torch.randn(4, 4))
+            tuple(harness.layer_cache(0).conv),
+            (torch.randn(4, 3), torch.randn(4, 4)),
         )
         self.assertEqual(record, [])
         self.assertEqual(float(harness.mamba_cache.conv[0].abs().sum()), 0.0)

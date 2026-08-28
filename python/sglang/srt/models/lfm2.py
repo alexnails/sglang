@@ -307,7 +307,7 @@ class Lfm2ShortConv(nn.Module):
             # conv state is the last ``conv_L_cache - 1`` rows of ``Bx``, so
             # the snapshot at the chunk-aligned track position is a gather over
             # it. No-op under ``no_buffer`` (LFM2's current default).
-            backend.track_conv_states_extend(meta.layer_cache, (Bx,))
+            backend.track_conv_states_extend((conv_state,), (Bx,))
 
         output, _ = self.out_proj(C_gate * conv_out)
         return output
