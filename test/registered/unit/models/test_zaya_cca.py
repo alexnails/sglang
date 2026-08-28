@@ -968,31 +968,19 @@ class TestZayaSlidingWindowAttention(CustomTestCase):
     @classmethod
     def setUpClass(cls) -> None:
         _ensure_dist_initialized()
-        # Building a RoPE cache reads ``get_global_server_args().rl_on_policy_target``,
-        # which is unset in this CPU unit-test process. Install a minimal
-        # ServerArgs for the duration of the test class and restore afterward.
-        from sglang.srt.server_args import (
-            ServerArgs,
-            get_global_server_args,
-            set_global_server_args_for_scheduler,
-        )
+        # Building a RoPE cache reads a published config leaf, so this class
+        # needs a published context; ``override_server_args`` is the sanctioned
+        # way for a test to get one (it publishes and projects the bags).
+        from sglang.srt.runtime_context import get_context
 
-        try:
-            cls._prev_server_args = get_global_server_args()
-        except ValueError:
-            cls._prev_server_args = None
-        if cls._prev_server_args is None:
-            cls._installed_server_args = True
-            set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
-        else:
-            cls._installed_server_args = False
+        cls._server_args_override = get_context().override_server_args(
+            model_path="dummy"
+        )
+        cls._server_args_override.install()
 
     @classmethod
     def tearDownClass(cls) -> None:
-        if getattr(cls, "_installed_server_args", False):
-            from sglang.srt.server_args import set_global_server_args_for_scheduler
-
-            set_global_server_args_for_scheduler(cls._prev_server_args)
+        cls._server_args_override.restore()
 
     def _build_attention(self, config, layer_id: int):
         from sglang.srt.models.zaya import ZayaAttention
