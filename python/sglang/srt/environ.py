@@ -855,6 +855,23 @@ class Envs:
     # build is not stuck on the slow path if the version check is too broad.
     SGLANG_ROCM_CUDA_GRAPH_FORCE_PYNCCL = EnvBool(None)
 
+    # ZAYA1 collectives. A tp=8/dp=4 decode step on the 74B spends ~83% of its
+    # GPU time in collectives, so these knobs A/B the two ways to attack that:
+    # send fewer bytes, or hide the bytes behind compute.
+    #
+    # Combine each MoE layer's partial expert outputs with a reduce-scatter
+    # instead of an all-reduce followed by a scatter that discards most of it.
+    # The all-reduce replicates the whole global token set to every rank and the
+    # scatter then keeps only this DP replica's slice; a reduce-scatter delivers
+    # just that slice. Ring traffic per layer drops from 2(n-1)/n * T_global to
+    # (n-1)/n * T_global plus a T_local all-gather inside the attention-TP pair
+    # -- ~1.75x less on the single largest collective of the step. Falls back to
+    # the all-reduce automatically when the buffer layout cannot support it.
+    SGLANG_OPT_ZAYA_MOE_REDUCE_SCATTER = EnvBool(False)
+    # Run each MoE layer's DP all-gather on the shared comm stream so it overlaps
+    # the router prologue instead of blocking the compute stream on it.
+    SGLANG_OPT_ZAYA_OVERLAP_DP_GATHER = EnvBool(False)
+
     # Unified Radix Tree
     SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
     # Registered TreeCore backend serving the unified radix cache.

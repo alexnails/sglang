@@ -47,6 +47,7 @@ import re
 from collections.abc import Iterable
 from typing import List, Optional, Tuple
 
+import msgspec
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -58,13 +59,20 @@ from sglang.srt.distributed import (
     moe_expert_parallel_all_reduce,
     moe_tensor_model_parallel_all_reduce,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
     dp_gather_replicate,
+    dp_gather_replicate_async,
+    dp_reduce_scatter_tensor,
     dp_scatter,
+    get_attention_dp_rank,
     get_global_dp_buffer,
+    get_global_dp_buffer_len,
     get_local_dp_buffer,
     is_dp_attention_enabled,
+    is_dp_max_padding,
+    prewarm_dp_gather_async,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -1466,15 +1474,29 @@ class ZayaRouter(nn.Module):
         self,
         hidden_states: torch.Tensor,
         prev_router_hidden_states: Optional[torch.Tensor] = None,
+        gather_event: Optional[torch.cuda.Event] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # ``hidden_states`` is ``[T, H]``.
-        hs, _ = self.down_proj(hidden_states)
-        if (
+        use_eda = (
             self.use_eda
             and prev_router_hidden_states is not None
             and hasattr(self, "router_states_scale")
-        ):
-            hs = hs + prev_router_hidden_states * self.router_states_scale
+        )
+        # The EDA term reads only ``prev_router_hidden_states``, which the previous
+        # MoE layer already left in the gathered layout, so it is the one piece of
+        # router work that does not depend on this layer's gather. Compute it
+        # first, then wait -- with ``gather_event`` set it runs while the gather is
+        # still in flight on the comm stream. Same operands in the same order as
+        # the un-overlapped form, so the arithmetic is unchanged.
+        eda_term = (
+            prev_router_hidden_states * self.router_states_scale if use_eda else None
+        )
+        if gather_event is not None:
+            torch.cuda.current_stream().wait_event(gather_event)
+
+        hs, _ = self.down_proj(hidden_states)
+        if eda_term is not None:
+            hs = hs + eda_term
 
         # ``hs`` is a freshly-allocated tensor (output of ``down_proj`` or the
         # EDA add above) and ``rmsnorm_eda`` is non-residual / out-of-place,
@@ -1566,6 +1588,67 @@ def mod_blend(
     return torch.addcmul(masked_experts_reduced, 1.0 - mod_mask, mod_out)
 
 
+class DPCombine(msgspec.Struct, frozen=True):
+    """Where this rank's slice of the DP-gathered token set lives.
+
+    Passed to :class:`ZayaBlock` when the experts ran on the gathered (global)
+    tokens and the partial outputs should be combined with a reduce-scatter that
+    lands only this DP replica's rows, instead of an all-reduce that replicates
+    all of them and a scatter that then drops the rest.
+    """
+
+    local_start: int
+    local_rows: int
+
+
+def dp_combine_for(*, global_rows: int, local_rows: int) -> Optional[DPCombine]:
+    """Describe the reduce-scatter combine for a gather of ``local_rows`` rows per
+    replica into a ``global_rows``-row buffer, or ``None`` when the layout cannot
+    support one.
+
+    Three preconditions, all properties of the gathered buffer rather than of the
+    model:
+
+    * MAX_LEN padding -- every replica occupies an equal, contiguous block, so
+      this rank's rows start at ``dp_rank * local_rows``. Under SUM_LEN the blocks
+      are ragged and the even ``tensor_split`` inside ``dp_reduce_scatter_tensor``
+      would straddle replica boundaries.
+    * The blocks tile the buffer exactly (``local_rows * dp_size == global_rows``).
+      MAX_LEN pads every replica to the batch's longest, so this holds whenever
+      that padding was applied to the tensor we are handed -- but the check is
+      cheap and a mismatch would silently return the wrong number of rows.
+    * ``global_rows`` divisible by the TP size -- the reduce-scatter splits the
+      global buffer into ``tp_size`` equal chunks, and each replica's block must be
+      a whole number of them. A tp=8/dp=4 decode of one token per replica gathers
+      4 rows and cannot be split 8 ways, so it keeps the all-reduce.
+    """
+    parallel = get_parallel()
+    if not is_dp_max_padding():
+        return None
+    if local_rows * parallel.attn_dp_size != global_rows:
+        return None
+    if global_rows % parallel.tp_size != 0:
+        return None
+    return DPCombine(
+        local_start=get_attention_dp_rank() * local_rows, local_rows=local_rows
+    )
+
+
+def _slice_combined_rows(
+    dp_combine: Optional[DPCombine], *tensors: torch.Tensor
+) -> tuple[torch.Tensor, ...]:
+    """Narrow global per-token tensors to the rows a reduce-scatter combine kept.
+
+    A no-op without ``dp_combine`` (the combine was an all-reduce, so every rank
+    still holds all rows). Row slices of a row-major tensor stay contiguous, so
+    the fused MOD kernels' coverage checks still pass.
+    """
+    if dp_combine is None:
+        return tensors
+    rows = slice(dp_combine.local_start, dp_combine.local_start + dp_combine.local_rows)
+    return tuple(t[rows] for t in tensors)
+
+
 class ZayaBlock(nn.Module):
     """ZAYA1 MoE mixer: ZayaRouter feeding FusedMoE, with optional MOD residual blend."""
 
@@ -1630,12 +1713,14 @@ class ZayaBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         prev_router_hidden_states: Optional[torch.Tensor] = None,
+        dp_combine: Optional[DPCombine] = None,
+        gather_event: Optional[torch.cuda.Event] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if hidden_states.shape[0] == 0:
             return hidden_states, hidden_states.new_zeros((0, self.mlp_expansion))
 
         probs, indices, router_hs_next = self.router(
-            hidden_states, prev_router_hidden_states
+            hidden_states, prev_router_hidden_states, gather_event
         )
 
         topk_out = StandardTopKOutput(
@@ -1673,7 +1758,14 @@ class ZayaBlock(nn.Module):
                 masked_experts = _mod.mod_premask(
                     experts_out, indices, self.num_moe_experts
                 )
-                masked_experts = self._reduce_experts(masked_experts)
+                masked_experts = self._combine_experts(masked_experts, dp_combine)
+                # The blend is per-token elementwise, so it is equally valid on
+                # the global rows (after an all-reduce) or on just this replica's
+                # rows (after a reduce-scatter) -- as long as its other operands
+                # are narrowed to the same rows.
+                indices, hidden_states, probs = _slice_combined_rows(
+                    dp_combine, indices, hidden_states, probs
+                )
                 hidden_out = _mod.mod_blend(
                     masked_experts,
                     indices,
@@ -1682,16 +1774,39 @@ class ZayaBlock(nn.Module):
                     self.num_moe_experts,
                 )
             else:
-                mod_out = hidden_states * probs
                 mod_mask, masked_experts = mod_premask_experts(
                     experts_out, indices, self.num_moe_experts
                 )
-                masked_experts = self._reduce_experts(masked_experts)
-                hidden_out = mod_blend(masked_experts, mod_mask, mod_out)
+                masked_experts = self._combine_experts(masked_experts, dp_combine)
+                mod_mask, hidden_states, probs = _slice_combined_rows(
+                    dp_combine, mod_mask, hidden_states, probs
+                )
+                hidden_out = mod_blend(masked_experts, mod_mask, hidden_states * probs)
         else:
-            hidden_out = self._reduce_experts(self.experts(hidden_states, topk_out))
+            hidden_out = self._combine_experts(
+                self.experts(hidden_states, topk_out), dp_combine
+            )
 
         return hidden_out, router_hs_next
+
+    def _combine_experts(
+        self, experts_out: torch.Tensor, dp_combine: Optional[DPCombine]
+    ) -> torch.Tensor:
+        """Combine per-rank partial expert outputs, keeping only what is needed.
+
+        With ``dp_combine`` the reduce and the DP scatter collapse into a single
+        reduce-scatter that delivers just this replica's rows; without it, the
+        caller reduces globally and scatters afterwards.
+        """
+        if dp_combine is None:
+            return self._reduce_experts(experts_out)
+        local = torch.empty(
+            (dp_combine.local_rows, experts_out.shape[1]),
+            dtype=experts_out.dtype,
+            device=experts_out.device,
+        )
+        dp_reduce_scatter_tensor(local, experts_out)
+        return local
 
     def _reduce_experts(self, experts_out: torch.Tensor) -> torch.Tensor:
         """Combine partial expert outputs over the MoE parallel groups.
@@ -1841,6 +1956,15 @@ class ZayaDecoderMLPLayer(nn.Module):
         else:
             self.res_scale = None
 
+        self.gather_event_key = ("zaya_gather", layer_id)
+        if envs.SGLANG_OPT_ZAYA_OVERLAP_DP_GATHER.get():
+            prewarm_dp_gather_async(self.gather_event_key)
+
+        # Odd layer ids are the MoE layers (see _build_layer), so layer 1 is the
+        # first; it reports which combine the run settled on, once.
+        self.first_moe_layer_id = 1
+        self._logged_combines: set[str] = set()
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1900,16 +2024,66 @@ class ZayaDecoderMLPLayer(nn.Module):
             and moe_reduce_width > parallel.attn_tp_size
             and get_moe_a2a_backend().is_none()
         )
+        # The reduce-scatter combine subsumes the scatter below, but only when the
+        # MoE reduce spans exactly the TP group -- that is the group
+        # ``dp_reduce_scatter_tensor`` reduces over. A narrower MoE reduce (e.g.
+        # --moe-dp-size) must keep the group-scoped all-reduce in
+        # ``_reduce_experts``.
+        dp_combine = None
+        if (
+            use_dp_gather
+            and moe_reduce_width == parallel.tp_size
+            and envs.SGLANG_OPT_ZAYA_MOE_REDUCE_SCATTER.get()
+        ):
+            dp_combine = dp_combine_for(
+                global_rows=get_global_dp_buffer_len(),
+                local_rows=hidden_states.shape[0],
+            )
+            if self.layer_id == self.first_moe_layer_id:
+                # The combine declines itself on layouts it cannot serve, so report
+                # which path a run actually took, not which one was requested, and
+                # spell out each precondition -- otherwise a decline is
+                # indistinguishable from the flag not being read at all.
+                #
+                # Deduplicate on the whole message, not just the verdict: prefill
+                # runs under SUM_LEN and always declines, so keying on the verdict
+                # alone would let that first line mask every later decode shape.
+                global_rows = get_global_dp_buffer_len()
+                local_rows = hidden_states.shape[0]
+                msg = (
+                    f"ZAYA1 MoE combine: "
+                    f"{'reduce-scatter' if dp_combine else 'all-reduce'} "
+                    f"global_rows={global_rows} local_rows={local_rows} "
+                    f"max_pad={is_dp_max_padding()} "
+                    f"tiles={local_rows * parallel.attn_dp_size == global_rows} "
+                    f"div_tp={global_rows % parallel.tp_size == 0}"
+                )
+                if msg not in self._logged_combines:
+                    self._logged_combines.add(msg)
+                    logger.info("%s", msg)
+
+        gather_event = None
         if use_dp_gather:
             hidden_states, local_hidden_states = (
                 get_global_dp_buffer(get_tp_group()),
                 hidden_states,
             )
-            dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
+            if envs.SGLANG_OPT_ZAYA_OVERLAP_DP_GATHER.get():
+                # Key the persistent event by layer: a fresh torch.cuda.Event per
+                # layer per forward exhausts the HSA signal pool within a few
+                # hundred steps (see _tbo_event).
+                gather_event = dp_gather_replicate_async(
+                    hidden_states,
+                    local_hidden_states,
+                    forward_batch,
+                    event_key=self.gather_event_key,
+                )
+            else:
+                dp_gather_replicate(hidden_states, local_hidden_states, forward_batch)
         hidden_states, prev_router_hidden_states = self.zaya_block(
-            hidden_states, prev_router_hidden_states
+            hidden_states, prev_router_hidden_states, dp_combine, gather_event
         )
-        if use_dp_gather:
+        if use_dp_gather and dp_combine is None:
             hidden_states, global_hidden_states = (
                 get_local_dp_buffer(get_tp_group()),
                 hidden_states,

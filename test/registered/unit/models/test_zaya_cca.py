@@ -1398,5 +1398,127 @@ class TestZayaCCATensorParallel(CustomTestCase):
             )
 
 
+class TestDPCombine(CustomTestCase):
+    """The reduce-scatter MoE combine: when it is allowed, and that blending on
+    the reduce-scattered rows equals blending globally and then scattering.
+    """
+
+    @contextmanager
+    def _dp_layout(self, *, tp_size, dp_size, dp_rank, max_padding=True):
+        """Stub the four layout facts ``dp_combine_for`` reads."""
+        from sglang.srt.models import zaya
+
+        saved = (zaya.get_parallel, zaya.is_dp_max_padding, zaya.get_attention_dp_rank)
+        zaya.get_parallel = lambda: SimpleNamespace(
+            tp_size=tp_size, attn_dp_size=dp_size
+        )
+        zaya.is_dp_max_padding = lambda: max_padding
+        zaya.get_attention_dp_rank = lambda: dp_rank
+        try:
+            yield
+        finally:
+            (
+                zaya.get_parallel,
+                zaya.is_dp_max_padding,
+                zaya.get_attention_dp_rank,
+            ) = saved
+
+    def test_combine_describes_this_replicas_block(self):
+        from sglang.srt.models.zaya import dp_combine_for
+
+        # tp=8/dp=4, 8 tokens per replica -> 32 global rows, replica 2 owns 16:24.
+        with self._dp_layout(tp_size=8, dp_size=4, dp_rank=2):
+            combine = dp_combine_for(global_rows=32, local_rows=8)
+        self.assertIsNotNone(combine)
+        self.assertEqual(combine.local_start, 16)
+        self.assertEqual(combine.local_rows, 8)
+
+    def test_combine_declined_when_global_rows_not_divisible_by_tp(self):
+        """A tp=8/dp=4 decode of one token per replica gathers 4 rows, which the
+        reduce-scatter cannot split 8 ways -- it must fall back to the all-reduce.
+        """
+        from sglang.srt.models.zaya import dp_combine_for
+
+        with self._dp_layout(tp_size=8, dp_size=4, dp_rank=0):
+            self.assertIsNone(dp_combine_for(global_rows=4, local_rows=1))
+
+    def test_combine_declined_under_sum_len_padding(self):
+        from sglang.srt.models.zaya import dp_combine_for
+
+        with self._dp_layout(tp_size=8, dp_size=4, dp_rank=0, max_padding=False):
+            self.assertIsNone(dp_combine_for(global_rows=32, local_rows=8))
+
+    def test_combine_declined_when_blocks_do_not_tile_the_buffer(self):
+        """Ragged replicas: 8 local rows cannot describe a 40-row/4-replica buffer."""
+        from sglang.srt.models.zaya import dp_combine_for
+
+        with self._dp_layout(tp_size=8, dp_size=4, dp_rank=0):
+            self.assertIsNone(dp_combine_for(global_rows=40, local_rows=8))
+
+    def test_slice_is_identity_without_a_combine(self):
+        from sglang.srt.models.zaya import _slice_combined_rows
+
+        a, b = torch.randn(6, 3), torch.randn(6, 3)
+        out = _slice_combined_rows(None, a, b)
+        self.assertIs(out[0], a)
+        self.assertIs(out[1], b)
+
+    def test_sliced_rows_stay_contiguous(self):
+        """The fused MOD kernels' coverage check requires contiguous operands."""
+        from sglang.srt.models.zaya import DPCombine, _slice_combined_rows
+
+        (sliced,) = _slice_combined_rows(
+            DPCombine(local_start=16, local_rows=8), torch.randn(32, 4)
+        )
+        self.assertEqual(sliced.shape, (8, 4))
+        self.assertTrue(sliced.is_contiguous())
+
+    def test_local_blend_matches_global_blend_then_scatter(self):
+        """The blend is per-token, so reduce-scatter-then-blend must equal
+        all-reduce-then-blend-then-scatter. This pins the slicing arithmetic:
+        ``local_start`` has to select the same rows the reduce-scatter delivers.
+        """
+        from sglang.srt.models.zaya import (
+            DPCombine,
+            _slice_combined_rows,
+            mod_blend,
+            mod_premask_experts,
+        )
+
+        torch.manual_seed(0)
+        tp_size, dp_size, dp_rank = 8, 4, 2
+        local_rows, hidden, num_experts = 8, 6, 5
+        global_rows = local_rows * dp_size
+
+        # Per-rank partial expert outputs over the gathered token set, plus the
+        # global router state every rank holds identically.
+        partials = [torch.randn(global_rows, hidden) for _ in range(tp_size)]
+        hidden_states = torch.randn(global_rows, hidden)
+        probs = torch.rand(global_rows, 1)
+        indices = torch.randint(0, num_experts + 1, (global_rows, 1))
+
+        combine = DPCombine(local_start=dp_rank * local_rows, local_rows=local_rows)
+        rows = slice(combine.local_start, combine.local_start + combine.local_rows)
+
+        # Reference: premask, all-reduce, blend globally, then scatter.
+        masks_and_masked = [
+            mod_premask_experts(p, indices, num_experts) for p in partials
+        ]
+        mod_mask = masks_and_masked[0][0]
+        all_reduced = sum(m for _, m in masks_and_masked)
+        reference = mod_blend(all_reduced, mod_mask, hidden_states * probs)[rows]
+
+        # Under test: premask, reduce-scatter (== summing the same partials but
+        # keeping only this replica's rows), blend on the narrowed operands.
+        reduce_scattered = sum(m[rows] for _, m in masks_and_masked)
+        local_mask, local_hidden, local_probs = _slice_combined_rows(
+            combine, mod_mask, hidden_states, probs
+        )
+        got = mod_blend(reduce_scattered, local_mask, local_hidden * local_probs)
+
+        self.assertEqual(got.shape, (local_rows, hidden))
+        torch.testing.assert_close(got, reference)
+
+
 if __name__ == "__main__":
     unittest.main()

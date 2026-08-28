@@ -728,6 +728,45 @@ def dp_gather_partial_async(
     return ev
 
 
+def prewarm_dp_gather_async(event_key) -> None:
+    """Allocate the comm stream and the persistent event for `event_key` up front.
+
+    Both are driver calls that must not happen inside CUDA-graph capture (see
+    `get_stream`), and the lazy get-or-create in `dp_gather_replicate_async` would
+    otherwise do them on whichever forward touches the layer first. Call at model
+    construction, once per event key.
+    """
+    get_dp_tbo_comm_stream()
+    _tbo_event(event_key)
+
+
+def dp_gather_replicate_async(
+    global_tokens: torch.Tensor,
+    local_tokens: torch.Tensor,
+    forward_batch: ForwardBatch,
+    event_key=("gather_replicate", 0),
+) -> torch.cuda.Event:
+    """`dp_gather_replicate` on the shared DP comm stream, returning a PERSISTENT
+    event (see `_tbo_event`) that fires when the gather completes.
+
+    Same contract as :func:`dp_gather_partial_async`: the caller must
+    `wait_event` on the compute stream before reading `global_tokens`. Used
+    outside TBO to overlap a single batch's gather with whatever prologue does not
+    depend on it -- the event pool is shared, so `event_key` must be unique per
+    concurrently-outstanding gather (e.g. keyed by layer).
+    """
+    comm = get_dp_tbo_comm_stream()
+    compute = torch.cuda.current_stream()
+    local_tokens.record_stream(comm)
+    global_tokens.record_stream(comm)
+    ev = _tbo_event(event_key)
+    with torch.cuda.stream(comm):
+        comm.wait_stream(compute)
+        dp_gather_replicate(global_tokens, local_tokens, forward_batch)
+        ev.record(comm)
+    return ev
+
+
 # Persistent grow-only buffers for non-EP DP TBO, keyed by (kind, tbo_subbatch).
 # Reused across ALL layers (and forwards) so the caching allocator does not churn
 # a fresh per-layer `torch.empty` for the 8x DP-gather / combine buffers. That
