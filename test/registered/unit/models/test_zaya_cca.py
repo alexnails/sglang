@@ -1592,6 +1592,203 @@ class TestZayaPartialGatherFoldsTheAttnReduce(CustomTestCase):
         )
 
 
+class TestDpGatherStagingFusion(CustomTestCase):
+    """The two launches per sum_len partial gather that C1 removes.
+
+    ``_dp_gather_via_all_reduce`` used to issue four launches: ``fill_(0)``, a
+    memcpy of this rank's rows into its slot, the all-reduce, and a copy of the
+    (out-of-place) all-reduce result back into the caller's buffer. The fill now
+    folds into the memcpy, and the copy-back is skipped by callers that take the
+    returned tensor. Both are meant to be *exactly* the old behaviour, so pin the
+    fused kernel against ``fill_(0) + memcpy`` and pin what the gather returns
+    for an out-of-place and an in-place collective.
+    """
+
+    @staticmethod
+    @contextmanager
+    def _sum_len_all_reduce(all_reduce):
+        """Drive the sum_len gather path on host tensors.
+
+        Patches out everything that needs a live NCCL group: the WORLD-gather
+        switch, the attention-TP rank, the world size, the collective itself and
+        the memcpy dispatch (CPU tensors cannot go through Triton).
+        """
+        from unittest import mock
+
+        from sglang.srt.layers import dp_attention as dpa
+
+        with mock.patch.object(
+            dpa, "memcpy_scatter_zero_rest_func", dpa.memcpy_scatter_zero_rest_cpu
+        ), mock.patch.object(
+            dpa, "world_dp_gather_enabled", lambda: False
+        ), mock.patch.object(
+            dpa, "get_attn_tensor_model_parallel_rank", lambda: 0
+        ), mock.patch.object(
+            dpa, "get_tensor_model_parallel_world_size", lambda: 1
+        ), mock.patch.object(
+            dpa, "tensor_model_parallel_all_reduce", all_reduce
+        ):
+            yield
+
+    @staticmethod
+    def _forward_batch(sizes: List[int]):
+        from sglang.srt.layers.dp_attention import DpPaddingMode
+
+        return SimpleNamespace(
+            dp_local_start_pos=None,
+            dp_local_num_tokens=None,
+            global_num_tokens_gpu=torch.tensor(sizes, dtype=torch.int32),
+            dp_padding_mode=DpPaddingMode.SUM_LEN,
+        )
+
+    def test_fused_scatter_zero_matches_fill_then_memcpy(self):
+        """The fused staging write must equal ``fill_(0)`` then ``memcpy``."""
+        from sglang.srt.layers.dp_attention import (
+            memcpy_cpu,
+            memcpy_scatter_zero_rest_cpu,
+        )
+
+        torch.manual_seed(3)
+        rows, hidden = 16, 5
+        # sz == 0 (idle replica) and sz < src rows (a src padded for cuda graph)
+        # are the two cases where the fill is the only thing zeroing a row.
+        for offset, sz, src_rows in ((0, 4, 4), (4, 3, 3), (12, 4, 4), (7, 0, 2)):
+            with self.subTest(offset=offset, sz=sz):
+                src = torch.randn(src_rows, hidden)
+                # A dirty destination: the fill is what makes the untouched rows
+                # zero, so starting from zeros would hide a missing zero-fill.
+                dirty = torch.randn(rows, hidden)
+                ref = dirty.clone()
+                ref.fill_(0)
+                memcpy_cpu(
+                    ref,
+                    src,
+                    0,
+                    torch.tensor(offset),
+                    torch.tensor(sz),
+                    False,
+                )
+                got = dirty.clone()
+                memcpy_scatter_zero_rest_cpu(
+                    got, src, 0, torch.tensor(offset), torch.tensor(sz)
+                )
+                self.assertTrue(torch.equal(got, ref))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "Triton memcpy needs a GPU")
+    def test_fused_scatter_zero_matches_on_device(self):
+        """Same equivalence for the Triton kernel the serving path uses."""
+        from sglang.kernels.ops.memory.memcpy_triton import (
+            memcpy_scatter_zero_rest_triton,
+            memcpy_triton,
+        )
+
+        dev = "cuda"
+        torch.manual_seed(4)
+        cases = (
+            # (dst shape, src shape, offset, sz)
+            ((16, 5), (4, 5), 4, 4),
+            ((16, 5), (8, 5), 0, 3),
+            ((16, 5), (4, 5), 12, 4),
+            ((16, 5), (4, 5), 7, 0),
+            # 1-D int32 input ids: chunk_size collapses to 1.
+            ((16,), (4,), 8, 4),
+        )
+        for dst_shape, src_shape, offset, sz in cases:
+            for dtype in (torch.bfloat16, torch.int32):
+                with self.subTest(dst=dst_shape, off=offset, sz=sz, dt=dtype):
+                    if dtype.is_floating_point:
+                        src = torch.randn(src_shape, device=dev).to(dtype)
+                        dirty = torch.randn(dst_shape, device=dev).to(dtype)
+                    else:
+                        src = torch.randint(1, 99, src_shape, device=dev, dtype=dtype)
+                        dirty = torch.randint(1, 99, dst_shape, device=dev, dtype=dtype)
+                    off_t = torch.tensor(offset, device=dev, dtype=torch.int32)
+                    sz_t = torch.tensor(sz, device=dev, dtype=torch.int32)
+
+                    ref = dirty.clone()
+                    ref.fill_(0)
+                    memcpy_triton(ref, src, 0, off_t, sz_t, False)
+                    got = dirty.clone()
+                    memcpy_scatter_zero_rest_triton(got, src, 0, off_t, sz_t)
+                    self.assertTrue(torch.equal(got, ref))
+
+    def test_out_variant_returns_the_collective_output(self):
+        """An out-of-place all-reduce: the result is the collective's buffer."""
+        from sglang.srt.layers.dp_attention import dp_gather_partial_out
+
+        sizes = [3, 7, 1, 5]
+        hidden = 4
+        marker = torch.full((sum(sizes), hidden), 7.0)
+
+        def all_reduce(x):
+            # Mimic the custom all-reduce: a fresh buffer, input untouched.
+            return x + marker
+
+        local = torch.randn(sizes[1], hidden)
+        staging = torch.randn(sum(sizes), hidden)
+        fb = self._forward_batch(sizes)
+        with _dp_layout(sizes, 1, is_max_len=False):
+            with self._sum_len_all_reduce(all_reduce):
+                out = dp_gather_partial_out(staging, local, fb)
+
+        expected = torch.zeros(sum(sizes), hidden)
+        expected[3 : 3 + 7] = local
+        self.assertIsNot(out, staging)
+        torch.testing.assert_close(out, expected + marker)
+        # The staging buffer is left holding the pre-reduce content, which is
+        # what makes the copy-back removable: nothing reads it afterwards.
+        torch.testing.assert_close(staging, expected)
+
+    def test_out_variant_returns_the_buffer_for_an_in_place_collective(self):
+        """An in-place all-reduce returns its input, so the buffer is the result."""
+        from sglang.srt.layers.dp_attention import dp_gather_partial_out
+
+        sizes = [2, 2]
+        hidden = 3
+
+        def all_reduce(x):
+            x.add_(1.0)
+            return x
+
+        local = torch.randn(sizes[0], hidden)
+        staging = torch.randn(sum(sizes), hidden)
+        fb = self._forward_batch(sizes)
+        with _dp_layout(sizes, 0, is_max_len=False):
+            with self._sum_len_all_reduce(all_reduce):
+                out = dp_gather_partial_out(staging, local, fb)
+
+        expected = torch.zeros(sum(sizes), hidden)
+        expected[:2] = local
+        self.assertIs(out, staging)
+        torch.testing.assert_close(out, expected + 1.0)
+
+    def test_in_place_wrapper_still_fills_the_caller_buffer(self):
+        """``dp_gather_partial`` keeps its in-place contract for every caller.
+
+        This is what makes C1 a no-op for the models that did not opt into the
+        returning variant: the copy back into ``global_tokens`` is still there
+        when (and only when) the collective handed back a different tensor.
+        """
+        from sglang.srt.layers.dp_attention import dp_gather_partial
+
+        sizes = [2, 2]
+        hidden = 3
+
+        def all_reduce(x):
+            return x + 5.0
+
+        local = torch.randn(sizes[1], hidden)
+        buf = torch.randn(sum(sizes), hidden)
+        fb = self._forward_batch(sizes)
+        with _dp_layout(sizes, 1, is_max_len=False):
+            with self._sum_len_all_reduce(all_reduce):
+                dp_gather_partial(buf, local, fb)
+
+        expected = torch.zeros(sum(sizes), hidden)
+        expected[2:] = local
+        torch.testing.assert_close(buf, expected + 5.0)
+
+
 def _reference_extend_conv(
     qk: torch.Tensor,
     hidden_states: torch.Tensor,
