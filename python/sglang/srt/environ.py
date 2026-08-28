@@ -1540,32 +1540,6 @@ class Envs:
     # device tensors. Not compatible with a captured prefill graph -- CCA
     # resolves that conflict in the graph's favour and logs it.
     SGLANG_OPT_ZAYA_FUSED_CCA_PREFILL = EnvBool(False)
-    # Fold the decode conv's grouped matmul into the window build instead of
-    # materializing the [T, C, taps] window for a separate batched GEMM.
-    # Launch-neutral by construction and measured a LOSS (TPOT +2.4% at C=32);
-    # kept so the refutation stays reproducible.
-    SGLANG_OPT_ZAYA_FUSED_CCA_DECODE = EnvBool(False)
-    # Fuse the router tail (softmax + balancing_biases + argmax + gather + casts
-    # + the MOD clamp) and the router MLP (3 GEMMs + 2 GELUs) into two Triton
-    # kernels. Worth -720 launches/step of ~2382, the largest single reduction
-    # available -- the router is 14 of the ~20 launches in a MoE layer.
-    #
-    # Both kernels are verified on MI355X (gfx950): 39 passed, 48 subtests, model
-    # path included. That covers the MLP kernel, which had never been compiled
-    # before -- its LDS budget fits at the shipping shape -- and the "device
-    # fault" that first put this flag here, which was never in these kernels but
-    # in a test helper calling sglang's model-parallel init on a GPU box.
-    #
-    # DEFAULT OFF for a perf reason only: the -720 launches have not been shown
-    # to convert to TPOT. Correctness is not the open question; payoff is.
-    SGLANG_OPT_ZAYA_FUSED_ROUTER = EnvBool(False)
-    # Compile the in-kernel index assertions into the fused router kernels, so a
-    # bad index aborts AT the kernel naming the violated invariant instead of
-    # surfacing as a SIGABRT at the next unrelated synchronisation point. Debug
-    # instrumentation only: it costs a branch and a trap per program. Use with
-    # TRITON_DEBUG=1 (Triton only emits device_assert when debug is on) and
-    # AMD_SERIALIZE_KERNEL=3 (attributes the fault to the launching kernel).
-    SGLANG_DEBUG_ZAYA_FUSED_ROUTER = EnvBool(False)
 
     # ===================================================================
     # Symmetric memory

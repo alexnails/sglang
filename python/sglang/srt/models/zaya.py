@@ -397,39 +397,13 @@ def cca_decode(
 
     When ``decode_conv_weight`` / ``_bias`` / ``_groups`` are supplied (see
     :meth:`CCA.fold_decode_conv`) the two conv stages are evaluated as a single
-    grouped matmul; otherwise ``conv_qk`` is run as-is. The Triton swap is
-    :func:`cca_conv1d_update`.
+    grouped matmul; otherwise ``conv_qk`` is run as-is.
     """
     dtype = qk.dtype
     if total_padding is None:
         total_padding = conv_state.shape[-1]
 
-    from sglang.kernels.ops.attention import cca_conv1d_update as _fused_update
     from sglang.kernels.ops.attention import cca_state_step as _state_step
-
-    if envs.SGLANG_OPT_ZAYA_FUSED_CCA_DECODE.get() and _fused_update.covered(
-        qk,
-        lag_now,
-        decode_conv_weight,
-        decode_conv_bias,
-        conv_state,
-        lag_state,
-        mamba_indices,
-        total_padding,
-        decode_conv_groups or 0,
-    ):
-        # One kernel for the window, the history shift and the grouped matmul.
-        return _fused_update.cca_conv1d_update(
-            qk,
-            lag_now,
-            decode_conv_weight,
-            decode_conv_bias,
-            conv_state,
-            lag_state,
-            mamba_indices,
-            total_padding,
-            decode_conv_groups,
-        )
 
     if _state_step.covered(
         qk, lag_now, conv_state, lag_state, mamba_indices, total_padding
@@ -489,15 +463,6 @@ def cca_decode(
 def cca_conv1d_fn(*args, **kwargs):
     """Fused varlen prefill conv-with-state; see the kernel module for the contract."""
     from sglang.kernels.ops.attention.cca_conv1d import cca_conv1d_fn as _fused
-
-    return _fused(*args, **kwargs)
-
-
-def cca_conv1d_update(*args, **kwargs):
-    """Fused decode conv-with-state (window + grouped matmul in one kernel)."""
-    from sglang.kernels.ops.attention.cca_conv1d_update import (
-        cca_conv1d_update as _fused,
-    )
 
     return _fused(*args, **kwargs)
 
@@ -2066,41 +2031,6 @@ class ZayaAttention(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def fusable_router_mlp(router_mlp: nn.Sequential) -> bool:
-    """Whether ``ZayaRouter.router_mlp`` has the shape the fused kernel assumes.
-
-    Structural, not numerical: exactly Linear / GELU / Linear / GELU / Linear,
-    no ``skip_bias_add``, no bias on the final projection, and -- the one thing
-    the kernel's own ``covered()`` cannot see from its tensors -- both
-    activations the *erf* GELU.
-
-    That last check is the point of this function. ``nn.GELU()`` is
-    ``approximate='none'``, i.e. ``0.5 * x * (1 + erf(x / sqrt(2)))``. The tanh
-    approximation differs from it by only ~5e-4 absolute: small enough to pass
-    for ordinary numerical noise in an end-to-end eval, large enough to flip
-    routing on near-ties, in every one of the 74B's 60 MoE layers. Fusing the
-    wrong flavour would be a silent accuracy regression, so nothing gets fused
-    until the flavour is verified.
-
-    Kept a free function -- like ``mod_premask_experts`` / ``mod_blend`` -- so
-    the guard is unit-testable without building a router.
-    """
-    if len(router_mlp) != 5:
-        return False
-    for i in (0, 2, 4):
-        stage = router_mlp[i]
-        if not isinstance(stage, ReplicatedLinear) or stage.skip_bias_add:
-            return False
-    for i in (1, 3):
-        activation = router_mlp[i]
-        if not isinstance(activation, nn.GELU):
-            return False
-        if getattr(activation, "approximate", "none") != "none":
-            return False
-    # The kernel folds no bias into the final projection.
-    return getattr(router_mlp[4], "bias", None) is None
-
-
 class ZayaRouting(NamedTuple):
     """Everything :class:`ZayaBlock` needs out of one router forward.
 
@@ -2225,17 +2155,6 @@ class ZayaRouter(nn.Module):
             ),
         )
 
-        # Checked once, here, because it is a property of the module graph
-        # rather than of the inputs.
-        self.fused_router_mlp_ok = fusable_router_mlp(self.router_mlp)
-
-        # Fusion-log bookkeeping. ``_mlp_fusion_reason`` is written by
-        # ``_router_logits`` and read by ``_log_fusion`` on the same forward, so
-        # one line reports both gates; the initial value is what a router that
-        # has never run reports.
-        self._mlp_fusion_reason: Optional[str] = "no forward yet"
-        self._last_router_fusion_state: Optional[tuple] = None
-
         self.register_buffer(
             "balancing_biases",
             torch.zeros(self.num_experts, dtype=torch.float32),
@@ -2306,120 +2225,12 @@ class ZayaRouter(nn.Module):
         hs_norm = self.rmsnorm_eda(hs)
         logits = self._router_logits(hs_norm)
 
-        # One kernel for the whole tail: softmax, balancing bias, top-1, the
-        # probability gather, the model-dtype rounding, and the int32/clamp/int32
-        # expert-id munging that ZayaBlock used to do on the way into FusedMoE.
-        # Nine launches per MoE layer become one, and on the 74B there are 60 of
-        # them in a decode step that is launch-bound rather than bandwidth-bound.
-        #
-        # ``.is_cuda`` is tested before the import rather than left to
-        # ``covered()`` alone because the kernel module imports ``triton`` at
-        # module scope, which a CPU-only environment need not have.
-        tail_reason = "not enabled"
-        if logits.is_cuda and envs.SGLANG_OPT_ZAYA_FUSED_ROUTER.get():
-            from sglang.kernels.ops.moe import zaya_router_tail as _tail
-
-            # The clamp ceiling: ids above this are the MOD skip slot.
-            max_expert_id = self.num_moe_experts - 1
-            tail_reason = _tail.decline_reason(
-                logits,
-                self.balancing_biases,
-                num_experts=self.num_experts,
-                max_expert_id=max_expert_id,
-                topk=self.topk,
-                out_dtype=hidden_states.dtype,
-            )
-            if tail_reason is None:
-                self._log_fusion(tail_reason)
-                moe_weight, moe_ids, route_prob, skip_ids = _tail.router_tail(
-                    logits,
-                    self.balancing_biases,
-                    num_experts=self.num_experts,
-                    max_expert_id=max_expert_id,
-                    softmax_fp32=self.router_softmax_fp32,
-                    out_dtype=hidden_states.dtype,
-                )
-                return ZayaRouting(
-                    moe_weight=moe_weight,
-                    moe_ids=moe_ids,
-                    route_prob=route_prob,
-                    skip_ids=skip_ids,
-                    hidden_states_next=router_hidden_states_next,
-                )
-
-        self._log_fusion(tail_reason)
         return self._routing_reference(
             logits, hidden_states.dtype, router_hidden_states_next
         )
 
-    def _log_fusion(self, tail_reason: Optional[str]) -> None:
-        """Log which router fusions took -- and why not -- once per outcome.
-
-        Both gates decline by *falling back*, so a precondition that stops
-        matching costs launches and nothing else. That is how this campaign
-        produced baseline-identical numbers three separate times that read as a
-        clean null result. Naming the gate that said no turns that into an
-        observation. Grep a run for ``mlp=True tail=True`` before trusting a
-        router A/B.
-
-        Cost on the hot path is a tuple compare per MoE layer; the message is
-        built only when the outcome changes, and ``_log_dataflow_decision``
-        dedupes across layers, so a uniform model logs one line, not sixty.
-        """
-        state = (self._mlp_fusion_reason, tail_reason)
-        if state == self._last_router_fusion_state:
-            return
-        self._last_router_fusion_state = state
-        mlp_reason = self._mlp_fusion_reason
-        detail = ""
-        if mlp_reason is not None:
-            detail += f" (mlp declined: {mlp_reason})"
-        if tail_reason is not None:
-            detail += f" (tail declined: {tail_reason})"
-        _log_dataflow_decision(
-            f"zaya router fusion: mlp={mlp_reason is None} "
-            f"tail={tail_reason is None}{detail}"
-        )
-
     def _router_logits(self, hs_norm: torch.Tensor) -> torch.Tensor:
-        """Expert logits from the normalized router state, ``[T, num_experts]``.
-
-        The 3-stage MLP with its two GELUs is five launches as an
-        ``nn.Sequential`` and one as a fused kernel -- 240 per decode step across
-        the 74B's 60 MoE layers. The weights are only ~270 KB per layer, so this
-        is launch overhead, not bandwidth.
-        """
-        # ``.is_cuda`` gates the import as well as the dispatch: the kernel
-        # module imports ``triton`` at module scope. The reason is stashed rather
-        # than returned because the tail's log line reports both gates together.
-        if not envs.SGLANG_OPT_ZAYA_FUSED_ROUTER.get():
-            self._mlp_fusion_reason = "not enabled"
-        elif not self.fused_router_mlp_ok:
-            self._mlp_fusion_reason = "router_mlp is not Linear/erf-GELU x3"
-        elif not hs_norm.is_cuda:
-            self._mlp_fusion_reason = f"hs_norm on {hs_norm.device}"
-        else:
-            from sglang.kernels.ops.moe import zaya_router_mlp as _mlp
-
-            first, second, last = (self.router_mlp[i] for i in (0, 2, 4))
-            operands = (
-                hs_norm,
-                first.weight,
-                first.bias,
-                second.weight,
-                second.bias,
-                last.weight,
-            )
-            self._mlp_fusion_reason = _mlp.decline_reason(
-                *operands, num_experts=self.num_experts
-            )
-            if self._mlp_fusion_reason is None:
-                return _mlp.router_mlp(*operands, num_experts=self.num_experts)
-
-        return self._router_logits_reference(hs_norm)
-
-    def _router_logits_reference(self, hs_norm: torch.Tensor) -> torch.Tensor:
-        """The unfused ``nn.Sequential``: reference semantics and fallback."""
+        """Expert logits from the normalized router state, ``[T, num_experts]``."""
         # Step through the Sequential manually so the ``(tensor, bias)`` tuple
         # returned by each ReplicatedLinear is unpacked correctly.
         out = hs_norm
@@ -2436,11 +2247,14 @@ class ZayaRouter(nn.Module):
         model_dtype: torch.dtype,
         router_hidden_states_next: torch.Tensor,
     ) -> ZayaRouting:
-        """The unfused torch chain: reference semantics and fallback in one place.
+        """The torch chain that turns expert logits into a routing decision.
 
-        This is the single definition of what the fused tail must reproduce, and
-        the path taken whenever ``zaya_router_tail.covered`` says no -- CPU
-        tensors, top-k > 1, or an expert axis wider than one Triton block.
+        A fused Triton replacement for this was built, verified correct on
+        gfx950, and measured a LOSS (TPOT +7.8% at C=1, +6.3% at C=32 on
+        MI355X) despite removing 720 of ~2382 kernel launches per decode step.
+        The router works on a 25-wide expert axis, which is too little
+        arithmetic to pay for a kernel of its own. Removed in full; re-fusing
+        this needs a measurement, not a launch count.
         """
         if self.router_softmax_fp32:
             expert_prob = torch.softmax(logits, dim=-1, dtype=torch.float32)

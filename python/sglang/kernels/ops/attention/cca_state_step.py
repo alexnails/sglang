@@ -50,9 +50,9 @@ negative padding ids, which touch nothing.
 
 The grouped matmul itself is deliberately left outside: it is a batched
 ``[Cg, Cg*W] x [Cg*W]`` per group, which cuBLAS/rocBLAS-backed einsum already
-runs near bandwidth, and a hand-rolled Triton matvec measured no better (see
-``cca_conv1d_update``, which tried exactly that and lost). The launches removed
-here are pure data movement.
+runs near bandwidth. Folding it in here was tried and measured a LOSS (TPOT
++2.4% at C=32 on MI355X), so do not re-fold it without a measurement; the
+launches removed here are pure data movement.
 
 Follows ``kda_fused_decode``'s structure -- a ``covered()`` predicate gates
 supported inputs and the caller falls back to the unfused chain -- and, like it,
