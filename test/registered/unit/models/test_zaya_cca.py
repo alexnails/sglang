@@ -2466,6 +2466,24 @@ def _make_tiny_router(
     # configuration that never ships.
     with torch.no_grad():
         router.balancing_biases = router.balancing_biases.float()
+
+    if torch.device(device).type == "cpu":
+        # sglang's fused ops resolve their implementation from the PLATFORM,
+        # once, and cache it -- never from the device of the tensors they are
+        # later handed (BaseFusedOp._resolve_forward_method, and RMSNorm.__init__
+        # which pins forward_aiter outright when _use_aiter). So on a machine
+        # that HAS a GPU, this CPU-only router still holds a GPU RMSNorm, and
+        # running its reference forward drives a device kernel down host
+        # pointers. That is not a supported configuration, and it does not fail
+        # cleanly: it corrupts the heap and the process aborts at some later
+        # allocation -- for us, inside the nn.GELU two ops downstream, which
+        # reads as a fault in code that never touched a GPU.
+        #
+        # Pin the native path. On a CPU-only machine this is exactly what
+        # dispatch resolves to anyway, so CI behaviour is unchanged; it only
+        # stops the GPU boxes from running the GPU kernel on host memory.
+        norm = router.rmsnorm_eda
+        norm._forward_method = norm.forward_native
     return router, config
 
 
@@ -2527,13 +2545,18 @@ class _SyncEachTest:
     boundary.
     """
 
+    # ``is_initialized``, not ``is_available``: synchronise a context that
+    # already exists, never create one. A CPU-only test that initializes the
+    # device driver just to sync is a confound, and while chasing this fault it
+    # was one -- it made "no prior GPU work" untrue of every run.
+
     def setUp(self):
         super().setUp()
-        if torch.cuda.is_available():
+        if torch.cuda.is_initialized():
             torch.cuda.synchronize()
 
     def tearDown(self):
-        if torch.cuda.is_available():
+        if torch.cuda.is_initialized():
             torch.cuda.synchronize()
         super().tearDown()
 
