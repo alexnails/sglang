@@ -893,8 +893,11 @@ class TestCCAQKMixKernel(CustomTestCase):
     def test_matches_torch_chain_across_gqa_shapes(self):
         _ensure_dist_initialized()
         # 8:1 is ZAYA1-74B at attn_tp=2; 4:1 is 8B at tp=1; 1:1 exercises the
-        # degenerate group where the k blend reduces to a single q head.
-        for num_q_heads, num_k_heads in ((8, 1), (8, 2), (2, 2)):
+        # degenerate group where the k blend reduces to a single q head. 3:1 is
+        # the only one whose group is not a power of two, so it is the case where
+        # the [G, HD] tile is padded and the masked rows must contribute nothing
+        # to either reduction.
+        for num_q_heads, num_k_heads in ((8, 1), (8, 2), (2, 2), (6, 2)):
             for num_tokens in (1, 5):
                 with self.subTest(q=num_q_heads, k=num_k_heads, t=num_tokens):
                     self._run(num_q_heads, num_k_heads, num_tokens)
@@ -933,6 +936,10 @@ class TestCCAQKMixKernel(CustomTestCase):
         self.assertFalse(kernel.covered(conv_qk, pre_q, base_k, scale, 8, 1, 4096))
         # q heads not divisible by k heads.
         self.assertFalse(kernel.covered(conv_qk, pre_q, base_k, scale, 8, 3, 32))
+        # A group too wide to hold as one [G, HD] register tile.
+        wide_q = torch.randn(4, 64 * 32)
+        wide_conv = torch.randn(4, 65 * 32)
+        self.assertFalse(kernel.covered(wide_conv, wide_q, base_k, scale, 64, 1, 32))
 
 
 class TestCCADecodeConvFold(CustomTestCase):
