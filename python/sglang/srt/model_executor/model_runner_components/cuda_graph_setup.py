@@ -57,6 +57,30 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _unmapped_attention_layers(
+    model, attention_layers: list, mha_companion_layers: list
+) -> list[str]:
+    """Names of the model's RadixAttention modules that the per-layer lists do
+    not address, i.e. ``attention_layers[m.layer_id] is not m`` and the MLA
+    companion list does not hold it either."""
+    from sglang.srt.layers.radix_attention import RadixAttention
+
+    unmapped = []
+    for name, module in model.named_modules():
+        if not isinstance(module, RadixAttention):
+            continue
+        layer_id = module.layer_id
+        if not isinstance(layer_id, int) or not 0 <= layer_id < len(attention_layers):
+            unmapped.append(f"{name} (layer_id={layer_id})")
+            continue
+        if attention_layers[layer_id] is module:
+            continue
+        if mha_companion_layers[layer_id] is module:
+            continue
+        unmapped.append(f"{name} (layer_id={layer_id})")
+    return unmapped
+
+
 class GraphCapture(msgspec.Struct, frozen=True, kw_only=True):
     runner: Optional[BaseRunner]
     memory_phase: str
@@ -369,6 +393,26 @@ def capture_prefill_graph(
         model_runner.dsa_indexers,
         model_runner.mha_companion_layers,
     ) = compute_attention_and_moe_layers(layer_model)
+
+    unmapped = _unmapped_attention_layers(
+        language_model,
+        model_runner.attention_layers,
+        model_runner.mha_companion_layers,
+    )
+    if unmapped:
+        # ``radix_attention`` indexes ``attention_layers[layer_id]`` under a
+        # captured prefill graph, so a layer whose module the ladder in
+        # ``compute_attention_and_moe_layers`` could not reach -- or whose
+        # layer_id does not address this list at all, as with a model that
+        # packs several attention modules per decoder layer -- would read None
+        # or run off the end. Those models keep the eager path.
+        logger.warning(
+            "Disable prefill CUDA graph because %d attention module(s) are not "
+            "reachable as attention_layers[layer_id]; first: %s",
+            len(unmapped),
+            unmapped[0],
+        )
+        return result(None)
 
     tic = time.perf_counter()
     before_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)

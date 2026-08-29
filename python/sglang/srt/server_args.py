@@ -6367,11 +6367,31 @@ class ServerArgs:
         ), "no_buffer do not support trtllm_mha attention backend."
 
     def _validate_mamba_extra_buffer(self, view, model_arch: str):
-        from sglang.srt.arg_groups.overrides import supports_mamba_cache_extra_buffer
+        from sglang.srt.arg_groups.overrides import (
+            requires_short_conv_track_limits,
+            supports_mamba_cache_extra_buffer,
+        )
 
         assert supports_mamba_cache_extra_buffer(
             view, model_arch
         ), f"extra_buffer is not supported for {model_arch}; use no_buffer."
+        if requires_short_conv_track_limits(model_arch):
+            # The extend snapshot's row count is mamba_track_mask.sum(), so a
+            # captured prefill graph freezes it at whatever capture saw (zero,
+            # since the capture mask is all-False) and never snapshots again.
+            assert view.cuda_graph_backend_prefill in (None, "disabled"), (
+                f"extra_buffer for {model_arch} is not supported together with a "
+                "prefill CUDA graph: the extend track gather has a "
+                "data-dependent shape. Use --mamba-radix-cache-strategy "
+                "no_buffer, or --cuda-graph-backend-prefill disabled."
+            )
+            # The snapshot has to land on the accepted step, and the decode
+            # graph runner drops its mamba-track buffers outright when a spec
+            # algorithm is set, so it would silently never fire.
+            assert view.speculative_algorithm is None, (
+                f"extra_buffer for {model_arch} does not support speculative "
+                "decoding; use --mamba-radix-cache-strategy no_buffer."
+            )
         assert (
             is_cuda() or is_musa() or is_npu() or is_hip() or is_xpu()
         ), "extra_buffer needs CUDA/MUSA/NPU/ROCm/XPU (FLA)."

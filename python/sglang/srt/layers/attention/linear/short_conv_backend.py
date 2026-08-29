@@ -145,31 +145,10 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
         to ``[n_layers * n_slots, ...]`` and does the whole model in one, with row
         ids ``layer * n_slots + slot``.
         """
-        # Speculative decoding needs a per-draft-token track (the snapshot has to
-        # land on the accepted step), and the decode graph runner disables its
-        # mamba-track buffers outright when a spec algorithm is set, so the
-        # snapshot would silently never happen. Refuse the combination.
-        if getattr(server_args, "speculative_algorithm", None) is not None:
-            raise NotImplementedError(
-                "mamba extra_buffer for short-conv models does not support "
-                "speculative decoding; use --mamba-radix-cache-strategy "
-                "no_buffer."
-            )
-        # The extend-side snapshot's row count is mamba_track_mask.sum(), data
-        # dependent, so a captured prefill graph would bake in the count capture
-        # saw (zero, the capture mask is all-False) and never snapshot again.
-        # There is no inert-buffer form of this as there is on the decode side.
-        prefill_graph = getattr(
-            getattr(server_args, "cuda_graph_config", None), "prefill", None
-        )
-        if getattr(prefill_graph, "backend", "disabled") != "disabled":
-            raise NotImplementedError(
-                "mamba extra_buffer for short-conv models is not supported "
-                "together with a prefill CUDA graph: the extend track gather "
-                "has a data-dependent shape. Use "
-                "--mamba-radix-cache-strategy no_buffer, or disable the "
-                "prefill CUDA graph."
-            )
+        # The prefill-CUDA-graph and speculative-decoding refusals are pure
+        # config combinations, so they live in
+        # ServerArgs._validate_mamba_extra_buffer, which reads the resolving
+        # view rather than this supplied record.
         chunk = server_args.mamba_cache_chunk_size
         max_window = max(self.conv_window_lens)
         # The extend snapshot gathers the ``window`` rows ending at the

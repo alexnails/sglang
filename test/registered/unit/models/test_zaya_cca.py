@@ -3228,70 +3228,51 @@ class TestShortConvTrackStateGuards(CustomTestCase):
             harness.mamba_cache.conv[1].untyped_storage(),
         )
 
+    def _extra_buffer_view(self, **over):
+        view = SimpleNamespace(
+            linear_attn_backend="triton",
+            mamba_radix_cache_strategy="extra_buffer",
+            speculative_num_draft_tokens=None,
+            page_size=None,
+            cuda_graph_backend_prefill=None,
+            speculative_algorithm=None,
+        )
+        for k, v in over.items():
+            setattr(view, k, v)
+        return view
+
+    def _validate(self, view, arch="ZayaForCausalLM"):
+        from sglang.srt.server_args import ServerArgs
+
+        ServerArgs._validate_mamba_extra_buffer(
+            ServerArgs.__new__(ServerArgs), view, arch
+        )
+
     def test_prefill_cuda_graph_is_refused(self):
         # The extend gather's row count is mamba_track_mask.sum(), so a
         # captured prefill graph would freeze it at whatever capture saw
-        # (zero) and never snapshot again.
-        from sglang.srt.layers.attention.linear.short_conv_backend import (
-            ShortConvAttnBackend,
-        )
-
-        backend = object.__new__(ShortConvAttnBackend)
-        backend.device = torch.device("cpu")
-        backend.conv_window_lens = [2, 1]
-        mamba_cache = SimpleNamespace(
-            conv=[torch.zeros(2, 6, 3, 2), torch.zeros(2, 6, 4, 1)],
-            temporal=torch.zeros(2, 6, 1, 1, 0),
-        )
-        with self.assertRaises(NotImplementedError):
-            backend._init_track_state(
-                SimpleNamespace(
-                    mamba_cache_chunk_size=8,
-                    mamba_track_interval=16,
-                    speculative_algorithm=None,
-                    cuda_graph_config=SimpleNamespace(
-                        prefill=SimpleNamespace(backend="full")
-                    ),
-                ),
-                mamba_cache,
-            )
-        # A disabled prefill graph is the supported configuration.
-        backend._init_track_state(
-            SimpleNamespace(
-                mamba_cache_chunk_size=8,
-                mamba_track_interval=16,
-                speculative_algorithm=None,
-                cuda_graph_config=SimpleNamespace(
-                    prefill=SimpleNamespace(backend="disabled")
-                ),
-            ),
-            mamba_cache,
-        )
-        self.assertEqual(len(backend._track_pairs), 1)
+        # (zero) and never snapshot again. Refused at resolution, not at
+        # backend construction, so the operator hears about it before the
+        # weights load.
+        with self.assertRaises(AssertionError):
+            self._validate(self._extra_buffer_view(cuda_graph_backend_prefill="full"))
+        # Both spellings of "no prefill graph" are the supported configuration.
+        self._validate(self._extra_buffer_view(cuda_graph_backend_prefill=None))
+        self._validate(self._extra_buffer_view(cuda_graph_backend_prefill="disabled"))
 
     def test_speculative_decoding_is_refused(self):
         # The decode graph runner drops its mamba-track buffers when a spec
         # algorithm is set, so the snapshot would silently never fire.
-        from sglang.srt.layers.attention.linear.short_conv_backend import (
-            ShortConvAttnBackend,
-        )
+        with self.assertRaises(AssertionError):
+            self._validate(self._extra_buffer_view(speculative_algorithm="EAGLE"))
 
-        backend = object.__new__(ShortConvAttnBackend)
-        backend.device = torch.device("cpu")
-        backend.conv_window_lens = [2, 1]
-        mamba_cache = SimpleNamespace(
-            conv=[torch.zeros(2, 6, 3, 2), torch.zeros(2, 6, 4, 1)],
-            temporal=torch.zeros(2, 6, 1, 1, 0),
-        )
-        with self.assertRaises(NotImplementedError):
-            backend._init_track_state(
-                SimpleNamespace(
-                    mamba_cache_chunk_size=8,
-                    mamba_track_interval=16,
-                    speculative_algorithm="EAGLE",
-                ),
-                mamba_cache,
-            )
+    def test_limits_apply_only_to_the_short_conv_track(self):
+        # An SSM arch verifies through prepare_mamba_track_for_verify and has a
+        # shape-stable extend gather, so neither refusal is its business.
+        from sglang.srt.arg_groups.overrides import requires_short_conv_track_limits
+
+        self.assertTrue(requires_short_conv_track_limits("ZayaForCausalLM"))
+        self.assertFalse(requires_short_conv_track_limits("Qwen3NextForCausalLM"))
 
     def test_strided_conv_layout_is_rejected(self):
         # Page-major / envelope conv views are strided, so `flatten(0, 1)` row

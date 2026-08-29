@@ -1870,6 +1870,18 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
 )
 
 
+# Archs whose extra_buffer track is implemented by ShortConvAttnBackend. Its
+# extend-side snapshot is a gather whose row count is data dependent, and it has
+# no per-draft-token verify hook, so it refuses a prefill CUDA graph and
+# speculative decoding -- see requires_short_conv_track_limits.
+_SHORT_CONV_TRACK_ARCHS = frozenset({"ZayaForCausalLM"})
+
+
+def requires_short_conv_track_limits(model_arch: str) -> bool:
+    """Whether extra_buffer on ``model_arch`` is served by the short-conv track."""
+    return model_arch in _SHORT_CONV_TRACK_ARCHS
+
+
 def supports_mamba_cache_extra_buffer(view: Any, model_arch: str) -> bool:
     """Whether ``model_arch`` supports the extra_buffer strategy on the
     configured linear-attention backend (pure read)."""
