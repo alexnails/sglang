@@ -80,14 +80,21 @@ including on the platform where the shipped transport does not work at all.
 ## Why this is a probe and not a patch
 
 `vmm_fd_probe.py` proves the primitive, not a drop-in backend.
-[#33279](https://github.com/sgl-project/sglang/pull/33279) lands the transport
-abstraction with every `VmmFdTransportBackend` method stubbed as `pass`
-(including `can_export_state`, so the daemon always selects torch IPC — merging
-it changes no behaviour). Writing the backend is more than porting this ctypes
-code: an ordinary torch tensor lives in a `cudaMalloc`'d caching-allocator block
-and **cannot** be exported to a shareable fd at all, so the daemon has to own
-VMM-backed allocations for the weights. The stub's `_export_fd_for_tensor(tensor)`
-signature implies otherwise.
+[#33279](https://github.com/sgl-project/sglang/pull/33279) has merged and lands
+the transport abstraction, but `VmmFdTransportBackend` is an explicit
+placeholder: `can_export_state` returns `False` so the daemon always selects
+torch IPC, and every other entry point raises `NotImplementedError`. Behaviour
+on main is unchanged.
+
+Writing the backend is mostly wiring — `srt/utils/cuda_vmm_utils.py` and
+`cuda_vmm_transport_utils.py` already ship `VmmReservation`,
+`export_shareable_handles` with POSIX FD handles, `_send_fd`/`_recv_fd` over
+`SCM_RIGHTS`, and `tensor_from_pointer`, all production-tested by the multimodal
+feature transport. The client already negotiates the backend from the daemon's
+handshake (`result.get("transport_backend")`), so no CLI flag is needed either.
+What is not wiring: an ordinary torch tensor lives in a `cudaMalloc`'d
+caching-allocator block and **cannot** be exported to a shareable fd at all, so
+the daemon has to own VMM-backed allocations for the weights.
 
 One consequence worth pairing with that work: `vmm_fd` exists to drop the shared
 PID namespace, and `IpcModelLoader._start_daemon_liveness_watchdog` is
@@ -97,6 +104,43 @@ watchdog SIGKILLs a healthy engine seconds after startup, or it matches an
 unrelated process and a dead daemon goes undetected while the engine reads freed
 GPU memory. A namespace-independent liveness check (socket EOF, or `SO_PEERCRED`
 plus a generation counter) is a prerequisite for `vmm_fd`, not a follow-up.
+
+## At production scale (8xH200, main, cookbook commands)
+
+Re-measured 2026-09-02 against main with the deployment commands the cookbook
+generates. `mode=off` is a cold disk load; `client` attaches to a live daemon.
+
+| Model | Mode | Weight load | Ready (e2e) | Tensors/rank |
+| --- | --- | --- | --- | --- |
+| gpt-oss-120b-bf16, tp8 (111 GB) | off | 406.20 s | 600.9 s | — |
+| gpt-oss-120b-bf16, tp8 | client, first | 0.11 s | 97.3 s | 472 |
+| gpt-oss-120b-bf16, tp8 | **client, restart** | **0.09 s** | **73.1 s** | 472 |
+| Qwen3-235B-A22B-FP8, tp8 ep2 (223 GB) | daemon disk load | 229.2 s | — | — |
+| Qwen3-235B-A22B-FP8, tp8 ep2 | client, first | 0.33 s | 201.5 s | 1226 |
+| Qwen3-235B-A22B-FP8, tp8 ep2 | **client, restart** | **0.31 s** | **104.9 s** | 1226 |
+
+Both generated correct output through the IPC path, before and after restart.
+KV sizing is now correct: client mode yields slightly *fewer* KV tokens than the
+disk baseline (12,227,432 vs 12,404,401) with near-identical headroom (7.45 vs
+7.53 GB).
+
+Two traps sit between the cookbook and the weight cache:
+
+- The cookbook's default gpt-oss command serves `openai/gpt-oss-120b`, which is
+  **MXFP4** — not on the IPC allowlist (only unquantized and block-wise FP8), so
+  that command cannot use the weight cache. Use `lmsys/gpt-oss-120b-bf16`.
+- Qwen3-235B-A22B-FP8 at tp8 needs `--ep 2` (the cookbook adds it for fp8+tp8);
+  without it the model itself fails to shard with `output_size of gate's and up's
+  weight = 192 is not divisible by weight quantization block_n = 128`. The daemon
+  needs the matching `--ep-size 2` or the fingerprint will not match.
+
+**MoE is broken in the published image.** On `lmsysorg/sglang:latest` (rev
+`71de97b`, which predates the transport abstraction) gpt-oss-120b-bf16 fails the
+client shape check with the expert weights transposed — `w13_weight` arrives as
+`[128, 720, 2880]` against a model expecting `[128, 2880, 720]`, because the
+daemon ran `process_weights_after_loading` and the meta-initialized client has
+the pre-transpose shapes. The same test passes on main. Check the image revision
+before concluding an architecture is unsupported.
 
 ## Other measured behaviour worth knowing
 
