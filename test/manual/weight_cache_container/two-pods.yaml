@@ -1,0 +1,127 @@
+# Two separate pods sharing one GPU, so the weight-cache daemon outlives the
+# engine and the engine pod can be deleted and recreated against resident weights.
+#
+# Verified on k3s v1.36.4 / 8xB300: the daemon pod stayed up untouched (same pid
+# before and after) while the engine pod was deleted and recreated, and the
+# replacement re-attached 228 tensors in 0.016s with mem usage=0.00 GB.
+#
+# Every field below is load-bearing:
+#
+#   hostIPC + hostPID   the shipped torch_ipc transport needs BOTH namespaces
+#                       shared. Each alone fails, with different driver errors.
+#
+#   NO emptyDir on /dev/shm   THIS IS THE TRAP. torch's CUDA IPC keeps a
+#                       per-block reference-count file in /dev/shm. hostIPC
+#                       gives a pod the host's /dev/shm, but mounting an
+#                       emptyDir there -- which is the standard fix for
+#                       PyTorch's "insufficient shared memory" dataloader error,
+#                       so it is in most GPU pod specs -- silently replaces it
+#                       with a per-pod tmpfs and the import dies with
+#                       cudaErrorMapBufferObjectFailed. Measured both ways on
+#                       otherwise identical manifests.
+#
+#   NVIDIA_VISIBLE_DEVICES   the device plugin will not allocate one GPU to two
+#                       pods, so neither pod requests nvidia.com/gpu; both name
+#                       the same UUID instead. This needs the container runtime
+#                       to honour the env var (nvidia-container-runtime with
+#                       accept-nvidia-visible-devices-envvar-when-unprivileged),
+#                       which some clusters disable. The alternative is the
+#                       device plugin's time-slicing or MPS sharing.
+#
+#   hostPath socket dir  separate pods cannot share an emptyDir. Mounted at /tmp
+#                       because the released image hardcodes
+#                       /tmp/sglang_weight_cache_rank{N}.sock; on main, set
+#                       SGLANG_WEIGHT_CACHE_SOCKET_TEMPLATE instead and mount
+#                       anywhere.
+#
+#   initContainer       a client-mode engine that starts before the socket
+#                       exists SILENTLY disk-loads, and a stale socket left by
+#                       any previous daemon shutdown makes it fail hard with
+#                       ConnectionRefused. The init step clears dead-PID
+#                       leftovers, then waits.
+#
+#   daemon as PID 1     PR_SET_PDEATHSIG is SIGKILL, so any wrapper that exits
+#                       takes the daemon down with it.
+#
+# Substitute NODE, GPU_UUID, and the model path/root before applying.
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: wc-daemon
+  labels: {app: wc-daemon}
+spec:
+  nodeName: NODE
+  hostIPC: true
+  hostPID: true
+  restartPolicy: Never
+  runtimeClassName: nvidia
+  containers:
+    - name: daemon
+      image: lmsysorg/sglang:latest
+      imagePullPolicy: IfNotPresent
+      command: ["python", "-m", "sglang.srt.weight_cache.daemon",
+                "--model-path", "/models/MODEL", "--tp-size", "1"]
+      env:
+        - {name: NVIDIA_VISIBLE_DEVICES, value: "GPU_UUID"}
+        - {name: NVIDIA_DRIVER_CAPABILITIES, value: "compute,utility"}
+      volumeMounts:
+        - {name: wcsock, mountPath: /tmp}
+        - {name: models, mountPath: /models, readOnly: true}
+  volumes:
+    - {name: wcsock, hostPath: {path: /run/sglang-weight-cache, type: DirectoryOrCreate}}
+    - {name: models, hostPath: {path: MODELROOT, type: Directory}}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: wc-engine
+  labels: {app: wc-engine}
+spec:
+  nodeName: NODE
+  hostIPC: true
+  hostPID: true
+  restartPolicy: Never
+  runtimeClassName: nvidia
+  initContainers:
+    - name: await-daemon
+      image: lmsysorg/sglang:latest
+      imagePullPolicy: IfNotPresent
+      command: ["bash", "-c"]
+      args:
+        - |
+          set -u
+          shopt -s nullglob
+          for r in /wcsock/*.ready; do
+            pid=$(sed -n 's/^pid=//p' "$r")
+            if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+              echo "clearing stale daemon files for dead pid=$pid"
+              rm -f "${r%.ready}.sock" "$r"
+            fi
+          done
+          until compgen -G '/wcsock/*.sock' > /dev/null; do
+            echo "waiting for daemon socket"; sleep 2
+          done
+          echo "daemon socket present"
+      volumeMounts:
+        - {name: wcsock, mountPath: /wcsock}
+  containers:
+    - name: engine
+      image: lmsysorg/sglang:latest
+      imagePullPolicy: IfNotPresent
+      command: ["python", "-m", "sglang.launch_server",
+                "--model-path", "/models/MODEL", "--tp", "1",
+                "--weight-cache-mode", "client",
+                "--mem-fraction-static", "0.50",
+                "--host", "0.0.0.0", "--port", "30000"]
+      env:
+        - {name: NVIDIA_VISIBLE_DEVICES, value: "GPU_UUID"}
+        - {name: NVIDIA_DRIVER_CAPABILITIES, value: "compute,utility"}
+      ports:
+        - {containerPort: 30000}
+      volumeMounts:
+        - {name: wcsock, mountPath: /tmp}
+        - {name: models, mountPath: /models, readOnly: true}
+  volumes:
+    - {name: wcsock, hostPath: {path: /run/sglang-weight-cache, type: DirectoryOrCreate}}
+    - {name: models, hostPath: {path: MODELROOT, type: Directory}}

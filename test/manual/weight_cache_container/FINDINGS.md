@@ -50,7 +50,38 @@ otherwise. Reproduce with the probes in this directory.
 | --- | --- |
 | 20 | The device plugin will not allocate one GPU to two pods. Needs the `NVIDIA_VISIBLE_DEVICES` escape hatch (often disabled by policy) or time-slicing / MPS. |
 | 21 | Separate pods cannot share an `emptyDir`, so the socket needs a `hostPath`; the socket is mode 0600, so both pods run as the same uid. |
-| 22 | One managed-Kubernetes platform fails the legacy transport *despite* meeting the namespace contract. Ruled out: the harness, device injection, and `/dev/shm`. Root cause unknown. |
+| 22 | ~~One managed-Kubernetes platform fails the legacy transport despite meeting the namespace contract.~~ **Root-caused: an `emptyDir` mounted at `/dev/shm`.** See below. |
+
+## Two pods, verified end to end
+
+Run on k3s v1.36.4 / 8xB300 with `two-pods.yaml`. The daemon pod stayed up
+untouched — same pid (313668) before and after — while the engine pod was
+deleted outright and recreated:
+
+| Step | Result |
+| --- | --- |
+| daemon pod ready | model loaded in 10.52 s, 228 tensors exported, 2006 MiB resident |
+| engine pod attaches | 228 handles, 0.016 s map, 0.04 s weight load, `mem usage=0.00 GB` |
+| generation | correct |
+| **engine pod deleted** | daemon pod still Running, GPU memory unchanged |
+| replacement engine pod | re-attached in 0.016 s, serving 105.7 s after the delete |
+| generation after restart | correct, new pod IP |
+
+The 105.7 s is container start plus CUDA-graph capture; the weight load inside
+it is 0.03 s.
+
+**The trap that made this look impossible: an `emptyDir` at `/dev/shm`.** torch's
+CUDA IPC keeps a per-block reference-count file there. `hostIPC: true` gives a
+pod the host's `/dev/shm`, but mounting an `emptyDir` over it — the standard fix
+for PyTorch's "insufficient shared memory" dataloader error, and therefore
+present in most GPU pod specs — silently substitutes a per-pod tmpfs, and the
+import dies with `cudaErrorMapBufferObjectFailed`. Two otherwise identical
+manifests, measured both ways: with the mount the engine pod fails, without it
+the same pod attaches in 0.016 s.
+
+This also explains the managed-Kubernetes failure recorded above as unexplained.
+An earlier attempt to rule `/dev/shm` out by symlinking the ref-count file in
+through `/proc/<pid>/root` gave a false negative.
 
 ## Process and docs
 
