@@ -15,6 +15,28 @@ _E8M0_ZERO = 2.0**-127
 
 
 @triton.jit
+def engram_dequant_row(
+    w_ptr,
+    s_ptr,
+    local,
+    offs,
+    owned,
+    DIM: tl.constexpr,
+    BLK: tl.constexpr,
+    E8M0_ZERO: tl.constexpr,
+):
+    w = w_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
+    s = s_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
+    vals = tl.load(w + local * DIM + offs, mask=owned, other=0.0).to(tl.float32)
+    exps = tl.load(s + local * (DIM // BLK) + offs // BLK, mask=owned, other=0).to(
+        tl.int32
+    )
+    scale = (exps << 23).to(tl.float32, bitcast=True)
+    scale = tl.where(exps == 0, E8M0_ZERO, scale)
+    return tl.where(owned, vals * scale, 0.0)
+
+
+@triton.jit
 def _engram_gather_kernel(
     w_ptr,
     s_ptr,
@@ -32,17 +54,10 @@ def _engram_gather_kernel(
     # comes out as zeros, which is what the sharded all-reduce sums.
     owned = (idx >= row_lo) & (idx < row_hi)
     local = tl.where(owned, idx - row_lo, 0)
-    w = w_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
-    s = s_ptr.to(tl.int64).to(tl.pointer_type(tl.uint8))
     offs = tl.arange(0, DIM)
-    vals = tl.load(w + local * DIM + offs, mask=owned, other=0.0).to(tl.float32)
-    exps = tl.load(s + local * (DIM // BLK) + offs // BLK, mask=owned, other=0).to(
-        tl.int32
+    out = engram_dequant_row(
+        w_ptr, s_ptr, local, offs, owned, DIM=DIM, BLK=BLK, E8M0_ZERO=E8M0_ZERO
     )
-    # 2**(e - 127) from the exponent bits: exact, no exp2 rounding or denormal flush.
-    scale = (exps << 23).to(tl.float32, bitcast=True)
-    scale = tl.where(exps == 0, E8M0_ZERO, scale)
-    out = tl.where(owned, vals * scale, 0.0)
     tl.store(out_ptr + row * DIM + offs, out.to(tl.bfloat16))
 
 

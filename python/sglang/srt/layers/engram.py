@@ -23,6 +23,10 @@ from torch import nn
 
 from sglang.kernels.ops.embeddings.engram_gate import fused_engram_gate
 from sglang.kernels.ops.embeddings.engram_gather import engram_gather
+from sglang.kernels.ops.embeddings.engram_gather_cached import (
+    build_group_probe_table,
+    engram_gather_cached,
+)
 from sglang.kernels.ops.embeddings.engram_hash import (
     MODE_DECODE,
     MODE_EXTEND,
@@ -666,6 +670,99 @@ class _HostTable:
             logger.info(msg)
 
 
+_CACHE_FILL_ROWS = 1 << 20
+
+
+def _hbm_cache_enabled() -> bool:
+    return envs.SGLANG_ENABLE_DSV41_ENGRAM_HBM_CACHE.get()
+
+
+class _HbmCache:
+    """A calibrated hot row set of one engram table, resident in device memory.
+
+    The 8 heads of an n-gram size share one rolling hash and are always looked
+    up together, so the cache admits whole groups: group g owns slots
+    ``n_heads * g .. n_heads * g + n_heads - 1``. One probe then serves eight
+    rows, which is why the probe table costs an eighth of a per-row one.
+
+    The plan orders groups frequency-first, so a per-GPU byte cap keeps a prefix
+    and needs no per-range allocation of its own.
+    """
+
+    def __init__(self, layer_id: int, dim: int, n_heads: int, n_layers: int, device):
+        self.groups = 0
+        self.slots = 0
+        self.weight = None
+        self.scale = None
+        self.probe_keys = None
+        self.probe_groups = None
+        self.n_heads = n_heads
+        path = envs.SGLANG_DSV41_ENGRAM_HBM_CACHE_PLAN.get()
+        if not path:
+            raise ValueError(
+                "SGLANG_ENABLE_DSV41_ENGRAM_HBM_CACHE needs "
+                "SGLANG_DSV41_ENGRAM_HBM_CACHE_PLAN pointing at a calibration .npz"
+            )
+        with np.load(path) as plan:
+            key = f"layer_{layer_id}"
+            if key not in plan:
+                raise ValueError(f"{path} has no {key}; keys are {list(plan.keys())}")
+            members = np.asarray(plan[key], dtype=np.int64)
+        if members.ndim != 2 or members.shape[1] != n_heads:
+            raise ValueError(
+                f"{path}:{key} must be [groups, {n_heads}] member row ids, "
+                f"got {members.shape}"
+            )
+        group_bytes = n_heads * (dim + dim // FP8_BLOCK_SIZE)
+        cap_gib = envs.SGLANG_DSV41_ENGRAM_HBM_CACHE_GIB.get()
+        if cap_gib > 0:
+            share = int(cap_gib * 2**30) // max(1, n_layers)
+            members = members[: max(1, share // group_bytes)]
+        self.groups = int(members.shape[0])
+        self.slots = self.groups * n_heads
+        if self.groups == 0:
+            return
+        self.member_ids = torch.from_numpy(members)
+        self.weight = torch.empty(
+            self.slots, dim, dtype=torch.float8_e4m3fn, device=device
+        )
+        self.scale = torch.empty(
+            self.slots, dim // FP8_BLOCK_SIZE, dtype=torch.float8_e8m0fnu, device=device
+        )
+        keys, groups, _ = build_group_probe_table(self.member_ids)
+        self.probe_keys = keys.to(device)
+        self.probe_groups = groups.to(device)
+
+    @property
+    def active(self) -> bool:
+        return self.groups > 0
+
+    def fill(self, weight: torch.Tensor, scale: torch.Tensor) -> None:
+        """Copy the hot rows out of the loaded table, host or device.
+
+        Indexed through a uint8 view so it does not depend on fp8 gather support
+        on the host, and chunked so the staging copy stays bounded.
+        """
+        src_w, src_s = weight.view(torch.uint8), scale.view(torch.uint8)
+        dst_w, dst_s = self.weight.view(torch.uint8), self.scale.view(torch.uint8)
+        flat = self.member_ids.reshape(-1)
+        for lo in range(0, self.slots, _CACHE_FILL_ROWS):
+            hi = min(lo + _CACHE_FILL_ROWS, self.slots)
+            rows = flat[lo:hi]
+            dst_w[lo:hi].copy_(src_w[rows])
+            dst_s[lo:hi].copy_(src_s[rows])
+
+    def nbytes(self) -> int:
+        if not self.active:
+            return 0
+        return (
+            self.weight.numel()
+            + self.scale.numel()
+            + self.probe_keys.numel() * self.probe_keys.element_size()
+            + self.probe_groups.numel() * self.probe_groups.element_size()
+        )
+
+
 class EngramEmbedding(nn.Module):
     """One layer's fp8 hash table with e8m0 block scales, dequantized on lookup.
 
@@ -677,16 +774,30 @@ class EngramEmbedding(nn.Module):
     sharded in every layout: a rank writes only its own row range.
     """
 
-    def __init__(self, num_embeddings: int, dim: int, layer_id: int):
+    def __init__(
+        self,
+        num_embeddings: int,
+        dim: int,
+        layer_id: int,
+        n_heads: int = 1,
+        n_ngram: int = 1,
+        n_engram_layers: int = 1,
+    ):
         super().__init__()
         self.dim = dim
+        self.layer_id = layer_id
+        self.num_embeddings = num_embeddings
+        self.n_heads = n_heads
+        self.n_ngram = n_ngram
+        self.n_engram_layers = n_engram_layers
         self.tp_size = get_parallel().tp_size
         tp_rank = get_parallel().tp_rank
         self.row_start = num_embeddings * tp_rank // self.tp_size
         row_end = num_embeddings * (tp_rank + 1) // self.tp_size
         self.rows = row_end - self.row_start
         self.host_table: Optional[_HostTable] = None
-        if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
+        self.hbm_cache: Optional[_HbmCache] = None
+        if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get() or _hbm_cache_enabled():
             self._init_host_table(num_embeddings, dim, layer_id)
         else:
             self.weight = nn.Parameter(
@@ -706,6 +817,11 @@ class EngramEmbedding(nn.Module):
         layout = _HostTable.choose_layout(
             envs.SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT.get()
         )
+        if _hbm_cache_enabled() and layout != "shared":
+            logger.info(
+                "engram hbm cache: forcing the shared host layout (was %s)", layout
+            )
+            layout = "shared"
         n = num_embeddings if layout == "shared" else self.rows
         w_bytes = n * dim
         s_bytes = n * (dim // FP8_BLOCK_SIZE)
@@ -737,9 +853,29 @@ class EngramEmbedding(nn.Module):
 
     def finish_load(self, label: str = ""):
         """Barrier (shared layout) once every rank has written its rows; log how
-        the table ended up backed."""
+        the table ended up backed, then admit the calibrated hot rows to HBM."""
         if self.host_table is not None:
             self.host_table.finish_load(label)
+        if not _hbm_cache_enabled():
+            return
+        assert self._shared, "the engram hbm cache needs the shared host layout"
+        self.hbm_cache = _HbmCache(
+            layer_id=self.layer_id,
+            dim=self.dim,
+            n_heads=self.n_heads,
+            n_layers=self.n_engram_layers,
+            device=torch.cuda.current_device(),
+        )
+        if self.hbm_cache.active:
+            self.hbm_cache.fill(self.weight.data, self.scale.data)
+        logger.info(
+            "engram hbm cache layer %d: %d groups, %d rows (%.2f GiB) of %d rows",
+            self.layer_id,
+            self.hbm_cache.groups,
+            self.hbm_cache.slots,
+            self.hbm_cache.nbytes() / 2**30,
+            self.num_embeddings,
+        )
 
     def forward(
         self,
@@ -751,16 +887,7 @@ class EngramEmbedding(nn.Module):
         if self._shared:
             if indices.shape[0] == 0:
                 return self._empty(indices)
-            out = self._empty(indices)
-            engram_gather(
-                self.weight.data_ptr(),
-                self.scale.data_ptr(),
-                indices.reshape(-1),
-                out.view(-1, self.dim),
-                self.dim,
-                FP8_BLOCK_SIZE,
-            )
-            return out
+            return self._gather_rows(indices, 0, self.num_embeddings)
         if cp_all_tokens and self.tp_size > 1:
             # Prefill CP: gather the hash ids over the CP group first so every
             # TP rank looks up the same indices, then keep this rank's slice.
@@ -804,17 +931,49 @@ class EngramEmbedding(nn.Module):
             rows = self.weight[local].float().unflatten(-1, (-1, FP8_BLOCK_SIZE))
             values = (rows * self.scale[local].float().unsqueeze(-1)).flatten(-2)
             return values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
+        return self._gather_rows(indices, self.row_start, self.row_start + self.rows)
+
+    def _gather_rows(
+        self, indices: torch.Tensor, row_lo: int, row_hi: int
+    ) -> torch.Tensor:
+        """Dequantized rows of `indices`, reading the hot ones from HBM when a
+        calibrated cache is resident and the rest from the backing table.
+
+        The cached path needs the trailing `n_ngram * n_heads` column axis intact
+        to recover which group each row belongs to.
+        """
         out = self._empty(indices)
-        engram_gather(
-            self.weight.data_ptr(),
-            self.scale.data_ptr(),
-            indices.reshape(-1),
-            out.view(-1, self.dim),
-            self.dim,
-            FP8_BLOCK_SIZE,
-            row_lo=self.row_start,
-            row_hi=self.row_start + self.rows,
-        )
+        flat, flat_out = indices.reshape(-1), out.view(-1, self.dim)
+        cache = self.hbm_cache
+        cols = self.n_ngram * self.n_heads
+        if cache is not None and cache.active and indices.shape[-1] == cols:
+            engram_gather_cached(
+                self.weight.data_ptr(),
+                self.scale.data_ptr(),
+                cache.weight.data_ptr(),
+                cache.scale.data_ptr(),
+                cache.probe_keys,
+                cache.probe_groups,
+                indices.reshape(-1, cols),
+                flat_out,
+                self.dim,
+                FP8_BLOCK_SIZE,
+                n_heads=self.n_heads,
+                n_ngram=self.n_ngram,
+                row_lo=row_lo,
+                row_hi=row_hi,
+            )
+        else:
+            engram_gather(
+                self.weight.data_ptr(),
+                self.scale.data_ptr(),
+                flat,
+                flat_out,
+                self.dim,
+                FP8_BLOCK_SIZE,
+                row_lo=row_lo,
+                row_hi=row_hi,
+            )
         return out
 
     def _dp_sharded_lookup(
@@ -910,7 +1069,12 @@ class Engram(nn.Module):
         self.clamp_value = 1e-6
         dim, hc_mult = config.hidden_size, config.hc_mult
         self.embed = EngramEmbedding(
-            layout.num_embeddings[self.layer_hash_index], layout.head_dim, layer_id
+            layout.num_embeddings[self.layer_hash_index],
+            layout.head_dim,
+            layer_id,
+            n_heads=layout.n_heads,
+            n_ngram=layout.max_ngram_size - 1,
+            n_engram_layers=len(layout.layer_ids),
         )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         self.wkv = ReplicatedLinear(

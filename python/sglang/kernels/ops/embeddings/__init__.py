@@ -24,6 +24,16 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
+        op="embeddings.engram_gather_cached",
+        backend=KernelBackend.TRITON,
+        target=(
+            "sglang.kernels.ops.embeddings.engram_gather_cached:engram_gather_cached"
+        ),
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="embeddings.engram_hash_ids",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.embeddings.engram_hash:engram_hash_ids",

@@ -1422,6 +1422,15 @@ class Envs:
     # loading: cached checkpoint pages fragment host memory and starve the 512 MiB
     # huge-page faults. Costs the next restart its warm page cache.
     SGLANG_ENABLE_DSV41_ENGRAM_DROP_PAGE_CACHE = EnvBool(True)
+    # Keep the engram tables in host memory but hold a calibrated hot row set in
+    # HBM, so only the cold tail pays the host link. Implies the host table.
+    SGLANG_ENABLE_DSV41_ENGRAM_HBM_CACHE = EnvBool(False)
+    # Frequency-ordered hot row ids, an .npz with one int64 array per engram layer
+    # keyed "layer_<id>", written by sglang.benchmark.engram_cache_calibrate.
+    SGLANG_DSV41_ENGRAM_HBM_CACHE_PLAN = EnvStr(None)
+    # Per-GPU cap on the hot set. Each layer's plan is frequency-ordered, so the
+    # cap keeps a prefix. 0 means take the whole plan.
+    SGLANG_DSV41_ENGRAM_HBM_CACHE_GIB = EnvFloat(0.0)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 
