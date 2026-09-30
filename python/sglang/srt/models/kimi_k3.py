@@ -198,6 +198,10 @@ _BANK_PARTIALS_MAX_TOKENS = 16
 # The fused route+quant kernel quantizes on one workgroup: faster than aiter's quant
 # launch up to 8 tokens on MI350X.
 _ROUTE_QUANT_MAX_TOKENS = 8
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+if _use_aiter:
+    from aiter.tuned_gemm import tgemm
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -282,6 +286,8 @@ def _k3_bf16_gemm(
         out = torch.empty(
             (x.shape[0], weight.shape[0]), dtype=out_dtype, device=x.device
         )
+    if out is None and _use_aiter:
+        return tgemm.mm(x, weight, None, otype=x.dtype)
     if x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16:
         from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
 
