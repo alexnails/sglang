@@ -58,6 +58,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import (
 from sglang.srt.hardware_backend.npu.utils import (
     use_npu_arch35_mxfp8_wo_a,
 )
+from sglang.srt.layers import megakernel
 from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_enable_prefill_cp,
 )
@@ -5287,8 +5288,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                         )
                     ):
                         continue
-                    if _is_hip and not is_nextn:
-                        _hip.stash_shared_expert(self.model.layers, name, loaded_weight)
+                    if not is_nextn:
+                        megakernel.on_weight_loaded(
+                            layers=self.model.layers, name=name, tensor=loaded_weight
+                        )
                     if (
                         self.num_fused_shared_experts > 0
                         and "mlp.shared_experts" in name
@@ -5559,8 +5562,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
         if not is_nextn:
-            if _is_hip:
-                _hip.stash_k1_weights(self.model.layers)
+            megakernel.post_load_weights(layers=self.model.layers)
             for i, layer in enumerate(self.model.layers):
                 if getattr(layer, "engram", None) is not None:
                     layer.engram.embed.finish_load(label=f"layer {i}")

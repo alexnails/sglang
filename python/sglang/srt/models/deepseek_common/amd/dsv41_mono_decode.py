@@ -1,4 +1,6 @@
-"""SGLang glue for the DeepSeek-V4.1 gfx950 mono decode launches (FFN launch and K1)."""
+"""The DeepSeek-V4.1 gfx950 mono decode launches (FFN launch and K1) as a megakernel provider."""
+
+from __future__ import annotations
 
 import logging
 import time
@@ -6,8 +8,16 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.spec import CapabilityRequirement
 from sglang.srt.environ import envs
+from sglang.srt.layers.megakernel import (
+    MegaKernelCapability,
+    MegaKernelProvider,
+    MegaKernelScope,
+    StepMode,
+)
 from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.models.deepseek_common.amd.dsv41_mono.common.plan import BLOCKS
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.utils import get_bool_env_var, is_gfx95_supported
 
@@ -35,102 +45,12 @@ _MODEL = dict(
 # n_group / topk_group (8 / 4 in SGLang's DeepseekV41Config) are not read: DS4.1 routes ungrouped
 _SHARED = ("gate_proj", "up_proj", "down_proj")
 
-_runner = None
-
-
-def _get_runner(device: torch.device):
-    """Return this TP rank's runner; its peer-memory setup is collective, so every rank builds it at the same layer."""
-    global _runner
-    p = get_parallel()
-    if _runner is None:
-        from sglang.srt.models.deepseek_common.amd.dsv41_mono.runner import (
-            MAX_TOKENS,
-            DSV41MonoLayer,
-            no_capture,
-        )
-
-        no_capture("SGLANG_ROCM_MONO_DECODE")
-        assert MAX_TOKENS >= MAX_ROWS, MAX_TOKENS
-        _runner = DSV41MonoLayer(p.tp_size, p.tp_rank, p.tp_group.cpu_group, device)
-        logger.info(
-            "DeepSeek-V4.1 mono decode: the FFN launch runs decode and verify steps of <= %d rows",
-            MAX_ROWS,
-        )
-    if (_runner.device, _runner.tp, _runner.rank) != (device, p.tp_size, p.tp_rank):
-        raise RuntimeError(
-            f"DSv4.1 mono decode: one runner a process, built for {_runner.device} TP{_runner.tp} rank {_runner.rank}"
-        )
-    return _runner
-
-
-_normal_path_warm = False
-
-
-def _warm_normal_path(moe, device: torch.device) -> None:
-    """Warm the normal MoE kernels for widths 1 to MAX_ROWS, so no later extend step compiles them."""
-    global _normal_path_warm
-    if _normal_path_warm:
-        return
-    _normal_path_warm = True
-    t0 = time.perf_counter()
-    x = torch.randn(
-        MAX_ROWS, _MODEL["hidden_size"], dtype=torch.bfloat16, device=device
-    )
-    for m in range(1, MAX_ROWS + 1):
-        # per-rank, no collective
-        moe.forward_normal(x[:m], return_moe_output=True)
-    torch.cuda.synchronize(device)
-    logger.info(
-        "DeepSeek-V4.1 mono decode: normal MoE path warmed for 1-%d tokens in %.1f s",
-        MAX_ROWS,
-        time.perf_counter() - t0,
-    )
-
 
 def unsupported_model(config) -> Optional[str]:
     """Why the kernels cannot serve this model config, or None."""
     for key, want in _MODEL.items():
         if getattr(config, key, None) != want:
             return f"needs DeepSeek-V4.1-Flash's {key} = {want!r}"
-    return None
-
-
-def _unsupported(config) -> Optional[str]:
-    """Why the kernels cannot serve this deployment, or None."""
-    # speculative target steps take the launches as DSpark's uniform verify steps only
-    algo = (get_spec().speculative_algorithm or "none").upper()
-    if algo not in ("NONE", "DSPARK"):
-        return "supports speculative decoding with DSpark only"
-    if algo == "DSPARK" and envs.SGLANG_RAGGED_VERIFY_MODE.get() != "static":
-        return "needs SGLANG_RAGGED_VERIFY_MODE=static with DSpark"
-    if not is_gfx95_supported():
-        return "needs gfx950"
-    p = get_parallel()
-    if p.tp_size not in (2, 4):
-        return "needs tensor parallel size 2 or 4"
-    if p.attn_tp_size != p.tp_size or p.moe_ep_size != 1:
-        return "needs tensor parallelism only: no attention data parallelism, no expert parallelism"
-    why = unsupported_model(config)
-    if why is not None:
-        return why
-    # the MoE's MXFP4 experts in aiter's gate / up interleaved (16, 16) shuffle (Fp8MoEMethod)
-    if (
-        not envs.SGLANG_DSV4_FP4_EXPERTS.get()
-        or envs.SGLANG_DSV4_FP4_DEQUANT.get()
-        or not envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
-        or get_bool_env_var("AITER_FORCE_A8W4")
-    ):
-        return "needs the MXFP4 experts in aiter's gate / up interleaved layout"
-    try:
-        from sglang.srt.models.deepseek_common.amd.dsv41_mono.runner import BLOCKS
-    except ImportError as err:
-        return f"needs FlyDSL and AITER's FlyDSL helpers ({err})"
-    # every CTA of a launch stays resident: a partitioned GPU deadlocks
-    cus = torch.cuda.get_device_properties(
-        torch.cuda.current_device()
-    ).multi_processor_count
-    if cus < BLOCKS:
-        return f"needs {BLOCKS} compute units, the GPU has {cus}"
     return None
 
 
@@ -151,61 +71,160 @@ def _unsupported_k1(attn) -> Optional[str]:
     return None
 
 
-def init_layer(layer) -> None:
-    """Attach the layer's FFN launch and K1 launch (or None); an opt-in the deployment cannot serve raises."""
-    layer.mono_ffn = layer.mono_k1 = None
-    if not envs.SGLANG_ROCM_MONO_DECODE.get():
-        if envs.SGLANG_ROCM_MONO_K1.get():
-            raise ValueError("SGLANG_ROCM_MONO_K1 needs SGLANG_ROCM_MONO_DECODE=1.")
-        return
-    # draft layers (DSpark stages, next-n layers) keep the normal path
-    if layer.mlp.is_nextn:
-        return
-    why = _unsupported(layer.config)
-    if why is None and envs.SGLANG_ROCM_MONO_K1.get():
-        why = _unsupported_k1(layer.self_attn)
-    if why is not None:
-        raise ValueError(f"SGLANG_ROCM_MONO_DECODE {why}.")
-    if layer.hc_boundary_fused and not layer.mlp.is_hash:
-        layer.mono_ffn = MonoFfn(layer)
-        a = layer.self_attn
-        if (
-            envs.SGLANG_ROCM_MONO_K1.get()
-            and a.compress_ratio in (1, 2)
-            and a.compressor is None
-            and a.indexer is None
-        ):
-            layer.mono_k1 = MonoK1(layer)
+class DSV41MonoProvider(MegaKernelProvider):
+    """``dsv41_mono``: the FFN launch; ``dsv41_mono_k1`` adds the attention-front launch (K1)."""
 
-
-def stash_shared_expert(layers, name: str, loaded_weight: torch.Tensor) -> None:
-    """Keep this rank's shard of a checkpoint FP8 shared-expert tensor for the FFN launch."""
-    if not envs.SGLANG_ROCM_MONO_DECODE.get() or "mlp.shared_experts" not in name:
-        return
-    i = get_layer_id(name)
-    # skip tensors outside the decoder layers (the checkpoint's mtp.* layers)
-    if i is None or i >= len(layers):
-        return
-    mono = getattr(layers[i], "mono_ffn", None)
-    if mono is None:
-        return
-    proj = next(p for p in _SHARED if f".{p}." in name)
-    kind = "weight" if name.endswith(".weight") else "scale"
-    # the TP-sharded intermediate dimension
-    dim = 1 if proj == "down_proj" else 0
-    p = get_parallel()
-    t = loaded_weight.view(torch.uint8)
-    n = t.shape[dim] // p.tp_size
-    mono.shared[proj, kind] = (
-        t.narrow(dim, p.tp_rank * n, n).to(torch.cuda.current_device()).contiguous()
+    capability = MegaKernelCapability(
+        devices=frozenset({CapabilityRequirement.HIP}),
+        architectures=frozenset({"DeepseekV4ForCausalLM"}),
+        tp_sizes=frozenset({2, 4}),
+        speculative_algorithms=frozenset({"NONE", "DSPARK"}),
+        # every CTA of a launch stays resident: a partitioned GPU deadlocks
+        min_compute_units=BLOCKS,
+        step_modes=frozenset({StepMode.DECODE, StepMode.TARGET_VERIFY}),
+        max_rows=MAX_ROWS,
     )
+
+    def __init__(self, name: str) -> None:
+        super().__init__(name)
+        self.k1 = name == "dsv41_mono_k1"
+        self._runner = None
+        self._normal_path_warm = False
+
+    def unsupported(self, hf_config) -> Optional[str]:
+        # speculative target steps take the launches as DSpark's uniform verify steps only
+        algo = (get_spec().speculative_algorithm or "none").upper()
+        if algo == "DSPARK" and envs.SGLANG_RAGGED_VERIFY_MODE.get() != "static":
+            return "needs SGLANG_RAGGED_VERIFY_MODE=static with DSpark"
+        if not is_gfx95_supported():
+            return "needs gfx950"
+        why = unsupported_model(hf_config)
+        if why is not None:
+            return why
+        # the MoE's MXFP4 experts in aiter's gate / up interleaved (16, 16) shuffle (Fp8MoEMethod)
+        if (
+            not envs.SGLANG_DSV4_FP4_EXPERTS.get()
+            or envs.SGLANG_DSV4_FP4_DEQUANT.get()
+            or not envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
+            or get_bool_env_var("AITER_FORCE_A8W4")
+        ):
+            return "needs the MXFP4 experts in aiter's gate / up interleaved layout"
+        try:
+            import sglang.srt.models.deepseek_common.amd.dsv41_mono.runner  # noqa: F401
+        except ImportError as err:
+            return f"needs FlyDSL and AITER's FlyDSL helpers ({err})"
+        return None
+
+    def bind_layer(self, layer, scope: MegaKernelScope):
+        # draft layers (DSpark stages, next-n layers) keep the normal path
+        if layer.mlp.is_nextn or not layer.hc_boundary_fused or layer.mlp.is_hash:
+            return None
+        if scope is MegaKernelScope.LAYER_FFN:
+            return MonoFfn(layer, provider=self)
+        if scope is MegaKernelScope.LAYER_ATTN_FRONT and self.k1:
+            why = _unsupported_k1(layer.self_attn)
+            if why is not None:
+                raise ValueError(f"--megakernel-backend {self.name} {why}.")
+            a = layer.self_attn
+            if (
+                a.compress_ratio in (1, 2)
+                and a.compressor is None
+                and a.indexer is None
+            ):
+                return MonoK1(layer, provider=self)
+        return None
+
+    def on_weight_loaded(self, layers, name: str, tensor: torch.Tensor) -> None:
+        """Keep this rank's shard of a checkpoint FP8 shared-expert tensor for the FFN launch."""
+        if "mlp.shared_experts" not in name:
+            return
+        i = get_layer_id(name)
+        # skip tensors outside the decoder layers (the checkpoint's mtp.* layers)
+        if i is None or i >= len(layers):
+            return
+        mono = layers[i].megakernel.launches.get(MegaKernelScope.LAYER_FFN)
+        if mono is None:
+            return
+        proj = next(p for p in _SHARED if f".{p}." in name)
+        kind = "weight" if name.endswith(".weight") else "scale"
+        # the TP-sharded intermediate dimension
+        dim = 1 if proj == "down_proj" else 0
+        p = get_parallel()
+        t = tensor.view(torch.uint8)
+        n = t.shape[dim] // p.tp_size
+        mono.shared[proj, kind] = (
+            t.narrow(dim, p.tp_rank * n, n).to(torch.cuda.current_device()).contiguous()
+        )
+
+    def post_load_weights(self, layers) -> None:
+        """Copy the K1 layers' row-major wqkv_a and wq_b before the FP8 linear method rewrites them."""
+        for layer in layers:
+            k1 = layer.megakernel.launches.get(MegaKernelScope.LAYER_ATTN_FRONT)
+            if k1 is not None:
+                a = layer.self_attn
+                k1.plain = (
+                    a.wqkv_a.weight.detach().clone(),
+                    a.wq_b.weight.detach().clone(),
+                )
+
+    def prepare_before_capture(self, device) -> None:
+        # the peer-memory setup is collective: every rank reaches warmup together;
+        # a draft runner's warmup comes later, possibly under a patched TP group
+        if self._runner is None:
+            self.runner(device)
+
+    def runner(self, device: torch.device):
+        """This TP rank's runner."""
+        p = get_parallel()
+        if self._runner is None:
+            from sglang.srt.models.deepseek_common.amd.dsv41_mono.runner import (
+                MAX_TOKENS,
+                DSV41MonoLayer,
+                no_capture,
+            )
+
+            no_capture(f"--megakernel-backend {self.name}")
+            assert MAX_TOKENS >= MAX_ROWS, MAX_TOKENS
+            self._runner = DSV41MonoLayer(
+                p.tp_size, p.tp_rank, p.tp_group.cpu_group, device
+            )
+            logger.info(
+                "DeepSeek-V4.1 mono decode: the FFN launch runs decode and verify steps of <= %d rows",
+                MAX_ROWS,
+            )
+        r = self._runner
+        if (r.device, r.tp, r.rank) != (device, p.tp_size, p.tp_rank):
+            raise RuntimeError(
+                f"DSv4.1 mono decode: one runner a process, built for {r.device} TP{r.tp} rank {r.rank}"
+            )
+        return r
+
+    def warm_normal_path(self, moe, device: torch.device) -> None:
+        """Warm the normal MoE kernels for widths 1 to MAX_ROWS, so no later extend step compiles them."""
+        if self._normal_path_warm:
+            return
+        self._normal_path_warm = True
+        t0 = time.perf_counter()
+        x = torch.randn(
+            MAX_ROWS, _MODEL["hidden_size"], dtype=torch.bfloat16, device=device
+        )
+        for m in range(1, MAX_ROWS + 1):
+            # per-rank, no collective
+            moe.forward_normal(x[:m], return_moe_output=True)
+        torch.cuda.synchronize(device)
+        logger.info(
+            "DeepSeek-V4.1 mono decode: normal MoE path warmed for 1-%d tokens in %.1f s",
+            MAX_ROWS,
+            time.perf_counter() - t0,
+        )
 
 
 class MonoFfn:
     """One layer's FFN launch. Its weights are taken from the layer at the first call, after loading."""
 
-    def __init__(self, layer):
+    def __init__(self, layer, *, provider: DSV41MonoProvider):
         self.layer = layer
+        self.provider = provider
         # (projection, "weight" / "scale") -> this rank's checkpoint shard
         self.shared: dict = {}
         self._weights = None
@@ -221,12 +240,10 @@ class MonoFfn:
         # n: the routed experts, before a fused shared one
         e, n = moe.experts, moe.gate.weight.shape[0]
         if not getattr(e.w13_weight, "is_shuffled", False):
-            raise RuntimeError(
-                "SGLANG_ROCM_MONO_DECODE: MoE weights not in aiter's shuffle"
-            )
+            raise RuntimeError("mono FFN launch: MoE weights not in aiter's shuffle")
         if len(self.shared) != 2 * len(_SHARED):
             raise RuntimeError(
-                f"SGLANG_ROCM_MONO_DECODE: shared-expert shards {sorted(self.shared)}"
+                f"mono FFN launch: shared-expert shards {sorted(self.shared)}"
             )
         sh = self.shared
 
@@ -255,24 +272,15 @@ class MonoFfn:
         self.shared = {}
         self._weights.check(get_parallel().tp_size)
         # first called eagerly (capture warms every graph up first), after weight loading
-        _warm_normal_path(moe, layer.input_layernorm.weight.device)
+        self.provider.warm_normal_path(moe, layer.input_layernorm.weight.device)
         return self._weights
 
     def __call__(self, part, residual, post, comb, pre):
         """Return (MoE output, residual, post, comb, pre) from wo_b's unreduced output and the seam state."""
-        out, residual, post, comb, pre = _get_runner(part.device).ffn(
+        out, residual, post, comb, pre = self.provider.runner(part.device).ffn(
             self.weights(), part, residual, post, comb, pre
         )
         return out, residual, post.view(post.shape[0], -1), comb, pre
-
-
-def ffn_launch(layer, forward_batch, rows: int) -> Optional[MonoFfn]:
-    """The layer's FFN launch when this step takes it: decode or target verify, at most ``MAX_ROWS`` rows."""
-    mono = getattr(layer, "mono_ffn", None)
-    mode = forward_batch.forward_mode
-    if mono is None or not (mode.is_decode() or mode.is_target_verify()):
-        return None
-    return mono if 1 <= rows <= MAX_ROWS else None
 
 
 _k1_kernels: dict = {}
@@ -322,10 +330,11 @@ def _e8m0(scale: torch.Tensor) -> torch.Tensor:
 class MonoK1:
     """One standard layer's K1 launch: the attention mHC seam and the attention front."""
 
-    def __init__(self, layer):
+    def __init__(self, layer, *, provider: DSV41MonoProvider):
         self.layer = layer
+        self.provider = provider
         self._weights = None
-        # (wqkv_a, wq_b) as loaded, from stash_k1_weights
+        # (wqkv_a, wq_b) as loaded, from DSV41MonoProvider.post_load_weights
         self.plain = None
         self.cos_sin = _cos_sin(layer.self_attn.freqs_cis)
 
@@ -335,7 +344,7 @@ class MonoK1:
         layer, a = self.layer, self.layer.self_attn
         heads = a.n_local_heads
         if self.plain is None:
-            raise RuntimeError("stash_k1_weights did not run after loading")
+            raise RuntimeError("K1: post_load_weights did not run after loading")
 
         def fp8(lin, plain, shape):
             # the FP8 linear method may rewrite the weight in place; K1 reads the row-major copy
@@ -400,7 +409,7 @@ class MonoK1:
         )
 
         M = x.shape[0]
-        r = _get_runner(x.device)
+        r = self.provider.runner(x.device)
         w = self.weights()
         if r.q.shape[1] != self.layer.self_attn.n_local_heads:
             raise RuntimeError(
@@ -481,28 +490,3 @@ class MonoK1:
             stream=torch.cuda.current_stream(),
         )
         return r.q[:M], r.res_mid[:M], r.post_a[:M], r.comb_a[:M], r.pre_a[:M]
-
-
-def stash_k1_weights(layers) -> None:
-    """Copy the K1 layers' row-major wqkv_a and wq_b weights before the FP8 linear method rewrites them."""
-    for layer in layers:
-        k1 = getattr(layer, "mono_k1", None)
-        if k1 is not None:
-            a = layer.self_attn
-            k1.plain = (
-                a.wqkv_a.weight.detach().clone(),
-                a.wq_b.weight.detach().clone(),
-            )
-
-
-def k1_launch(layer, forward_batch, pending_post, prev_pre) -> Optional[MonoK1]:
-    """Return the layer's K1 launch when this step takes it, else None."""
-    k1 = getattr(layer, "mono_k1", None)
-    if k1 is None or pending_post is None or prev_pre is None:
-        return None
-    x, residual, post, _ = pending_post
-    if x is None or post is None:
-        return None
-    return (
-        k1 if ffn_launch(layer, forward_batch, residual.shape[0]) is not None else None
-    )

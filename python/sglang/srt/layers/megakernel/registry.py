@@ -29,7 +29,13 @@ logger = logging.getLogger(__name__)
 ProviderFactory = Callable[[str], MegaKernelProvider]
 
 # name -> factory, or "module:attr" resolved on first selection
-_FACTORIES: Dict[str, Union[ProviderFactory, str]] = {}
+_DSV41_MONO = (
+    "sglang.srt.models.deepseek_common.amd.dsv41_mono_decode:DSV41MonoProvider"
+)
+_FACTORIES: Dict[str, Union[ProviderFactory, str]] = {
+    "dsv41_mono": _DSV41_MONO,
+    "dsv41_mono_k1": _DSV41_MONO,
+}
 # backend name -> validated provider; one entry per process
 _ACTIVE: Dict[str, MegaKernelProvider] = {}
 

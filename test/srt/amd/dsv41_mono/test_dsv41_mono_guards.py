@@ -6,6 +6,8 @@ import types
 
 from sglang.srt.models.deepseek_common.amd.dsv41_mono_decode import (
     _MODEL,
+    MAX_ROWS,
+    DSV41MonoProvider,
     unsupported_model,
 )
 
@@ -37,31 +39,28 @@ def warm_widths():
     """The normal-path warmup's token counts over two calls: 1..MAX_ROWS once."""
     import torch
 
-    from sglang.srt.models.deepseek_common.amd import dsv41_mono_decode as m
-
     seen = []
     moe = types.SimpleNamespace(
         forward_normal=lambda x, return_moe_output: seen.append(x.shape[0])
     )
+    provider = DSV41MonoProvider("dsv41_mono")
     sync, torch.cuda.synchronize = torch.cuda.synchronize, lambda device=None: None
     try:
-        m._warm_normal_path(moe, torch.device("cpu"))
-        m._warm_normal_path(moe, torch.device("cpu"))
+        provider.warm_normal_path(moe, torch.device("cpu"))
+        provider.warm_normal_path(moe, torch.device("cpu"))
     finally:
         torch.cuda.synchronize = sync
-    return seen == list(range(1, m.MAX_ROWS + 1))
+    return seen == list(range(1, MAX_ROWS + 1))
 
 
 def spec_cases(cfg):
-    """The deployment guard lets None / 'none' / DSpark (static verify) through and rejects the rest."""
+    """The capability admits none / DSpark only; the provider also needs static verify under DSpark."""
     from sglang.srt.models.deepseek_common.amd import dsv41_mono_decode as m
 
-    only, static, gpu = (
-        "supports speculative decoding with DSpark only",
-        "needs SGLANG_RAGGED_VERIFY_MODE=static with DSpark",
-        "needs gfx950",
-    )
+    allowed = DSV41MonoProvider.capability.speculative_algorithms
+    static, gpu = "needs SGLANG_RAGGED_VERIFY_MODE=static with DSpark", "needs gfx950"
     fails = []
+    provider = DSV41MonoProvider("dsv41_mono")
     get_spec, gfx95 = m.get_spec, m.is_gfx95_supported
     ragged = os.environ.pop("SGLANG_RAGGED_VERIFY_MODE", None)
     # without a GPU the next check stops at "needs gfx950"
@@ -69,22 +68,24 @@ def spec_cases(cfg):
     try:
         cases = [
             (None, None, gpu),
-            ("none", None, gpu),
             ("NONE", None, gpu),
             ("DSPARK", None, gpu),
             ("dspark", "static", gpu),
             ("DSPARK", "compact", static),
-            ("NEXTN", None, only),
-            ("EAGLE", None, only),
-            ("EAGLE3", None, only),
+            ("NEXTN", None, "capability"),
+            ("EAGLE", None, "capability"),
+            ("EAGLE3", None, "capability"),
         ]
         for algo, mode, want in cases:
             if mode is None:
                 os.environ.pop("SGLANG_RAGGED_VERIFY_MODE", None)
             else:
                 os.environ["SGLANG_RAGGED_VERIFY_MODE"] = mode
-            m.get_spec = lambda: types.SimpleNamespace(speculative_algorithm=algo)
-            why = m._unsupported(cfg)
+            if (algo or "NONE").upper() not in allowed:
+                why = "capability"
+            else:
+                m.get_spec = lambda: types.SimpleNamespace(speculative_algorithm=algo)
+                why = provider.unsupported(cfg)
             ok = why == want
             print(
                 f"  {'PASS' if ok else 'FAIL'} speculative_algorithm={algo!r} ragged={mode!r}: {why}"
@@ -101,17 +102,28 @@ def spec_cases(cfg):
 
 def step_cases():
     """The FFN launch (and K1 through it) takes decode and target-verify steps of 1..MAX_ROWS rows, nothing else."""
+    from sglang.srt.layers.megakernel import LayerMegaKernel, MegaKernelScope
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
-    from sglang.srt.models.deepseek_common.amd import dsv41_mono_decode as m
+    from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
+        _k1_launch,
+    )
 
     ffn, k1 = object(), object()
-    layer = types.SimpleNamespace(mono_ffn=ffn, mono_k1=k1)
+    layer = types.SimpleNamespace(
+        megakernel=LayerMegaKernel(
+            provider=DSV41MonoProvider("dsv41_mono_k1"),
+            launches={
+                MegaKernelScope.LAYER_FFN: ffn,
+                MegaKernelScope.LAYER_ATTN_FRONT: k1,
+            },
+        )
+    )
     fails, n = [], 0
     for mode in ForwardMode:
         takes = mode in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY)
         for rows in (0, 1, 4, 6, 12, 48, 49):
             fb = types.SimpleNamespace(forward_mode=mode)
-            want = takes and 1 <= rows <= m.MAX_ROWS
+            want = takes and 1 <= rows <= MAX_ROWS
             pending = (
                 object(),
                 types.SimpleNamespace(shape=(rows,)),
@@ -119,8 +131,11 @@ def step_cases():
                 object(),
             )
             got = (
-                m.ffn_launch(layer, fb, rows) is ffn,
-                m.k1_launch(layer, fb, pending, object()) is k1,
+                layer.megakernel.launch(
+                    MegaKernelScope.LAYER_FFN, forward_batch=fb, rows=rows
+                )
+                is ffn,
+                _k1_launch(layer, fb, pending, object()) is k1,
             )
             n += 1
             if got != (want, want):
@@ -132,45 +147,34 @@ def step_cases():
 
 
 def draft_layer_cases(cfg):
-    """init_layer leaves draft layers (mlp.is_nextn) on the normal path and still checks target layers."""
-    from sglang.srt.models.deepseek_common.amd import dsv41_mono_decode as m
+    """Draft layers (mlp.is_nextn) bind no launch; an opted-in target layer is still checked."""
+    from sglang.srt.layers.megakernel import MegaKernelScope, bind_layer, registry
+    from sglang.srt.runtime_context import get_context
 
     fails = []
-    old, gfx95, get_spec = (
-        os.environ.get("SGLANG_ROCM_MONO_DECODE"),
-        m.is_gfx95_supported,
-        m.get_spec,
+    provider = DSV41MonoProvider("dsv41_mono_k1")
+    draft = types.SimpleNamespace(
+        mlp=types.SimpleNamespace(is_nextn=True, is_hash=False),
+        hc_boundary_fused=True,
     )
-    os.environ["SGLANG_ROCM_MONO_DECODE"] = "1"
-    m.is_gfx95_supported = lambda: False
-    m.get_spec = lambda: types.SimpleNamespace(speculative_algorithm="DSPARK")
+    ok = all(provider.bind_layer(draft, s) is None for s in MegaKernelScope)
+    print(f"  {'PASS' if ok else 'FAIL'} draft layer: no launches")
+    if not ok:
+        fails.append("draft layer")
+    target = types.SimpleNamespace(
+        mlp=types.SimpleNamespace(is_nextn=False), config=cfg
+    )
+    registry._ACTIVE.clear()
     try:
-        draft = types.SimpleNamespace(
-            mlp=types.SimpleNamespace(is_nextn=True), config=None
-        )
-        m.init_layer(draft)
-        ok = draft.mono_ffn is None and draft.mono_k1 is None
-        print(f"  {'PASS' if ok else 'FAIL'} draft layer: no launches, no check")
-        if not ok:
-            fails.append("draft layer")
-        target = types.SimpleNamespace(
-            mlp=types.SimpleNamespace(is_nextn=False), config=cfg
-        )
-        try:
-            m.init_layer(target)
-            why = None
-        except ValueError as e:
-            why = str(e)
-        ok = why == "SGLANG_ROCM_MONO_DECODE needs gfx950."
-        print(f"  {'PASS' if ok else 'FAIL'} target layer still checked: {why}")
-        if not ok:
-            fails.append("target layer")
-    finally:
-        m.is_gfx95_supported, m.get_spec = gfx95, get_spec
-        if old is None:
-            os.environ.pop("SGLANG_ROCM_MONO_DECODE", None)
-        else:
-            os.environ["SGLANG_ROCM_MONO_DECODE"] = old
+        with get_context().override_server_args(megakernel_backend="dsv41_mono"):
+            bind_layer(target, hf_config=cfg, scopes=(MegaKernelScope.LAYER_FFN,))
+        why = None
+    except ValueError as e:
+        why = str(e)
+    ok = why is not None and why.startswith("--megakernel-backend dsv41_mono ")
+    print(f"  {'PASS' if ok else 'FAIL'} target layer still checked: {why}")
+    if not ok:
+        fails.append("target layer")
     return fails
 
 

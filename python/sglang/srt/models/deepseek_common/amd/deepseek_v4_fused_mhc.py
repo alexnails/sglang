@@ -9,6 +9,7 @@ if TYPE_CHECKING:
 
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
+from sglang.srt.layers.megakernel import MegaKernelScope
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.utils import should_skip_post_experts_all_reduce
 from sglang.srt.models.deepseek_v2 import MoEOutput
@@ -35,7 +36,6 @@ if _is_hip:
     from sglang.kernels.ops.layernorm.mhc_boundary_hip import (
         hc_boundary_fused_deferred,
     )
-    from sglang.srt.models.deepseek_common.amd import dsv41_mono_decode
 if _is_gfx95_supported:
     from sglang.srt.models.deepseek_common.amd.deepseek_v4_gfx95_dense import (
         post_attention_norm,
@@ -573,6 +573,24 @@ def apply_moe_mhc(x: torch.Tensor, state: MhcPostOperands) -> torch.Tensor:
     )
 
 
+def _k1_launch(layer, forward_batch, pending_post, prev_pre):
+    """The layer's attention-front launch when this step takes it and the FFN launch too."""
+    if pending_post is None or prev_pre is None:
+        return None
+    x, residual, post, _ = pending_post
+    if x is None or post is None:
+        return None
+    rows = residual.shape[0]
+    ffn = layer.megakernel.launch(
+        MegaKernelScope.LAYER_FFN, forward_batch=forward_batch, rows=rows
+    )
+    if ffn is None:
+        return None
+    return layer.megakernel.launch(
+        MegaKernelScope.LAYER_ATTN_FRONT, forward_batch=forward_batch, rows=rows
+    )
+
+
 def forward_hc_pre_from_prev_fused_boundary(
     layer,
     positions: torch.Tensor,
@@ -587,13 +605,17 @@ def forward_hc_pre_from_prev_fused_boundary(
     """ROCm form of DeepseekV4DecoderLayer.forward_hc_pre_from_prev.
     pending_post is the previous layer's unapplied FFN hc_post (x, residual, post,
     comb); with defer_post this layer's is returned the same way and hidden_states is None."""
-    k1 = dsv41_mono_decode.k1_launch(layer, forward_batch, pending_post, prev_pre)
+    k1 = _k1_launch(layer, forward_batch, pending_post, prev_pre)
     if k1 is not None:
         # K1 runs this boundary and the attention front; the attention starts from its q
         q, residual, post, comb, pre = k1(
             positions, forward_batch, *pending_post, prev_pre
         )
-        mono = dsv41_mono_decode.ffn_launch(layer, forward_batch, residual.shape[0])
+        mono = layer.megakernel.launch(
+            MegaKernelScope.LAYER_FFN,
+            forward_batch=forward_batch,
+            rows=residual.shape[0],
+        )
         with layer.self_attn.maybe_use_decode_attn_tp(forward_batch):
             x = layer.self_attn(
                 x=residual[:, 0],
@@ -622,7 +644,9 @@ def forward_hc_pre_from_prev_fused_boundary(
     x, x_quant = layer._input_norm(
         x, allow_aiter_quant=False, coefficients=attn_coefficients
     )
-    mono = dsv41_mono_decode.ffn_launch(layer, forward_batch, residual.shape[0])
+    mono = layer.megakernel.launch(
+        MegaKernelScope.LAYER_FFN, forward_batch=forward_batch, rows=residual.shape[0]
+    )
     with layer.self_attn.maybe_use_decode_attn_tp(forward_batch):
         mhc = (
             None
