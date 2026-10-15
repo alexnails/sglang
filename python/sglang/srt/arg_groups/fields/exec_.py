@@ -220,6 +220,16 @@ class ExecKernel(msgspec.Struct):
             choices=GRAMMAR_BACKEND_CHOICES,
         ),
     ] = None
+    megakernel_backend: A[
+        Optional[str],
+        Arg(
+            help="Serve eligible decode steps with a registered megakernel provider "
+            "(persistent launches replacing spans of each layer). Names come from "
+            "the megakernel registry, which out-of-tree plugins extend; a deployment "
+            "the provider cannot serve fails at startup. Steps it does not serve "
+            "take the normal path.",
+        ),
+    ] = None
     fp8_gemm_runner_backend: A[
         str,
         Arg(

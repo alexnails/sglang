@@ -32,6 +32,9 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
+from sglang.srt.layers.megakernel import (
+    prepare_before_capture as prepare_megakernel_before_capture,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -264,6 +267,7 @@ class BaseRunner(ABC):
         )
         if prepare_model_resources is not None:
             prepare_model_resources(mr)
+        prepare_megakernel_before_capture(device=torch.device(mr.device, mr.gpu_id))
 
         if should_run_flashinfer_autotune(self.model_runner):
             buffers, batch_size = self._autotune_buffers()
