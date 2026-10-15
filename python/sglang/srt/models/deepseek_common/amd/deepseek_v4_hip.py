@@ -15,6 +15,8 @@ from sglang.srt.layers.attention.hip_flash_mla import (
     hip_attention_needs_head_pad,
     resolve_hip_flashmla_backend,
 )
+from sglang.srt.layers.megakernel import MegaKernelScope
+from sglang.srt.layers.megakernel import bind_layer as bind_megakernel
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
@@ -164,6 +166,11 @@ def init_decoder_layer(layer, quant_config) -> None:
     layer._wqkv_a_native_consumer = False
     layer.hc_boundary_fused = (
         _is_gfx95_supported and layer.hc_pre_from_prev_sublayer and layer.hc_mult == 4
+    )
+    layer.megakernel = bind_megakernel(
+        layer,
+        hf_config=layer.config,
+        scopes=(MegaKernelScope.LAYER_FFN, MegaKernelScope.LAYER_ATTN_FRONT),
     )
 
 
