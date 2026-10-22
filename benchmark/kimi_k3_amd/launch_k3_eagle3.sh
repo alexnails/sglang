@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Kimi-K3 on one 8x MI350X / MI355X (gfx950) node with this branch: the measured best config (README.md, config B).
+# Kimi-K3 on one 8x MI350X / MI355X (gfx950) node with this branch: the measured config (see README.md).
 # TP8, aiter MLA prefill/decode, FP8 KV, EAGLE3 (topk 1, 3 steps, 4 draft tokens, unquantized draft),
 # chunked prefill 8192, 16 running requests, decode graphs for bs 1/2/4/8/16.
 #
