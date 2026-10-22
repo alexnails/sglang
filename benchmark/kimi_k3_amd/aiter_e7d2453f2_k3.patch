@@ -1,0 +1,49 @@
+diff --git a/csrc/cpp_itfs/torch_utils.py b/csrc/cpp_itfs/torch_utils.py
+index 39b485fb1..489ca6467 100644
+--- a/csrc/cpp_itfs/torch_utils.py
++++ b/csrc/cpp_itfs/torch_utils.py
+@@ -54,8 +54,15 @@ def torch_to_c_types(*args):
+             c_args.append(ctypes.POINTER(ctypes.c_int)())
+         elif isinstance(arg, torch.Tensor):
+             c_args.append(ctypes.cast(arg.data_ptr(), ctypes.c_void_p))
+-        elif isinstance(arg, torch.cuda.Stream):
+-            c_args.append(ctypes.cast(arg.cuda_stream, ctypes.c_void_p))
++        elif isinstance(arg, torch.Stream):
++            handle = getattr(arg, "cuda_stream", None)
++            if handle is None:
++                handle = torch.cuda.Stream(
++                    stream_id=arg.stream_id,
++                    device_index=arg.device_index,
++                    device_type=arg.device_type,
++                ).cuda_stream
++            c_args.append(ctypes.cast(handle, ctypes.c_void_p))
+         else:
+             if type(arg) not in ctypes_map:
+                 raise ValueError(f"Unsupported type: {type(arg)}")
+diff --git a/csrc/include/custom_all_reduce.cuh b/csrc/include/custom_all_reduce.cuh
+index 042337547..aa851976d 100644
+--- a/csrc/include/custom_all_reduce.cuh
++++ b/csrc/include/custom_all_reduce.cuh
+@@ -4534,8 +4534,21 @@ class CustomAllreduce
+             int       ll128_bs = 0; // >0 -> LL128 with this block size
+             if(world_size_ == 8)
+             {
+-                if(numel <= 4 * 8192)
++                // K3's joint [latent 3584 | shared 7168] MoE reduction at 4 tokens.
++                // AITER_AR8_LL_MAX / AITER_AR8_LL128_MAX (elements) override the
++                // cutoffs for protocol sweeps; read once.
++                static const int ll_max = [] {
++                    const char* e = std::getenv("AITER_AR8_LL_MAX");
++                    return e ? std::atoi(e) : 4 * (7168 + 3584);
++                }();
++                static const int ll128_max = [] {
++                    const char* e = std::getenv("AITER_AR8_LL128_MAX");
++                    return e ? std::atoi(e) : 0;
++                }();
++                if(numel <= ll_max)
+                     ll_bs = 256;
++                else if(numel <= ll128_max)
++                    ll128_bs = 256;
+             }
+             else if(world_size_ == 4)
+             {
