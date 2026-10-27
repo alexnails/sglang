@@ -1,6 +1,9 @@
+import concurrent.futures
 import importlib.util
 import queue
 import sys
+import threading
+import time
 import unittest
 from types import ModuleType, SimpleNamespace
 from unittest.mock import ANY, Mock, patch
@@ -8,7 +11,7 @@ from unittest.mock import ANY, Mock, patch
 import numpy as np
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import CommonKVSender
+from sglang.srt.disaggregation.common.conn import CommonKVManager, CommonKVSender
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager
 from sglang.srt.disaggregation.utils import DisaggregationMode
@@ -48,6 +51,65 @@ class FakePPStatus(dict):
 
     def collect(self, room):
         return [self.get(room), self.peer.get(room)]
+
+
+def make_dp_attention_sender(room, *, tp_rank, tp_size=4, post):
+    manager = object.__new__(CommonKVManager)
+    manager.disaggregation_mode = DisaggregationMode.PREFILL
+    manager.deferred_bootstrap = None
+    manager.is_dummy_cp_rank = False
+    manager.attn_tp_rank, manager.attn_tp_size = tp_rank, tp_size
+    manager.attn_cp_rank = manager.pp_rank = 0
+    manager.attn_dp_rank = 1
+    manager.sender_trace_module = None
+    manager.update_status = Mock()
+    manager._dp_rank_register_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1
+    )
+    parallel = SimpleNamespace(num_dp_ranks=2, load_balance_method="round_robin")
+    with (
+        patch(
+            "sglang.srt.disaggregation.common.conn.get_parallel", return_value=parallel
+        ),
+        patch("sglang.srt.disaggregation.common.conn.requests.post", post),
+    ):
+        with get_context().override_server_args(enable_trace=False):
+            CommonKVSender(manager, "bootstrap:8998", room)
+    return manager._dp_rank_register_executor
+
+
+class TestRegisterPrefillDpRank(unittest.TestCase):
+    def test_only_one_rank_per_room_posts(self):
+        counts = []
+        for tp_rank in range(4):
+            post = Mock(return_value=SimpleNamespace(status_code=200))
+            make_dp_attention_sender(6, tp_rank=tp_rank, post=post).shutdown(wait=True)
+            counts.append(post.call_count)
+        self.assertEqual(counts, [0, 0, 1, 0])
+
+    def test_posting_rank_sends_room_and_dp_rank(self):
+        post = Mock(return_value=SimpleNamespace(status_code=200))
+        make_dp_attention_sender(5, tp_rank=1, post=post).shutdown(wait=True)
+        post.assert_called_once_with(
+            "http://bootstrap:8998/register_dp_rank",
+            json={"bootstrap_room": 5, "dp_rank": 1},
+            timeout=5,
+        )
+
+    def test_sender_init_does_not_wait_for_the_post(self):
+        release = threading.Event()
+        post = Mock(
+            side_effect=lambda *a, **k: (
+                release.wait(10) and SimpleNamespace(status_code=200)
+            )
+        )
+        start = time.monotonic()
+        executor = make_dp_attention_sender(4, tp_rank=0, post=post)
+        elapsed = time.monotonic() - start
+        release.set()
+        executor.shutdown(wait=True)
+        self.assertLess(elapsed, 1.0)
+        post.assert_called_once()
 
 
 class TestCommonSenderLifecycle(unittest.TestCase):

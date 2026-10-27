@@ -446,6 +446,9 @@ class CommonKVManager(BaseKVManager):
                 self.bootstrap_port
             )
             self.register_to_bootstrap()
+            self._dp_rank_register_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="register-dp-rank"
+            )
             self.transfer_infos = {}
             self.req_to_decode_prefix_len: Dict[int, int] = {}
             self.decode_kv_args_table = {}
@@ -2180,12 +2183,22 @@ class CommonKVSender(BaseKVSender):
         self.init_time = time.time()
 
     def _register_prefill_dp_rank(self):
-        """Register this request's prefill dp_rank to the bootstrap server."""
+        mgr = self.kv_mgr
+        if (
+            mgr.attn_tp_rank != self.bootstrap_room % mgr.attn_tp_size
+            or mgr.attn_cp_rank != 0
+            or mgr.pp_rank != 0
+        ):
+            return
         url = f"http://{self.bootstrap_server_url}/register_dp_rank"
         payload = {
             "bootstrap_room": self.bootstrap_room,
-            "dp_rank": self.kv_mgr.attn_dp_rank,
+            "dp_rank": mgr.attn_dp_rank,
         }
+        mgr._dp_rank_register_executor.submit(self._post_prefill_dp_rank, url, payload)
+
+    @staticmethod
+    def _post_prefill_dp_rank(url: str, payload: dict):
         try:
             response = requests.post(url, json=payload, timeout=5)
             if response.status_code != 200:
