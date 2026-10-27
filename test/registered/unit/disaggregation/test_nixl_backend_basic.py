@@ -1,5 +1,6 @@
 """Basic CPU unit tests for NIXL disaggregation control paths."""
 
+import dataclasses
 import json
 import os
 import sys
@@ -1139,6 +1140,58 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
             0,
         )
         self.assertEqual(handle, ("dropped", mgr.agent.sections["dropped"]))
+
+    def _replace_peer(self, mgr, old_name, listening=False, rooms=None, **identity):
+        new_info = dataclasses.replace(
+            mgr.decode_kv_args_table[old_name],
+            agent_name="restarted",
+            agent_metadata=b"restarted",
+            dst_port=6666,
+            **identity,
+        )
+        mgr.transfer_infos = rooms or {}
+        mgr._replaced_peers = set()
+        with patch.object(
+            NixlKVManager, "_decode_endpoint_is_listening", return_value=listening
+        ):
+            mgr._mark_replaced_peers(new_info)
+        mgr._reap_replaced_peers()
+        return new_info
+
+    def test_restarted_decode_rank_retires_the_old_peer(self):
+        """A re-registration from the same decode rank under a new agent name
+        drops the old peer's state and its NIXL remote agent."""
+        mgr = self._make_manager(["old"])
+        self._replace_peer(mgr, "old")
+        self.assertNotIn("old", mgr.decode_kv_args_table)
+        self.assertNotIn("old", mgr.prep_handles)
+        self.assertNotIn("old", mgr.agent.sections)
+
+    def test_retirement_waits_for_rooms_still_targeting_the_old_peer(self):
+        """A replaced peer that an in-flight room still targets is kept until
+        that room is gone."""
+        mgr = self._make_manager(["old"])
+        self._replace_peer(mgr, "old", rooms={7: {"old": object()}})
+        self.assertIn("old", mgr.decode_kv_args_table)
+        self.assertIn("old", mgr.agent.sections)
+        mgr.transfer_infos.clear()
+        mgr._reap_replaced_peers()
+        self.assertNotIn("old", mgr.decode_kv_args_table)
+        self.assertNotIn("old", mgr.agent.sections)
+
+    def test_other_decode_rank_or_live_old_endpoint_retires_nothing(self):
+        """A registration from a different rank, or whose old endpoint still
+        accepts connections, must not retire the existing peer."""
+        for listening, identity in (
+            (False, {"decode_tp_rank": 1}),
+            (False, {"endpoint": "127.0.0.2"}),
+            (False, {"gpu_id": 1}),
+            (True, {}),
+        ):
+            mgr = self._make_manager(["old"])
+            self._replace_peer(mgr, "old", listening=listening, **identity)
+            self.assertIn("old", mgr.decode_kv_args_table, (listening, identity))
+            self.assertIn("old", mgr.agent.sections, (listening, identity))
 
 
 if __name__ == "__main__":
