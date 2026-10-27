@@ -1,5 +1,6 @@
 """Basic CPU unit tests for NIXL disaggregation control paths."""
 
+import itertools
 import json
 import os
 import sys
@@ -24,6 +25,7 @@ from sglang.srt.disaggregation.nixl.conn import (
     TransferKVChunk,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -557,6 +559,66 @@ class TestNixlTransferWorker(CustomTestCase):
         self.assertEqual(
             mgr.send_kv_status_message.call_args.kwargs["status"], KVPoll.Failed
         )
+
+    def _in_thread(self, fn, timeout=10):
+        out = []
+        t = threading.Thread(target=lambda: out.append(fn()), daemon=True)
+        t.start()
+        t.join(timeout)
+        return out
+
+    def _clock(self, step):
+        return patch(
+            "sglang.srt.disaggregation.nixl.conn.time.monotonic",
+            side_effect=(i * step for i in itertools.count()),
+        )
+
+    def test_transfer_that_never_completes_fails_after_the_waiting_timeout(self):
+        """A handle stuck in PROC is reported unsettled and failed, not waited on forever."""
+        mgr = object.__new__(NixlKVManager)
+        mgr.agent = SimpleNamespace(check_xfer_state=lambda handle: "PROC")
+        with (
+            self._clock(100.0),
+            envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.override(300),
+        ):
+            out = self._in_thread(
+                lambda: mgr._await_handles(["kv"], failure_seen=False)
+            )
+        self.assertEqual(out, [(False, True)])
+
+    def test_stuck_transfer_fails_its_room_and_the_worker_moves_on(self):
+        """A room whose transfer never completes ends Failed instead of holding the worker."""
+        room = 26
+        mgr = self._make_manager(room)
+        mgr.send_kvcache = MagicMock(return_value="kv")
+        mgr.send_aux = MagicMock(return_value="aux")
+        mgr.agent.check_xfer_state = lambda handle: "PROC"
+        mgr.poison_deferred_ack_room = MagicMock()
+        mgr._reload_invalidated_peers = MagicMock()
+        chunk = self._make_chunk(room, [1], is_last_chunk=True)
+        with (
+            self._clock(100.0),
+            patch(
+                "sglang.srt.disaggregation.nixl.conn.NIXL_ERR_SETTLE_TIMEOUT_S", 0.01
+            ),
+            envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.override(300),
+        ):
+            out = self._in_thread(lambda: self._run_worker_once(mgr, chunk))
+        self.assertEqual(out, [None])
+        self.assertEqual(mgr.request_status[room], KVPoll.Failed)
+
+    def test_transfer_completing_before_the_waiting_timeout_is_not_failed(self):
+        mgr = object.__new__(NixlKVManager)
+        states = iter(["PROC", "PROC", "DONE"])
+        mgr.agent = SimpleNamespace(check_xfer_state=lambda handle: next(states))
+        with (
+            self._clock(100.0),
+            envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.override(300),
+        ):
+            out = self._in_thread(
+                lambda: mgr._await_handles(["kv"], failure_seen=False)
+            )
+        self.assertEqual(out, [(True, False)])
 
     def _make_staging_manager(self, room):
         mgr = self._make_manager(room)
