@@ -1141,5 +1141,74 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
         self.assertEqual(handle, ("dropped", mgr.agent.sections["dropped"]))
 
 
+class TestNixlPeerRefusal(CustomTestCase):
+    def _make_manager(self):
+        mgr = object.__new__(NixlKVManager)
+        mgr.agent = ReloadFakeAgent()
+        mgr.disaggregation_mode = DisaggregationMode.PREFILL
+        mgr.decode_kv_args_table = {}
+        mgr.prep_handles = {}
+        mgr.prep_handles_slice_dst = {}
+        mgr._prepared_state_plans = {}
+        mgr._refused_peers = {}
+        mgr.request_status = {}
+        mgr.failure_records = {}
+        mgr.failure_lock = threading.Lock()
+        mgr.deferred_bootstrap = None
+        mgr._deferred_ack_targets = {}
+        mgr._deferred_ack_poisoned_rooms = set()
+        mgr._staging_outstanding = {}
+        mgr.transfer_infos = {}
+        mgr.requires_dcp_relayout = lambda size, rank: False
+        mgr.check_peer_aux_buffer_count = MagicMock()
+        mgr._prepare_state_xfer = MagicMock()
+
+        def prepare_payload(info):
+            mgr.prep_handles[info.agent_name] = object()
+            if info.agent_name == "bad":
+                raise ValueError("unsupported layout")
+
+        mgr._prepare_payload_xfer = prepare_payload
+        return mgr
+
+    def _register(self, mgr, name):
+        info = SimpleNamespace(
+            agent_name=name,
+            agent_metadata=name.encode("ascii"),
+            dst_dcp_size=1,
+            dst_dcp_rank=0,
+            dst_aux_ptrs=[0],
+        )
+        with patch.object(KVArgsRegisterInfo, "from_zmq", return_value=info):
+            mgr._handle_decode_message([b"None", b"", b"", name.encode("ascii")])
+
+    def test_failed_peer_registration_keeps_the_bootstrap_loop_serving_peers(self):
+        """A peer whose registration raises must not stop later peers from registering."""
+        mgr = self._make_manager()
+        self._register(mgr, "bad")
+        self._register(mgr, "good")
+        self.assertIn("good", mgr.decode_kv_args_table)
+        self.assertNotIn("bad", mgr.decode_kv_args_table)
+        self.assertNotIn("bad", mgr.prep_handles)
+        self.assertFalse(mgr.agent.check_remote_metadata("bad"))
+        self.assertTrue(mgr.agent.check_remote_metadata("good"))
+
+    def test_room_addressed_to_a_refused_peer_fails_instead_of_pending(self):
+        """A room for a refused peer fails with the refusal reason; other peers' rooms are unaffected."""
+        mgr = self._make_manager()
+        self._register(mgr, "bad")
+        mgr._handle_decode_message([b"7", b"", b"", b"bad"])
+        self.assertEqual(mgr.request_status[7], KVPoll.Failed)
+        self.assertIn("unsupported layout", mgr.failure_records[7])
+        self.assertNotIn(7, mgr.transfer_infos)
+
+        self._register(mgr, "good")
+        info = SimpleNamespace(required_dst_info_num=2)
+        with patch.object(TransferInfo, "from_zmq", return_value=info):
+            mgr._handle_decode_message([b"8", b"", b"", b"good"])
+        self.assertIn("good", mgr.transfer_infos[8])
+        self.assertNotIn(8, mgr.request_status)
+
+
 if __name__ == "__main__":
     unittest.main()

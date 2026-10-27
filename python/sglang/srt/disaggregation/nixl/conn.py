@@ -635,6 +635,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self._state_layout_rejections: Dict[str, str] = {}
         self.kv_buffer_tensors = None
         self.prep_handles: Dict[str, Any] = {}
+        self._refused_peers: Dict[str, str] = {}
         self.prep_handle_slice_src: Optional[Tuple[Any, int, int, int]] = (
             None  # (handle, num_groups, num_ptr_pairs, num_slots)
         )
@@ -3352,6 +3353,74 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self.register_deferred_ack_target(room_to_be_aborted, ack_target)
         self._maybe_ack_drained_abort(room_to_be_aborted)
 
+    def _register_or_refuse_peer(
+        self, waiting_req_bytes: List[bytes], agent_name: str
+    ) -> None:
+        try:
+            self._add_remote_peer(KVArgsRegisterInfo.from_zmq(waiting_req_bytes))
+        except Exception as e:
+            self._rollback_remote_peer(agent_name)
+            reason = f"{type(e).__name__}: {e}"
+            self._refused_peers[agent_name] = reason
+            logger.error(
+                "Refused decode peer %s at registration: %s", agent_name, reason
+            )
+            return
+        self._refused_peers.pop(agent_name, None)
+        logger.debug(f"Register KVArgs from {agent_name} successfully")
+
+    def _rollback_remote_peer(self, agent_name: str) -> None:
+        self.decode_kv_args_table.pop(agent_name, None)
+        self.prep_handles.pop(agent_name, None)
+        self.prep_handles_slice_dst.pop(agent_name, None)
+        self._prepared_state_plans.pop(agent_name, None)
+        try:
+            if self.agent.check_remote_metadata(agent_name):
+                self.agent.remove_remote_agent(agent_name)
+        except Exception:
+            logger.exception("Failed to unload refused NIXL peer %s", agent_name)
+
+    def _fail_room_of_refused_peer(self, room: int, agent_name: str) -> bool:
+        reason = self._refused_peers.get(agent_name)
+        if reason is None:
+            return False
+        self.record_failure(
+            room, f"Decode peer {agent_name} was refused at registration: {reason}"
+        )
+        self.update_status(room, KVPoll.Bootstrapping)
+        self.update_status(room, KVPoll.Failed)
+        return True
+
+    def _handle_decode_message(self, waiting_req_bytes: List[bytes]) -> None:
+        room = waiting_req_bytes[0].decode("ascii")
+        agent_name = waiting_req_bytes[3].decode("ascii")
+        if room == "None":
+            # Register new peer and save KV base pointers.
+            self._register_or_refuse_peer(waiting_req_bytes, agent_name)
+            return
+        room = int(room)
+        if self._fail_room_of_refused_peer(room, agent_name):
+            return
+        if room not in self.transfer_infos:
+            self.transfer_infos[room] = {}
+        self.transfer_infos[room][agent_name] = TransferInfo.from_zmq(waiting_req_bytes)
+        required_dst_info_num = self.transfer_infos[room][
+            agent_name
+        ].required_dst_info_num
+        logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
+        if len(self.transfer_infos[room]) == required_dst_info_num:
+            self.resolve_kv_replica_factor(self.transfer_infos[room])
+            self.req_to_decode_prefix_len[room] = next(
+                (
+                    info.decode_prefix_len
+                    for info in self.transfer_infos[room].values()
+                    if info.decode_prefix_len is not None
+                ),
+                0,
+            )
+            logger.debug(f"{room=} is bootstrapped")
+            self.update_status(room, KVPoll.WaitingForInput)
+
     def _start_bootstrap_thread(self):
         def bootstrap_thread():
             """This thread recvs transfer info from the decode engine"""
@@ -3379,38 +3448,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 assert waiting_req_bytes[0] == GUARD, (
                     f"First message should be {GUARD}. Foreign traffic?"
                 )
-                waiting_req_bytes = waiting_req_bytes[1:]
-                room = waiting_req_bytes[0].decode("ascii")
-                agent_name = waiting_req_bytes[3].decode("ascii")
-                if room == "None":
-                    # Register new peer and save KV base pointers.
-                    self._add_remote_peer(
-                        KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
-                    )
-                    logger.debug(f"Register KVArgs from {agent_name} successfully")
-                    continue
-                room = int(room)
-                if room not in self.transfer_infos:
-                    self.transfer_infos[room] = {}
-                self.transfer_infos[room][agent_name] = TransferInfo.from_zmq(
-                    waiting_req_bytes
-                )
-                required_dst_info_num = self.transfer_infos[room][
-                    agent_name
-                ].required_dst_info_num
-                logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
-                if len(self.transfer_infos[room]) == required_dst_info_num:
-                    self.resolve_kv_replica_factor(self.transfer_infos[room])
-                    self.req_to_decode_prefix_len[room] = next(
-                        (
-                            info.decode_prefix_len
-                            for info in self.transfer_infos[room].values()
-                            if info.decode_prefix_len is not None
-                        ),
-                        0,
-                    )
-                    logger.debug(f"{room=} is bootstrapped")
-                    self.update_status(room, KVPoll.WaitingForInput)
+                self._handle_decode_message(waiting_req_bytes[1:])
 
         def bootstrap_thread_guarded():
             try:
