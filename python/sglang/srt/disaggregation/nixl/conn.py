@@ -1121,7 +1121,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             if all_settled:
                 return True, any_failed
             if not any_failed:
-                time.sleep(0)
+                time.sleep(envs.SGLANG_DISAGGREGATION_NIXL_POLL_INTERVAL_S.get())
                 continue
             # This room is already lost, so trade its notification for the
             # worker's other rooms: back off, and give up waiting for the
