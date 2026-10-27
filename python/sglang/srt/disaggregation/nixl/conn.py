@@ -1098,13 +1098,18 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
     ) -> Tuple[bool, bool]:
         """Poll until every handle settled. Returns ``(settled, any_failed)``.
 
-        The wait is unbounded while every handle is still healthy, and bounded
-        to NIXL_ERR_SETTLE_TIMEOUT_S from the moment the batch is known broken.
+        The wait while every handle is still healthy is bounded to
+        SGLANG_DISAGGREGATION_WAITING_TIMEOUT, after which the batch counts as
+        failed and unsettled. Once the batch is known broken it is bounded to
+        NIXL_ERR_SETTLE_TIMEOUT_S.
         ``failure_seen`` arms that deadline up front, for a batch that raised
         before the barrier ran. A state that cannot be read counts as running,
         since it does not prove the write into the decode's pages is over.
         """
         deadline = time.time() + NIXL_ERR_SETTLE_TIMEOUT_S if failure_seen else None
+        healthy_deadline = (
+            time.monotonic() + envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
+        )
         while True:
             all_settled = True
             any_failed = failure_seen
@@ -1121,6 +1126,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             if all_settled:
                 return True, any_failed
             if not any_failed:
+                if time.monotonic() >= healthy_deadline:
+                    logger.warning(
+                        "NIXL transfer still running after "
+                        f"{envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()}s"
+                    )
+                    return False, True
                 time.sleep(0)
                 continue
             # This room is already lost, so trade its notification for the
