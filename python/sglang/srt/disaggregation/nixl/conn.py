@@ -4,6 +4,7 @@ import dataclasses
 import json
 import logging
 import os
+import socket
 import struct
 import threading
 import time
@@ -644,6 +645,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self._num_slots_src: int = 0
         self._peer_reload_lock = threading.Lock()
         self._peer_reload_times: Dict[str, float] = {}
+        self._replaced_peers: set = set()
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             if self.kv_args.kv_item_lens:
@@ -2046,6 +2048,61 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             self._prepare_payload_xfer(decode_kv_args)
             self._prepare_state_xfer(decode_kv_args)
 
+    @staticmethod
+    def _is_same_decode_rank(old: KVArgsRegisterInfo, new: KVArgsRegisterInfo) -> bool:
+        return (
+            old.agent_name != new.agent_name
+            and old.endpoint == new.endpoint
+            and old.gpu_id == new.gpu_id
+            and old.decode_tp_size == new.decode_tp_size
+            and old.decode_tp_rank == new.decode_tp_rank
+            and old.dst_dcp_size == new.dst_dcp_size
+            and old.dst_dcp_rank == new.dst_dcp_rank
+        )
+
+    @staticmethod
+    def _decode_endpoint_is_listening(endpoint: str, port: int) -> bool:
+        try:
+            with socket.create_connection((endpoint, port), timeout=1.0):
+                return True
+        except OSError:
+            return False
+
+    def _mark_replaced_peers(self, new_info: KVArgsRegisterInfo) -> None:
+        for old in list(self.decode_kv_args_table.values()):
+            if old.agent_name in self._replaced_peers:
+                continue
+            if not self._is_same_decode_rank(old, new_info):
+                continue
+            if old.dst_port != new_info.dst_port and (
+                self._decode_endpoint_is_listening(old.endpoint, old.dst_port)
+            ):
+                continue
+            logger.info(
+                "Decode peer %s was replaced by %s; retiring it",
+                old.agent_name,
+                new_info.agent_name,
+            )
+            self._replaced_peers.add(old.agent_name)
+
+    def _reap_replaced_peers(self) -> None:
+        for agent_name in list(self._replaced_peers):
+            if any(agent_name in infos for infos in list(self.transfer_infos.values())):
+                continue
+            with self._peer_reload_lock:
+                self.decode_kv_args_table.pop(agent_name, None)
+                self.prep_handles.pop(agent_name, None)
+                self.prep_handles_slice_dst.pop(agent_name, None)
+                self._prepared_state_plans.pop(agent_name, None)
+                self._peer_reload_times.pop(agent_name, None)
+                try:
+                    self.agent.remove_remote_agent(agent_name)
+                except Exception:
+                    logger.exception(
+                        "Failed to remove NIXL remote agent %s", agent_name
+                    )
+            self._replaced_peers.discard(agent_name)
+
     def _reload_invalidated_peers(self, room_transfer_infos: Dict[str, Any]) -> None:
         # NIXL drops a peer's metadata after a remote-disconnect error and never
         # restores it; reload it from the registration we already hold.
@@ -3360,6 +3417,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 logger.debug(
                     f"Received multipart with total byte size {sum(len(x) for x in waiting_req_bytes)}"
                 )
+                if self._replaced_peers:
+                    self._reap_replaced_peers()
 
                 # Staging: decode reports consumption watermark back to prefill
                 if waiting_req_bytes[0] == b"WATERMARK":
@@ -3384,9 +3443,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 agent_name = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
                     # Register new peer and save KV base pointers.
-                    self._add_remote_peer(
-                        KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
-                    )
+                    register_info = KVArgsRegisterInfo.from_zmq(waiting_req_bytes)
+                    self._add_remote_peer(register_info)
+                    if self.disaggregation_mode == DisaggregationMode.PREFILL:
+                        self._mark_replaced_peers(register_info)
+                        self._reap_replaced_peers()
                     logger.debug(f"Register KVArgs from {agent_name} successfully")
                     continue
                 room = int(room)
