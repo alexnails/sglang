@@ -1124,6 +1124,12 @@ def kda_gate_chunk_cumsum(
         )
     assert len(g.shape) == 4
     B, T, H, S = g.shape
+    if dt_bias is not None:
+        assert dt_bias.numel() == H * S, (
+            f"dt_bias must be flat [H*K]={H * S} elements (kernel indexes "
+            f"dt_bias + i_h*S + k), got {dt_bias.numel()} — undersized tensors "
+            f"read OOB into allocator pool memory"
+        )
     BT = chunk_size
     if chunk_indices is None and cu_seqlens is not None:
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
@@ -1208,6 +1214,50 @@ def chunk_kda_fwd(
     chunk_indices: Optional[torch.Tensor] = None,
     chunk_offsets: Optional[torch.Tensor] = None,
 ):
+    if (
+        q.shape[1] > 3072
+        and cu_seqlens is not None
+        and initial_state is not None
+        and track_state is None
+        and track_chunk_idx is None
+        and not output_intermediate_states
+        and q.shape[0] == 1
+        and q.shape[-1] == 128
+        and v.shape[-1] == 128
+        and is_gfx95_supported()
+    ):
+        # 3p decoupled chunk-state scan (author-kda, SkepticKDA CONFIRMED):
+        # P1 folds GS=8 chunks into per-group affine operators (parallel over
+        # groups x heads), P2 scans NT/8 group operators (8x shorter serial
+        # chain than production h-kernel), P3 reuses the fused scan_o kernel
+        # with each group as a pseudo-sequence. Capped MI350X whole-call:
+        # -6.2%t/-10.4%J @4096, -21.7%t/-22.6%J @8192, -28.0%t/-23.7%J @16384.
+        # Prototype constraints (loud asserts inside, never silent wrong):
+        # varlen batch-1, initial_state required, K=V=128, every sequence
+        # length divisible by GS*64=512, no track/intermediate states.
+        # Below the T>3072 gate production keeps the fused scan_o path.
+        from sglang.kernels.ops.attention.fla.kda_scan2p import chunk_kda_fwd_3p
+
+        return chunk_kda_fwd_3p(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            initial_state,
+            initial_state_indices,
+            cu_seqlens=cu_seqlens,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=lower_bound,
+            output_intermediate_states=output_intermediate_states,
+            track_state=track_state,
+            track_chunk_idx=track_chunk_idx,
+            beta_is_raw=beta_is_raw,
+            chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets,
+        )
     chunk_size = 64
     # Pre-compute chunk indices once and thread through all downstream kernels.
     # Without this, each of the 4 callees would recompute independently. A
