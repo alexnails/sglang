@@ -1001,10 +1001,16 @@ class AiterAttnBackend(AttentionBackend):
         num_heads_k = self.fp8_prefill_num_kv_head
         qhead_granularity = gqa_ratio
         qlen_granularity = self._prefill_qlen_granularity
-        kvlen_granularity = 128
         block_size = 1
 
         qo_indptr_cpu = qo_indptr.to("cpu", dtype=torch.int32)
+        # T-adaptive PS kv-split granularity (SkepticKVM-verified on MI350X):
+        # kvlen 1024 wins for short query chunks (-14.4% time / -14.6% J at
+        # T=2048) but falls off a reproducible +16% cliff at T=2560-2816 and
+        # loses by T=4096; the <=2048 threshold sits safely below the
+        # measured crossover (2304-2560).
+        max_q_len = int((qo_indptr_cpu[1:] - qo_indptr_cpu[:-1]).max())
+        kvlen_granularity = 1024 if max_q_len <= 2048 else 128
         kv_indptr_cpu = kv_indptr.to("cpu", dtype=torch.int32)
         seq_lens_cpu = seq_lens.to("cpu", dtype=torch.int32)
 
