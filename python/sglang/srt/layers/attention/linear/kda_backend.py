@@ -1015,7 +1015,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
             layer.bias,
             activation="silu",
             conv_states=conv_states,
-            has_initial_state=forward_batch.extend_prefix_lens > 0,
+            # author-conv: pass None when the batch has no prefix so
+            # causal_conv1d_fn's lean single-seq fast path can engage
+            # (an all-False tensor gates it off and buys nothing).
+            has_initial_state=(
+                None
+                if forward_batch.extend_prefix_lens_cpu is not None
+                and not any(forward_batch.extend_prefix_lens_cpu)
+                else forward_batch.extend_prefix_lens > 0
+            ),
             cache_indices=cache_indices,
             query_start_loc=self.forward_metadata.query_start_loc,
             seq_lens_cpu=forward_batch.extend_seq_lens_cpu,

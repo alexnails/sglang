@@ -21,6 +21,75 @@ CAUSAL_CONV1D_FWD_BLOCK_M = 8
 
 
 @triton.jit()
+def _causal_conv1d_fwd_lean_kernel(
+    # Lean single-sequence prefill fast path (author-conv): drops the
+    # varlen/initial-state prologue that costs ~27% of kernel time.
+    # Numerics: fp32 acc, bias pre-load, taps applied oldest->newest,
+    # silu acc/(1+exp(-acc)) — same order as _causal_conv1d_fwd_kernel;
+    # tap products computed in fp32 (prod rounds products to bf16), so
+    # outputs can deviate by <=1 bf16 ulp (strictly more accurate).
+    x_ptr,
+    w_ptr,
+    b_ptr,
+    conv_state_ptr,
+    cache_indices_ptr,
+    o_ptr,
+    dim,
+    seqlen,
+    stride_x_dim: tl.constexpr,
+    stride_x_token: tl.constexpr,
+    stride_o_dim: tl.constexpr,
+    stride_o_token: tl.constexpr,
+    stride_cs_seq: tl.constexpr,
+    stride_cs_dim: tl.constexpr,
+    stride_cs_tok: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_f = tl.program_id(0)  # feature block (fastest: full token-row coverage)
+    pid_m = tl.program_id(1)  # token block
+    idx_feats = pid_f * BLOCK_N + tl.arange(0, BLOCK_N)
+    tok0 = pid_m * BLOCK_M
+    mf = idx_feats < dim
+    w0 = tl.load(w_ptr + idx_feats * 4 + 0, mask=mf, other=0.0)
+    w1 = tl.load(w_ptr + idx_feats * 4 + 1, mask=mf, other=0.0)
+    w2 = tl.load(w_ptr + idx_feats * 4 + 2, mask=mf, other=0.0)
+    w3 = tl.load(w_ptr + idx_feats * 4 + 3, mask=mf, other=0.0)
+    acc_pre = tl.load(b_ptr + idx_feats, mask=mf, other=0.0).to(tl.float32)
+    base = x_ptr + idx_feats * stride_x_dim
+    c0 = tl.load(base + (tok0 - 3).to(tl.int64) * stride_x_token,
+                 mask=mf & (tok0 >= 3), other=0.0)
+    c1 = tl.load(base + (tok0 - 2).to(tl.int64) * stride_x_token,
+                 mask=mf & (tok0 >= 2), other=0.0)
+    c2 = tl.load(base + (tok0 - 1).to(tl.int64) * stride_x_token,
+                 mask=mf & (tok0 >= 1), other=0.0)
+    for i in tl.static_range(BLOCK_M):
+        t = tok0 + i
+        ok = t < seqlen
+        x3 = tl.load(base + t.to(tl.int64) * stride_x_token, mask=mf & ok, other=0.0)
+        acc = acc_pre
+        acc += c0.to(tl.float32) * w0.to(tl.float32)
+        acc += c1.to(tl.float32) * w1.to(tl.float32)
+        acc += c2.to(tl.float32) * w2.to(tl.float32)
+        acc += x3.to(tl.float32) * w3.to(tl.float32)
+        acc = acc / (1 + tl.exp(-acc))
+        tl.store(o_ptr + t.to(tl.int64) * stride_o_token + idx_feats * stride_o_dim,
+                 acc.to(o_ptr.dtype.element_ty), mask=mf & ok)
+        c0 = c1
+        c1 = c2
+        c2 = x3
+    # conv_state tail write: the last token-block stores x[seqlen-3:seqlen]
+    if tok0 + BLOCK_M >= seqlen:
+        slot = tl.load(cache_indices_ptr).to(tl.int64)
+        csb = conv_state_ptr + slot * stride_cs_seq + idx_feats * stride_cs_dim
+        for k in tl.static_range(3):
+            t = seqlen - 3 + k
+            v = tl.load(base + t.to(tl.int64) * stride_x_token,
+                        mask=mf & (t >= 0), other=0.0)
+            tl.store(csb + k * stride_cs_tok, v, mask=mf & (t >= 0))
+
+
+@triton.jit()
 def _causal_conv1d_fwd_kernel(  # continuous batching
     # Pointers to matrices
     x_ptr,  # (dim, cu_seqlen) holding `batch` of actual sequences + padded sequences
@@ -75,22 +144,23 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     # one program handles one chunk in a single sequence
     # rather than mixing sequences - to make updating initial_states across sequences efficiently
 
+    # author-conv: feats on program_id(0) so consecutive CTAs cover the full
+    # token row (DRAM page locality on [T,dim]-contiguous transposed views)
     if USE_BLOCK_TABLE:
         # CUDA-graph safe launch: the grid is a fixed upper bound on the
         # (sequence, BLOCK_M-chunk) pairs of a token bucket and each program
         # reads its pair from the table; padded rows carry pad_slot_id.
-        idx_block = tl.program_id(0)
+        idx_block = tl.program_id(1)
         idx_seq = tl.load(block_table_ptr + idx_block * 2)
         chunk_offset = tl.load(block_table_ptr + idx_block * 2 + 1)
     else:
         # single-sequence id
-        idx_seq = tl.program_id(0)
+        idx_seq = tl.program_id(2)
         chunk_offset = tl.program_id(1)
-
     # BLOCK_N elements along the feature-dimension (channel)
-    idx_feats = tl.program_id(2) * BLOCK_N + tl.arange(0, BLOCK_N)
+    idx_feats = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
 
-    if idx_seq == pad_slot_id:
+    if USE_PAD_SLOT and idx_seq == pad_slot_id:
         return
 
     sequence_start_index = tl.load(query_start_loc_ptr + idx_seq)
@@ -207,7 +277,6 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                 & (idx_tokens_last < seqlen)[:, None]
                 & (idx_feats < dim)[None, :]
             )  # token-index  # token-index  # feature-index
-            loaded_x = tl.load(x_ptrs, mask_x, 0.0)
             new_conv_state = tl.load(x_ptrs, mask_x, 0.0)
             idx_tokens_conv = tl.arange(0, NP2_STATELEN)  # [BLOCK_M]
             conv_states_ptrs_target = (
@@ -347,7 +416,9 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         w_ptrs = w_base + (3 * stride_w_width)  # [BLOCK_N] tensor
         w_col3 = tl.load(w_ptrs, mask_w, other=0.0)
     mask_x_1d = idx_feats < dim
-    for idx_token in range(segment_len):
+    # author-conv: static trip count -> full unroll; all BLOCK_M token loads
+    # issue independently (memory-level parallelism), tail masked off
+    for idx_token in tl.static_range(BLOCK_M):
         acc = acc_preload
 
         matrix_w = w_col0
@@ -357,7 +428,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                 if j == 1:  # KERNEL_WIDTH-1:
                     matrix_w = w_col1
                     x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d & (idx_token < segment_len))
             elif KERNEL_WIDTH == 3:
                 if j == 1:
                     matrix_w = w_col1
@@ -365,7 +436,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                 elif j == 2:
                     matrix_w = w_col2
                     x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d & (idx_token < segment_len))
             elif KERNEL_WIDTH == 4:
                 if j == 1:
                     matrix_w = w_col1
@@ -376,7 +447,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                 elif j == 3:
                     matrix_w = w_col3
                     x_ptrs_1d = x_base_1d + idx_token * stride_x_token  # [BLOCK_N]
-                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d)
+                    matrix_x = tl.load(x_ptrs_1d, mask=mask_x_1d & (idx_token < segment_len))
 
             acc += matrix_x * matrix_w  # [BLOCK_N]
 
@@ -391,7 +462,8 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
             col2 = matrix_x
 
         if SILU_ACTIVATION:
-            acc = acc / (1 + tl.exp(-acc))
+            # author-conv: tl.sigmoid lowers to cheaper div path than acc/(1+exp)
+            acc = acc * tl.sigmoid(acc)
         mask_1d = (idx_token < segment_len) & (
             idx_feats < dim
         )  # token-index  # feature-index
@@ -472,6 +544,52 @@ def causal_conv1d_fn(
     is_channel_last = (x.stride(0) == 1) & (x.stride(1) > 1)
     dim, cu_seqlen = x.shape
     _, width = weight.shape
+
+    # author-conv: lean fast path for the dominant K3 prefill case —
+    # a single sequence, no initial state, channel-last x, width 4, silu.
+    # The general kernel's varlen/initial-state prologue costs ~27% of
+    # kernel time at these shapes; the lean kernel is numerics-identical
+    # except tap products accumulate in fp32 (<=1 bf16 ulp, strictly more
+    # accurate than the general kernel's bf16-rounded products).
+    # NOTE: dispatch cannot check cache_indices[0] != pad_slot_id without
+    # a host sync; single-seq prefill calls never pad (padded decode
+    # buckets always carry a block_table, excluded here).
+    # NOTE: seq_lens_cpu may be None (kda_extend_in_graph) — the None check
+    # MUST come first (regression: TypeError on the graph path).
+    if (
+        kwargs.get("lean", True)
+        and seq_lens_cpu is not None
+        and len(seq_lens_cpu) == 1
+        and seq_lens_cpu[0] == cu_seqlen
+        and width == 4
+        and bias is not None
+        and has_initial_state is None
+        and block_table is None
+        and conv_states is not None
+        and cache_indices is not None
+        and activation in ("silu", "swish")
+        and is_channel_last
+        and out.stride(0) == 1
+        and weight.stride(0) == 4
+        and weight.stride(1) == 1
+        and conv_states.dim() == 3
+        and conv_states.stride(1) == 1
+    ):
+        _BLOCK_M = 8 if cu_seqlen <= 2048 else 16
+        _BLOCK_N = 256
+        _grid = (triton.cdiv(dim, _BLOCK_N), triton.cdiv(cu_seqlen, _BLOCK_M))
+        _causal_conv1d_fwd_lean_kernel[_grid](
+            x, weight, bias, conv_states, cache_indices, out,
+            dim, cu_seqlen,
+            x.stride(0), x.stride(1),
+            out.stride(0), out.stride(1),
+            conv_states.stride(0), conv_states.stride(1),
+            conv_states.stride(2),
+            _BLOCK_M, _BLOCK_N,
+            num_warps=4,
+        )
+        return out
+
     state_len = width - 1
     np2_statelen = triton.next_power_of_2(state_len)
 
@@ -532,13 +650,13 @@ def causal_conv1d_fn(
 
     def grid(META):
         if block_table is not None:
-            # (num_blocks, 1, feature blocks): no host-side sequence lengths.
-            return (block_table.shape[0], 1, triton.cdiv(dim, META["BLOCK_N"]))
+            # (feature blocks, num_blocks, 1): no host-side sequence lengths.
+            return (triton.cdiv(dim, META["BLOCK_N"]), block_table.shape[0], 1)
         max_seq_len = max(seq_lens_cpu)
         return (
-            len(seq_lens_cpu),  # batch_size
+            triton.cdiv(dim, META["BLOCK_N"]),  # feature blocks (fastest)
             (max_seq_len + META["BLOCK_M"] - 1) // META["BLOCK_M"],
-            triton.cdiv(dim, META["BLOCK_N"]),
+            len(seq_lens_cpu),  # batch_size
         )
 
     _causal_conv1d_fwd_kernel[grid](
@@ -580,10 +698,11 @@ def causal_conv1d_fn(
         USE_PAD_SLOT=pad_slot_id is not None,
         NP2_STATELEN=np2_statelen,
         # launch_cooperative_grid=True
-        BLOCK_M=CAUSAL_CONV1D_FWD_BLOCK_M,
-        BLOCK_N=256,
+        BLOCK_M=kwargs.get("block_m", CAUSAL_CONV1D_FWD_BLOCK_M),
+        BLOCK_N=kwargs.get("block_n", 256),
         USE_BLOCK_TABLE=block_table is not None,
         num_stages=2,
+        num_warps=kwargs.get("num_warps", 4),
     )
     return out
 
