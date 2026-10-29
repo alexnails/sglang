@@ -103,13 +103,18 @@ logger = logging.getLogger(__name__)
 
 # Use aiter mla persist design for fp8-kv cache
 _use_mla_ps_kernel = get_bool_env_var("SGLANG_AITER_MLA_PERSIST", "True")
-# Kimi K3 decode-band optimization: dispatch the Gluon MLA kernel instead of
-# the asm persistent-split kernel in the shapes where it measurably wins
-# (pcap350d gfx950, fp8 KV, 12 zero-padded heads, energy-protocol A/B):
-#   decode qlen=1, bs<=4: 1.24-1.79x faster, 0.96-1.63x lower energy
-#     (ctx 1k-80k; bs>=8 flips to a 0.90-0.95x loss at long ctx);
-#   verify qlen=7, bs=1:  1.97-2.46x faster, 1.06-2.10x lower energy.
-# asm-PS stays for every other shape, so its metadata path is kept enabled.
+# Kimi K3 decode-band optimization: route the small-rows target-verify band
+# of _forward_verify_split_mla (qlen > 1, bs*qlen <= 8) to the Gluon MLA
+# kernel, which measurably beats BOTH true production arms there (pcap350d
+# gfx950, fp8 KV, 12 zero-padded heads, energy-protocol A/B, bs1 q7 over
+# ctx 1k-80k):
+#   1.75-2.23x vs asm stage1 + mla_split_reduce, and
+#   1.37-1.83x vs asm stage1 alone (the fused-epilogue marginal cost).
+# Decode (qlen=1) stays on asm stage1: Gluon only washes vs stage1+reduce
+# (<=1.17x) and loses vs the fused-epilogue marginal cost (0.70-0.93x).
+# Verify past 8 rows also stays on asm (the current Gluon bh16bn128 config
+# regresses there). asm stage1 keeps running for every other shape, so the
+# PS metadata path stays enabled.
 _k3_prefer_gluon_mla = get_bool_env_var("SGLANG_AITER_K3_OPT")
 
 # Use fp8 prefill only on gfx95
@@ -1454,12 +1459,15 @@ class AiterAttnBackend(AttentionBackend):
         return False
 
     def _prefer_gluon_over_asm_ps(self, bs: int, qlen: int) -> bool:
-        """K3 opt-in: take the Gluon MLA kernel for the shapes where the
-        measured A/B has it winning (see module comment), keeping asm-PS for
-        the high-work cells where Gluon's current kernel regresses. Gluon
-        needs no PS schedule metadata, but the metadata stays enabled because
-        asm-PS remains reachable for other shapes. DCP keeps asm PS: Gluon is
-        not validated for gathered-head topologies."""
+        """K3 opt-in: Gluon for the small-rows target-verify band only
+        (qlen > 1, bs*qlen <= 8), dispatched inside _forward_verify_split_mla.
+        Measured on gfx950 vs the true production arms of that function
+        (asm stage1 + mla_split_reduce / fused epilogue): 1.37-2.23x at
+        bs1 q7 across ctx 1k-80k. Decode (qlen=1) washes vs stage1+reduce
+        and loses vs the fused-epilogue marginal cost; verify past 8 rows
+        regresses on the current bh16bn128 Gluon config; both stay on asm.
+        DCP keeps asm: Gluon is not validated for gathered-head
+        topologies."""
         if not (
             _k3_prefer_gluon_mla
             and self.dcp_world_size <= 1
@@ -1470,9 +1478,7 @@ class AiterAttnBackend(AttentionBackend):
             )
         ):
             return False
-        if qlen <= 1:
-            return bs <= 4
-        return bs * qlen <= 8
+        return qlen > 1 and bs * qlen <= 8
 
     def _asm_ps_supports_qlen(self, q_len: int) -> bool:
         """Whether the asm PS dispatch has a kernel for this query length."""
@@ -1575,6 +1581,31 @@ class AiterAttnBackend(AttentionBackend):
         q_descale = self._unit_q_scale(q_pad.device) if fp8_q else k_descale
         kv_flat = k_buffer.view(-1, 1, 1, layer.qk_head_dim)
         rows = q_pad.shape[0]
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and self._prefer_gluon_over_asm_ps(
+                rows // (self.forward_metadata.max_q_len or 1),
+                self.forward_metadata.max_q_len or 1,
+            )
+        ):
+            # K3 opt-in: Gluon for the small-rows verify band (measured
+            # 1.37-2.23x over asm stage1 + split_reduce / the fused
+            # epilogue's marginal reduce). mla_qk_prep above still ran: it
+            # owns the fp8 KV write and the row-0 NaN guard every asm
+            # stage1 below depends on; only its padded q is unused here.
+            return mla_gluon_decode(
+                q=torch.cat([q_nope, q_rope], dim=-1).view(
+                    -1, layer.tp_q_head_num, layer.qk_head_dim
+                ),
+                k_buffer=k_buffer,
+                layer=layer,
+                kv_indices=self.forward_metadata.kv_indices,
+                kv_indptr=self.forward_metadata.kv_indptr,
+                sm_scale=layer.scaling,
+                kv_scale=self._resolve_fp8_kv_scale_float(layer, k_descale),
+                min_kv_seq_len=self._resolve_mla_gluon_min_kv_seq_len(forward_batch),
+                qlen=self.forward_metadata.max_q_len or 1,
+            )
         defers = (
             mla_epilogue_handoff.defers(layer)
             and mla_decode_epilogue.MIN_ROWS <= rows <= mla_decode_epilogue.MAX_ROWS
@@ -1773,17 +1804,14 @@ class AiterAttnBackend(AttentionBackend):
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         max_q_len = self.forward_metadata.max_q_len or 1
 
-        if self._prefer_gluon_over_asm_ps(q.shape[0] // max_q_len, max_q_len) or (
-            prefer_mla_gluon_decode(
-                head_pad_mode=getattr(self, "head_pad_mode", "none"),
-                num_head=getattr(self, "num_head", layer.tp_q_head_num),
-                kv_cache_dtype=self.kv_cache_dtype,
-            )
-            and not (
-                _use_mla_ps_kernel
-                and self.mla_decode_backend == "asm"
-                and self._asm_ps_supports_qlen(max_q_len)
-            )
+        if prefer_mla_gluon_decode(
+            head_pad_mode=getattr(self, "head_pad_mode", "none"),
+            num_head=getattr(self, "num_head", layer.tp_q_head_num),
+            kv_cache_dtype=self.kv_cache_dtype,
+        ) and not (
+            _use_mla_ps_kernel
+            and self.mla_decode_backend == "asm"
+            and self._asm_ps_supports_qlen(max_q_len)
         ):
             return mla_gluon_decode(
                 q=q,
@@ -4270,20 +4298,14 @@ class AiterAttnBackend(AttentionBackend):
                         )
                     return o
             elif forward_batch.forward_mode.is_target_verify():
-                if self._prefer_gluon_over_asm_ps(
-                    q.shape[0] // (self.forward_metadata.max_q_len or 1),
-                    self.forward_metadata.max_q_len or 1,
-                ) or (
-                    prefer_mla_gluon_decode(
-                        head_pad_mode=getattr(self, "head_pad_mode", "none"),
-                        num_head=getattr(self, "num_head", layer.tp_q_head_num),
-                        kv_cache_dtype=self.kv_cache_dtype,
-                    )
-                    and not (
-                        _use_mla_ps_kernel
-                        and self.mla_verify_backend == "asm"
-                        and self._asm_ps_supports_qlen(self.forward_metadata.max_q_len or 1)
-                    )
+                if prefer_mla_gluon_decode(
+                    head_pad_mode=getattr(self, "head_pad_mode", "none"),
+                    num_head=getattr(self, "num_head", layer.tp_q_head_num),
+                    kv_cache_dtype=self.kv_cache_dtype,
+                ) and not (
+                    _use_mla_ps_kernel
+                    and self.mla_verify_backend == "asm"
+                    and self._asm_ps_supports_qlen(self.forward_metadata.max_q_len or 1)
                 ):
                     return mla_gluon_decode(
                         q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
