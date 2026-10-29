@@ -14,6 +14,7 @@ from sglang.srt.distributed.communication_op import tensor_model_parallel_all_ga
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+from sglang.srt.layers.rotary_embedding import RotaryEmbedding
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel
@@ -37,6 +38,39 @@ logger = logging.getLogger(__name__)
 _CONFIDENCE = Invariant(
     "dspark.model.confidence", Bucket.GUARD, InClosedRange(0.0, 1.0)
 )
+# RoPE apply-path methods. The fused KV-commit kernel replicates
+# RotaryEmbedding's apply math reading ``cos_sin_cache`` directly, so a rope
+# instance is compatible only when it inherits the base apply path unchanged
+# (subclasses that only change the cache contents, e.g.
+# YaRNScalingRotaryEmbedding, are fine; subclasses that override the apply
+# math or dispatch, e.g. MRotaryEmbedding / DualChunk / DeepseekScaling, are
+# not).
+_ROPE_APPLY_METHODS = (
+    "forward",
+    "forward_native",
+    "forward_cuda",
+    "forward_xpu",
+    "forward_npu",
+    "forward_cpu",
+    "forward_torch_compile",
+    "forward_triton",
+    "forward_jit",
+    "forward_aot",
+)
+
+
+def _rope_has_base_apply_semantics(rotary: nn.Module) -> bool:
+    """Capability check for the fused KV-commit rope: True when ``rotary``
+    applies rotation exactly like ``RotaryEmbedding`` over its
+    ``cos_sin_cache`` (any cache-content subclass qualifies)."""
+    if not isinstance(rotary, RotaryEmbedding):
+        return False
+    for cls in type(rotary).__mro__:
+        if cls is RotaryEmbedding:
+            return True
+        if any(name in cls.__dict__ for name in _ROPE_APPLY_METHODS):
+            return False
+    return False
 
 
 def gather_and_crop_vocab(
@@ -552,7 +586,7 @@ class DSparkDraftMixin:
         head_dim = attn0.head_dim
         kv_size = attn0.kv_size
         rotary = attn0.rotary_emb
-        if type(rotary).__name__ != "RotaryEmbedding":
+        if not _rope_has_base_apply_semantics(rotary):
             return None
         if getattr(rotary, "rotary_dim", None) != head_dim:
             return None

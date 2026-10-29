@@ -58,18 +58,23 @@ def _fused_kv_norm_rope_write_kernel(
     vs0 = tl.load(meta_ptr + l * 4 + 3)
 
     row = kv_ptr + t * (L * 2 * KV) + l * (2 * KV)
+    cos16 = cos.to(tl.bfloat16)
+    sin16 = sin.to(tl.bfloat16)
     for h in tl.static_range(NH):
         k = tl.load(row + h * D + d_ar).to(tl.float32)
         ms = tl.sum(k * k, 0) / D
-        inv = 1.0 / tl.sqrt(ms + EPS)
-        k1 = tl.load(row + h * D + off1).to(tl.float32) * inv * knw1
-        k2 = tl.load(row + h * D + off2).to(tl.float32) * inv * knw2
-        k1 = k1.to(tl.bfloat16).to(tl.float32)
-        k2 = k2.to(tl.bfloat16).to(tl.float32)
-        o1 = k1 * cos - k2 * sin
-        o2 = k2 * cos + k1 * sin
-        tl.store(k_buf + loc * ks0 + h * D + off1, o1.to(tl.bfloat16))
-        tl.store(k_buf + loc * ks0 + h * D + off2, o2.to(tl.bfloat16))
+        # Bit-parity with the unfused chain: torch.rsqrt(x) is exactly
+        # fp32(1 / sqrt(fp64(x))) on ROCm, and the production rope module
+        # (sgl_kernel, vLLM-derived) rotates in bf16 arithmetic after casting
+        # the fp32 cos/sin cache to bf16. Deviating from either shows up as
+        # ~0.1-1% one-ulp bf16 flips against the fallback path.
+        inv = (1.0 / tl.sqrt((ms + EPS).to(tl.float64))).to(tl.float32)
+        k1 = (tl.load(row + h * D + off1).to(tl.float32) * inv * knw1).to(tl.bfloat16)
+        k2 = (tl.load(row + h * D + off2).to(tl.float32) * inv * knw2).to(tl.bfloat16)
+        o1 = k1 * cos16 - k2 * sin16
+        o2 = k2 * cos16 + k1 * sin16
+        tl.store(k_buf + loc * ks0 + h * D + off1, o1)
+        tl.store(k_buf + loc * ks0 + h * D + off2, o2)
 
         v = tl.load(row + KV + h * D + d_ar)
         tl.store(v_buf + loc * vs0 + h * D + d_ar, v)
