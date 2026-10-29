@@ -205,6 +205,8 @@ def _launch_config(rows: int, max_q: int, max_splits: int) -> tuple[int, int, in
             return block_s, 4 if rows <= 4 else 2, 8
         return block_s, 2 if rows <= 4 else 1, 8
     if block_s == 64:
+        return block_s, 4, 4
+    if block_s == 16:
         return block_s, 2, 4
     return block_s, 1, 4
 

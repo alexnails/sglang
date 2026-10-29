@@ -177,7 +177,9 @@ def k3_latent_tail_partials(
         BLOCK_M=max(16, triton.next_power_of_2(M)),
         BLOCK_N=block_n,
         BLOCK_K=L // PARTIAL_SPLITS,
-        num_warps=4,
+        # M=1 leaves 15/16 of each MFMA row idle; 2 warps per program is
+        # faster there (measured MI350X); M>=4 wants the full 4.
+        num_warps=2 if M == 1 else 4,
         num_stages=1,
         matrix_instr_nonkdim=16,
     )
