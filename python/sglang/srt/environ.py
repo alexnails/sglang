@@ -999,6 +999,12 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
+    # gfx950 fused KDA decode: one flydsl kernel for conv update + f_b projection +
+    # delta-rule recurrence + gated RMSNorm (kernels/ops/attention/kda_fused_decode_aiter_hip.py).
+    # "aiter" (default) enables; any other value keeps the unfused triton chain.
+    # Measured on MI350X (per-layer decode chain, bs1/bs16): fused 7.10/8.59 us,
+    # 2.34/4.99 mJ vs unfused 12.06/15.13 us, 3.90/7.36 mJ (-40%/-32% J per call).
+    SGLANG_ROCM_K3_KDA_FUSED_BACKEND = EnvStr("aiter")
     # gfx950 KDA chunked prefill (K = V = 128): store the gated key chunk-major
     # ([chunks, H, K, 64], tokens contiguous) for the state scan, with its tuned tile.
     SGLANG_ROCM_KDA_CHUNK_MAJOR_SCAN = EnvBool(True)
