@@ -4244,6 +4244,15 @@ class KimiK3LinearForCausalLM(nn.Module):
             break
 
 
+        # Post-load: cache the fp8 decode LM-head weight (env-gated; see
+        # kimi_k3_rocm_quant). Quantizes whatever load_weights put in place,
+        # so dummy-load benchmark flows get the same path.
+        if _is_hip and envs.SGLANG_ROCM_K3_LM_HEAD_FP8.get():
+            from sglang.srt.models.kimi_k3_rocm_quant import (
+                k3_prepare_lm_head_fp8,
+            )
+            if k3_prepare_lm_head_fp8(self.lm_head):
+                rank0_log("Kimi-K3 LM head: cached fp8 decode weight (M<=4 path).")
 class KimiK3ForConditionalGeneration(nn.Module):
     """K3 multimodal wrapper: MoonViT3d tower + KimiK3LinearForCausalLM."""
 

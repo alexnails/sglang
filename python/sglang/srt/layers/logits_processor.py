@@ -1013,6 +1013,16 @@ class LogitsProcessor(nn.Module):
                 logits = torch.matmul(
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
+            elif (
+                hidden_states.shape[0] <= 4
+                and getattr(lm_head, "k3_fp8_decode_weight", None) is not None
+            ):
+                # K3 on gfx950: cached fp8 per-channel LM head for decode
+                # (SGLANG_ROCM_K3_LM_HEAD_FP8; kimi_k3_rocm_quant.py).
+                from sglang.srt.models.kimi_k3_rocm_quant import (
+                    k3_lm_head_fp8_decode,
+                )
+                logits = k3_lm_head_fp8_decode(lm_head, hidden_states)
             else:
                 logits = torch.matmul(
                     hidden_states.to(lm_head.weight.dtype), lm_head.weight.T

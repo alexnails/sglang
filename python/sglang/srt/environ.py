@@ -987,6 +987,10 @@ class Envs:
     # Also fold the A8W4 experts' MXFP8 activation quant into that kernel (at most 8
     # tokens: past that its single quant workgroup costs more than a launch).
     SGLANG_ROCM_K3_FUSED_ROUTE_QUANT = EnvBool(True)
+    # Cache an fp8-e4m3 per-output-channel copy of the LM-head weight at load
+    # and run the decode LM head (M<=4) as per-token-quant + aiter a8w8 GEMM
+    # (kimi_k3_rocm_quant.py). Accuracy-affecting: opt-in, bf16 stays default.
+    SGLANG_ROCM_K3_LM_HEAD_FP8 = EnvBool(False)
     # Split the MoE front's replicated router and latent down-projection by output
     # columns (each rank reads 1/8 of them) and all-gather logits and latent, up to
     # 64 tokens.
