@@ -14,6 +14,11 @@
 // Scores follow topk_reg_kernel: sig = rcp(1 + 2^(-log2e * x)), the selection
 // key is sig + bias, the weight is the pre-bias sig, renormalized in descending
 // order; exact score ties go to the lower expert id.
+// kGatherScale (kFuseQuant's sibling for rows an earlier kernel quantized):
+// gathers the token-major e8m0 scales into the same shuffled a1_scale layout,
+// replacing aiter's mxfp4_moe_sort_fwd launch; byte-identical to it over the
+// consumer range [0, num_valid_ids[0]) — the padded rows past that, which
+// aiter zeroes across the whole allocation and no consumer reads, are skipped.
 
 #pragma once
 
@@ -49,9 +54,13 @@ struct K3RouteSortParams {
   const bf16_t* __restrict__ quant_input;  // [M, quant_cols], row stride quant_input_stride
   uint8_t* __restrict__ a1;                // [M, quant_cols] fp8 e4m3, token-major
   uint8_t* __restrict__ a1_scale;          // e8m0 bytes, mx_scale_shuffle_idx(scale_n_pad, row, g)
+  // Optional scale gather (aiter mxfp4_moe_sort_fwd): token-major e8m0 scales of
+  // rows an earlier kernel quantized, scattered into the a1_scale layout above.
+  const uint8_t* __restrict__ scale_input;  // [M, quant_cols / 32], row stride scale_input_stride
   int64_t logits_stride;
   int64_t moe_buf_vecs;
   int64_t quant_input_stride;
+  int64_t scale_input_stride;
   int32_t quant_cols;
   int32_t scale_n_pad;
   int32_t num_tokens;
@@ -113,10 +122,13 @@ SGL_DEVICE uint8_t mxfp8_quant_group(const bf16_t* __restrict__ src, uint8_t* __
 inline constexpr int kRouteSortMaxGroups = 128;  // quant_cols / 32
 
 // kPrecomputed: topk_ids / topk_weights are inputs (an earlier kernel ran the top-k).
-template <int kExperts, int kTopK, typename TBias, bool kFuseQuant, bool kPrecomputed>
+// kGatherScale: scale_input holds the rows' e8m0 scales (an earlier kernel
+// quantized); gather them into a1_scale instead of computing them.
+template <int kExperts, int kTopK, typename TBias, bool kFuseQuant, bool kPrecomputed, bool kGatherScale>
 __global__ __launch_bounds__(kRouteSortThreads) void k3_route_sort_kernel(const __grid_constant__ K3RouteSortParams p) {
   static_assert(kExperts % (2 * kRouteSortWave) == 0 && kExperts <= kRouteSortThreads);
   static_assert(kTopK <= kRouteSortWave && kTopK < 256);
+  static_assert(!(kFuseQuant && kGatherScale), "scales are computed or gathered, never both");
 
   __shared__ unsigned long long s_mask[kExperts];  // bit t: token t routes to the expert
   __shared__ int16_t s_ids[kRouteSortMaxTokens][kTopK];
@@ -128,7 +140,7 @@ __global__ __launch_bounds__(kRouteSortThreads) void k3_route_sort_kernel(const 
   __shared__ __attribute__((aligned(16))) uint64_t s_ckey[kRouteSortWaves][kRouteSortMaxCand];
   __shared__ float s_csig[kRouteSortWaves][kRouteSortMaxCand];
   __shared__ uint8_t s_qscale[kFuseQuant ? kRouteSortMaxTokens : 1][kFuseQuant ? kRouteSortMaxGroups : 1];
-  __shared__ int32_t s_route_row[kFuseQuant ? kRouteSortMaxTokens * kTopK : 1];  // sorted row of each route
+  __shared__ int32_t s_route_row[(kFuseQuant || kGatherScale) ? kRouteSortMaxTokens * kTopK : 1];  // sorted row of each route
 
   static_assert(k3_attn_res_read::kThreads <= kRouteSortThreads, "a partial workgroup covers a row");
   if (blockIdx.x > 0) {
@@ -141,22 +153,14 @@ __global__ __launch_bounds__(kRouteSortThreads) void k3_route_sort_kernel(const 
   const int wave = tid / kRouteSortWave;
   const int num_tokens = p.num_tokens;
   const uint64_t lanemask_lt = (1ull << lane) - 1ull;
-#ifdef K3RS_TIMING
-  uint64_t k3rs_ts[16] = {};
-  if (tid == 0) k3rs_ts[0] = __builtin_amdgcn_s_memtime();
-#endif
 
   for (int e = tid; e < kExperts; e += kRouteSortThreads)
     s_mask[e] = 0ull;
   __syncthreads();
 
-#ifdef K3RS_TIMING
-  if (tid == 0) k3rs_ts[1] = __builtin_amdgcn_s_memtime();
-#endif
-
   // Stage-1 activation quant: one 32-element group per task. The waves that
   // have no token to route (num_tokens < 16) run it alongside the top-k.
-  const int quant_groups = kFuseQuant ? p.quant_cols / 32 : 0;
+  const int quant_groups = (kFuseQuant || kGatherScale) ? p.quant_cols / 32 : 0;
   auto quant_tasks = [&](int worker, int num_workers) {
     for (int task = worker; task < num_tokens * quant_groups; task += num_workers) {
       const int t = task / quant_groups;
@@ -205,10 +209,6 @@ __global__ __launch_bounds__(kRouteSortThreads) void k3_route_sort_kernel(const 
   }
   if (kFuseQuant && num_tokens >= kRouteSortWaves) quant_tasks(tid, kRouteSortThreads);
   __syncthreads();
-
-#ifdef K3RS_TIMING
-  if (tid == 0) k3rs_ts[7] = __builtin_amdgcn_s_memtime();
-#endif
 
   const int block_m = p.block_m;
   const int pad_id = (kTopK << 24) | num_tokens;
@@ -266,7 +266,7 @@ __global__ __launch_bounds__(kRouteSortThreads) void k3_route_sort_kernel(const 
     const int row = s_boff[e] * block_m + __popcll(s_mask[e] & ((1ull << t) - 1ull));
     p.sorted_ids[row] = (k << 24) | t;
     p.sorted_weights[row] = s_w[t][k];
-    if constexpr (kFuseQuant) s_route_row[route] = row;
+    if constexpr (kFuseQuant || kGatherScale) s_route_row[route] = row;
   }
   if constexpr (kFuseQuant) {
     __syncthreads();
@@ -295,25 +295,52 @@ __global__ __launch_bounds__(kRouteSortThreads) void k3_route_sort_kernel(const 
       }
     }
   }
-
-#ifdef K3RS_TIMING
-  if (tid == 0) k3rs_ts[10] = __builtin_amdgcn_s_memtime();
-#endif
+  if constexpr (kGatherScale) {
+    __syncthreads();
+    // Same output as aiter's mxfp4_moe_sort_fwd, byte-identical over its
+    // whole written range [0, ceil(total_rows/32)*32): aiter zero-stages
+    // every 32-row tile it writes and skips all-padding tiles, and
+    // total_rows is always a whole number of 32-row tiles. Single-WG stores
+    // cannot beat aiter's 256-WG sort at large batch, so the fused gather
+    // only wins at small num_tokens (the host gates it); the byte fallback
+    // below keeps the path correct for any shape.
+    for (int64_t v = tid; v < static_cast<int64_t>(total_rows) * (p.scale_n_pad / 4);
+         v += kRouteSortThreads)
+      reinterpret_cast<uint32_t*>(p.a1_scale)[v] = 0u;
+    __syncthreads();
+    if (p.block_m == 32 && num_tokens <= 16 && quant_groups % 8 == 0) {
+      // Paired word stores: at num_tokens <= 16 every expert block has at
+      // most 16 valid rows, so the shuffled dword at (x, g) packs row x at
+      // columns g / g+4 with the x+16 padding rows as zero bytes 1 and 3
+      // (already cleared above) — one store covers both scales of a pair.
+      const int half_g = quant_groups / 2;
+      for (int item = tid; item < num_tokens * kTopK * half_g; item += kRouteSortThreads) {
+        const int route = item / half_g;
+        const int gh = item - route * half_g;
+        const int g = (gh & ~3) * 2 + (gh & 3);
+        const int t = route / kTopK;
+        const uint32_t s = static_cast<uint8_t>(p.scale_input[t * p.scale_input_stride + g]);
+        const uint32_t s2 = static_cast<uint8_t>(p.scale_input[t * p.scale_input_stride + g + 4]);
+        const int32_t word_off =
+            mx_scale_shuffle_idx(p.scale_n_pad, s_route_row[route], g);
+        *reinterpret_cast<uint32_t*>(p.a1_scale + word_off) = s | (s2 << 16);
+      }
+    } else {
+      for (int item = tid; item < num_tokens * kTopK * quant_groups; item += kRouteSortThreads) {
+        const int route = item / quant_groups;
+        const int g = item - route * quant_groups;
+        p.a1_scale[mx_scale_shuffle_idx(p.scale_n_pad, s_route_row[route], g)] =
+            static_cast<uint8_t>(p.scale_input[(route / kTopK) * p.scale_input_stride + g]);
+      }
+    }
+  }
 
   // ---- zero the stage-2 accumulation buffer
   for (int64_t v = tid; v < p.moe_buf_vecs; v += kRouteSortThreads)
     p.moe_buf[v] = make_uint4(0u, 0u, 0u, 0u);
-#ifdef K3RS_TIMING
-  __syncthreads();
-  if (tid == 0) {
-    k3rs_ts[11] = __builtin_amdgcn_s_memtime();
-    for (int i = 0; i < 12; ++i)
-      reinterpret_cast<uint64_t*>(p.moe_buf)[i] = k3rs_ts[i];
-  }
-#endif
 }
 
-template <int kExperts, int kTopK, typename TBias, bool kFuseQuant, bool kPrecomputed>
+template <int kExperts, int kTopK, typename TBias, bool kFuseQuant, bool kPrecomputed, bool kGatherScale>
 struct K3RouteSortKernel {
   static void
   run(const tvm::ffi::TensorView logits,
@@ -328,6 +355,7 @@ struct K3RouteSortKernel {
       const tvm::ffi::TensorView quant_input,
       const tvm::ffi::TensorView a1,
       const tvm::ffi::TensorView a1_scale,
+      const tvm::ffi::TensorView scale_input,
       const int64_t block_m,
       const double routed_scaling_factor,
       const bool renormalize,
@@ -372,6 +400,14 @@ struct K3RouteSortKernel {
           quant_input.stride(0) % 8 == 0 && reinterpret_cast<uintptr_t>(quant_input.data_ptr()) % 16 == 0,
           "quant input rows must be 16-byte aligned");
       RuntimeCheck(a1.numel() >= static_cast<int64_t>(num_tokens) * quant_cols, "a1 too small");
+      scale_n_pad = (quant_cols / 32 + 7) / 8 * 8;
+      RuntimeCheck(a1_scale.numel() >= (max_rows + 31) / 32 * 32 * scale_n_pad, "a1_scale too small");
+    }
+    if constexpr (kGatherScale) {
+      static_assert(!kFuseQuant, "scales are computed or gathered, never both");
+      TensorMatcher({M, -1}).with_dtype<uint8_t>().with_device(device_).with_strides({-1, 1}).verify(scale_input);
+      quant_cols = static_cast<int32_t>(scale_input.size(1)) * 32;
+      RuntimeCheck(scale_input.size(1) > 0 && scale_input.size(1) <= kRouteSortMaxGroups, "scale groups must be 1..128");
       scale_n_pad = (quant_cols / 32 + 7) / 8 * 8;
       RuntimeCheck(a1_scale.numel() >= (max_rows + 31) / 32 * 32 * scale_n_pad, "a1_scale too small");
     }
@@ -427,10 +463,12 @@ struct K3RouteSortKernel {
         .moe_buf = static_cast<uint4*>(moe_buf.data_ptr()),
         .quant_input = kFuseQuant ? static_cast<const bf16_t*>(quant_input.data_ptr()) : nullptr,
         .a1 = kFuseQuant ? static_cast<uint8_t*>(a1.data_ptr()) : nullptr,
-        .a1_scale = kFuseQuant ? static_cast<uint8_t*>(a1_scale.data_ptr()) : nullptr,
+        .a1_scale = (kFuseQuant || kGatherScale) ? static_cast<uint8_t*>(a1_scale.data_ptr()) : nullptr,
+        .scale_input = kGatherScale ? static_cast<const uint8_t*>(scale_input.data_ptr()) : nullptr,
         .logits_stride = logits.stride(0),
         .moe_buf_vecs = moe_buf_bytes / 16,
         .quant_input_stride = kFuseQuant ? quant_input.stride(0) : 0,
+        .scale_input_stride = kGatherScale ? scale_input.stride(0) : 0,
         .quant_cols = quant_cols,
         .scale_n_pad = scale_n_pad,
         .num_tokens = num_tokens,
@@ -440,7 +478,7 @@ struct K3RouteSortKernel {
         .partials = partials,
     };
     LaunchKernel(1 + static_cast<uint32_t>(partial_rows), kRouteSortThreads, device_.unwrap())(
-        k3_route_sort_kernel<kExperts, kTopK, TBias, kFuseQuant, kPrecomputed>, params);
+        k3_route_sort_kernel<kExperts, kTopK, TBias, kFuseQuant, kPrecomputed, kGatherScale>, params);
   }
 };
 

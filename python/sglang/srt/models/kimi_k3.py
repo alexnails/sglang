@@ -194,6 +194,10 @@ _GATHER_TOPK_MIN_TOKENS = 16
 # Decode batches whose attention-residual reads take bank partials from the route
 # sort: faster up to 16 rows of an MI350X EAGLE3 decode cycle, slower at 64.
 _BANK_PARTIALS_MAX_TOKENS = 16
+# The route sort's fused scale gather (replacing aiter's scale-only sort) is a
+# single-WG scatter: measured faster than the aiter pair at 1-2 tokens on
+# MI350X (-1.6 us at bs1), slower from 4 (aiter sorts with 256 workgroups).
+_ROUTE_GATHER_SCALE_MAX_TOKENS = 2
 # The fused route+quant kernel quantizes on one workgroup: faster than aiter's quant
 # launch up to 8 tokens on MI350X.
 _ROUTE_QUANT_MAX_TOKENS = 8
@@ -1515,8 +1519,6 @@ class KimiK3MoE(nn.Module):
         bias = cfg.correction_bias_for_dtype(router_logits.dtype)
         if not kimi_k3_route_sort.covered(router_logits, bias, cfg.top_k):
             return None
-        # Rows the front gather quantized get their scales sorted by aiter's
-        # scale-only sort (the caller stages them), faster than placing them here.
         fuse_quant = (
             quantized is None
             and topk_output is None
@@ -1525,7 +1527,14 @@ class KimiK3MoE(nn.Module):
         )
         if fuse_quant and not kimi_k3_route_sort.quant_covered(routed_input):
             return None
-        return kimi_k3_route_sort.route_sort(
+        # Rows the front gather quantized bring token-major e8m0 scales; gather
+        # them into the sorted layout here, replacing aiter's scale-only sort.
+        gather_scale = (
+            quantized is not None
+            and router_logits.shape[0] <= _ROUTE_GATHER_SCALE_MAX_TOKENS
+            and kimi_k3_route_sort.gather_covered(quantized[1])
+        )
+        routes = kimi_k3_route_sort.route_sort(
             router_logits,
             bias,
             topk=cfg.top_k,
@@ -1536,9 +1545,14 @@ class KimiK3MoE(nn.Module):
             renormalize=cfg.renormalize,
             # The A8W4 experts quantize these rows first; fold that in too.
             quant_input=routed_input if fuse_quant else None,
+            scale_input=quantized[1] if gather_scale else None,
             topk_output=topk_output,
             partials=self._next_bank_partials(router_logits.shape[0]),
         )
+        if gather_scale:
+            # The staged handoff takes a1 + sorted scales straight from here.
+            routes = routes._replace(a1=quantized[0])
+        return routes
 
     def _next_bank_partials(
         self, num_tokens: int

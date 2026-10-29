@@ -53,8 +53,9 @@ def _jit_route_sort_module(
     bias_dtype: torch.dtype,
     fuse_quant: bool,
     precomputed: bool = False,
+    gather_scale: bool = False,
 ) -> Module:
-    args = make_cpp_args(num_experts, topk, bias_dtype, fuse_quant, precomputed)
+    args = make_cpp_args(num_experts, topk, bias_dtype, fuse_quant, precomputed, gather_scale)
     return load_jit(
         "kimi_k3_route_sort",
         *args,
@@ -95,6 +96,18 @@ def quant_covered(quant_input: torch.Tensor) -> bool:
     )
 
 
+def gather_covered(scales: torch.Tensor) -> bool:
+    """Token-major e8m0 scales ([M, D // 32]) an earlier kernel wrote, gatherable
+    into the sorted scale layout (replaces aiter's mxfp4_moe_sort_fwd)."""
+    groups = scales.shape[-1]
+    return (
+        scales.dim() == 2
+        and scales.dtype == torch.float8_e8m0fnu
+        and scales.stride(1) == 1
+        and 0 < groups <= 128
+    )
+
+
 def route_sort(
     router_logits: torch.Tensor,
     correction_bias: torch.Tensor,
@@ -106,15 +119,19 @@ def route_sort(
     routed_scaling_factor: float,
     renormalize: bool,
     quant_input: Optional[torch.Tensor] = None,
+    scale_input: Optional[torch.Tensor] = None,
     topk_output: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
     partials: Optional[BankPartials] = None,
 ) -> RouteSortOutput:
     """Top-k of sigmoid(router_logits) + bias, sorted into aiter's block-padded
     route layout; moe_buf ([M, model_dim], allocated when None) is zeroed.
     With quant_input ([M, D] bf16, the routed activations) the stage-1 MXFP8
-    quant + scale sort is fused in as well. topk_output = (weights [M, topk]
-    fp32, ids [M, topk] int32) from an earlier kernel skips the top-k. partials
-    adds the workgroups that compute them, one per row of partials.bank."""
+    quant + scale sort is fused in as well; with scale_input ([M, D // 32]
+    e8m0, scales of rows an earlier kernel quantized) just the scale gather is
+    fused (byte-identical to aiter's mxfp4_moe_sort_fwd) and a1 stays None.
+    topk_output = (weights [M, topk] fp32, ids [M, topk] int32) from an
+    earlier kernel skips the top-k. partials adds the workgroups that compute
+    them, one per row of partials.bank."""
     num_tokens, num_experts = router_logits.shape
     device = router_logits.device
     # Same sizes as aiter.fused_moe._moe_sorting_impl.
@@ -137,6 +154,8 @@ def route_sort(
             (num_tokens, model_dim), dtype=torch.bfloat16, device=device
         )
     fuse_quant = quant_input is not None
+    gather_scale = scale_input is not None
+    assert not (fuse_quant and gather_scale), "scales are computed or gathered, never both"
     if fuse_quant:
         # Same shapes / dtypes as aiter's fused_dynamic_mx_quant_moe_sort.
         cols = quant_input.shape[1]
@@ -147,8 +166,21 @@ def route_sort(
             dtype=torch.float8_e8m0fnu,
             device=device,
         )
+    elif gather_scale:
+        # Same shape / dtype as aiter's mxfp4_moe_sort_fwd output.
+        groups = scale_input.shape[1]
+        scale_n_pad = (groups + 7) // 8 * 8
+        a1 = sorted_ids  # unread placeholder
+        a1_scale = torch.empty(
+            ((max_rows + 31) // 32 * 32, scale_n_pad),
+            dtype=torch.float8_e8m0fnu,
+            device=device,
+        )
+        quant_input = sorted_ids  # unread placeholder
     else:
         quant_input = a1 = a1_scale = sorted_ids  # unread placeholders
+    if not gather_scale:
+        scale_input = sorted_ids  # unread placeholder
     if partials is None:
         # unread placeholders; no rows launch no partial workgroups
         partial_args = (sorted_ids,) * 5 + (0, 0, 0, 0.0)
@@ -166,7 +198,7 @@ def route_sort(
             float(partials.score_eps),
         )
     module = _jit_route_sort_module(
-        num_experts, topk, correction_bias.dtype, fuse_quant, topk_output is not None
+        num_experts, topk, correction_bias.dtype, fuse_quant, topk_output is not None, gather_scale
     )
     module.run(
         router_logits,
@@ -180,7 +212,8 @@ def route_sort(
         moe_buf.view(-1),
         quant_input,
         a1.view(torch.uint8) if fuse_quant else a1,
-        a1_scale.view(torch.uint8) if fuse_quant else a1_scale,
+        a1_scale.view(torch.uint8) if (fuse_quant or gather_scale) else a1_scale,
+        scale_input.view(torch.uint8) if gather_scale else scale_input,
         block_m,
         float(routed_scaling_factor),
         renormalize,
@@ -195,5 +228,5 @@ def route_sort(
         num_valid_ids,
         moe_buf,
         a1 if fuse_quant else None,
-        a1_scale if fuse_quant else None,
+        a1_scale if (fuse_quant or gather_scale) else None,
     )
