@@ -8,8 +8,9 @@ import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from aiter.ops.flydsl.kernels.tensor_shim import GTensor
-from flydsl.expr import range_constexpr
+from aiter.ops.flydsl.kernels.dpp_utils import dpp_xor_f32
+from aiter.ops.flydsl.kernels.tensor_shim import GTensor, buf_load_scalar
+from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.typing import T
 
 _HEADS = 12
@@ -30,7 +31,9 @@ _WAVES_PER_EU = 3
 
 
 @functools.cache
-def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
+def create_kimi_k3_kda_decode_kernel(
+    norm_eps: float, lower_bound: float, *, dpp_reduce: bool = True
+):
     """Build the fixed gfx950 BF16 Kimi-K3 decode specialization."""
 
     @fx.struct
@@ -41,8 +44,12 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
         recurrent_out: fx.Array[fx.BFloat16, _DIM, 16]
         norm_partial: fx.Array[fx.Float32, 2, 16]
 
+    kernel_name = "kimi_k3_kda_decode_bf16_gfx950"
+    if not dpp_reduce:
+        kernel_name += "_dpp0"
+
     @flyc.kernel(
-        name="kimi_k3_kda_decode_bf16_gfx950",
+        name=kernel_name,
         known_block_size=[_BLOCK_THREADS, 1, 1],
     )
     def kernel(
@@ -103,7 +110,9 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
         warp = tid // fx.Int32(_WARP_SIZE)
         lane_k = lane % fx.Int32(_WARP_THREADS_K)
 
-        state_idx = fx.Int32(state_indices[batch])
+        # Wave-uniform slot index through the scalar memory path
+        # (s_buffer_load, ~325 pJ) instead of a per-lane vector load.
+        state_idx = fx.Int32(buf_load_scalar(state_indices.rsrc, batch, 1))
         valid = state_idx > fx.Int32(0)
 
         # Branch bodies are closures: a bare `if` would make the AST rewriter
@@ -189,7 +198,10 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
             decay_vecs = []
             sum_q_partial = fx.Float32(0.0)
             sum_k_partial = fx.Float32(0.0)
-            a = fx.math.exp2(fx.Float32(A_log[head]) * fx.Float32(_LOG2E))
+            a = fx.math.exp2(
+                fx.Int32(buf_load_scalar(A_log.rsrc, head, 1)).bitcast(fx.Float32)
+                * fx.Float32(_LOG2E)
+            )
 
             for ki in range_constexpr(_K_ITERS):
                 k_base = k_vec_start + fx.Int32(ki * _WARP_TILE_K)
@@ -226,19 +238,31 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
                 decay_vecs.append(fx.math.exp2(gate * fx.Float32(_LOG2E)))
 
             width = fx.Int32(_WARP_SIZE)
-            for offset in (1, 2, 4):
-                sum_q_partial = sum_q_partial + fx.gpu.shuffle_xor(
-                    sum_q_partial, fx.Int32(offset), width
-                )
-                sum_k_partial = sum_k_partial + fx.gpu.shuffle_xor(
-                    sum_k_partial, fx.Int32(offset), width
-                )
-
-            subgroup_leader = (lane // fx.Int32(_WARP_THREADS_K)) * fx.Int32(
-                _WARP_THREADS_K
-            )
-            norm_q = fx.gpu.shuffle_idx(sum_q_partial, subgroup_leader, width)
-            norm_k = fx.gpu.shuffle_idx(sum_k_partial, subgroup_leader, width)
+            if const_expr(dpp_reduce):
+                # XOR offsets 1/2/4 stay inside a 16-lane DPP row, so this
+                # butterfly combines the same lanes' partials in the same
+                # order as shuffle_xor (bit-identical), at DPP cost (~812 pJ)
+                # instead of ds_swizzle (~1235 pJ) per step.
+                for offset in (1, 2, 4):
+                    sum_q_partial = sum_q_partial + dpp_xor_f32(
+                        sum_q_partial, offset
+                    )
+                    sum_k_partial = sum_k_partial + dpp_xor_f32(
+                        sum_k_partial, offset
+                    )
+            else:
+                for offset in (1, 2, 4):
+                    sum_q_partial = sum_q_partial + fx.gpu.shuffle_xor(
+                        sum_q_partial, fx.Int32(offset), width
+                    )
+                    sum_k_partial = sum_k_partial + fx.gpu.shuffle_xor(
+                        sum_k_partial, fx.Int32(offset), width
+                    )
+            # After the XOR butterfly every lane of the 8-lane subgroup holds
+            # the subgroup total; the old leader broadcast (ds_bpermute,
+            # ~2006 pJ) read back the identical value, so it is gone.
+            norm_q = sum_q_partial
+            norm_k = sum_k_partial
             inv_q = fx.math.rsqrt(fx.Float32(norm_q) + fx.Float32(1e-6))
             inv_k = fx.math.rsqrt(fx.Float32(norm_k) + fx.Float32(1e-6))
 
@@ -250,10 +274,26 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
             for ki in range_constexpr(_K_ITERS):
                 dot_kq_vec = fx.fma(k_vecs[ki], q_vecs[ki], dot_kq_vec)
             dot_kq = fx.Vector(dot_kq_vec).reduce("add")
-            for offset in (1, 2, 4):
-                dot_kq = dot_kq + fx.gpu.shuffle_xor(dot_kq, fx.Int32(offset), width)
+            if const_expr(dpp_reduce):
+                for offset in (1, 2, 4):
+                    dot_kq = dot_kq + dpp_xor_f32(dot_kq, offset)
+            else:
+                for offset in (1, 2, 4):
+                    dot_kq = dot_kq + fx.gpu.shuffle_xor(
+                        dot_kq, fx.Int32(offset), width
+                    )
 
-            beta_value = fx.Float32(raw_beta[batch * stride_beta_token + head])
+            # Wave-uniform beta: one scalar dword load plus SALU
+            # half-select (bf16 is the top half of f32, so the bitcast below
+            # is the exact f32 the vector path converts to).
+            beta_idx = batch * stride_beta_token + head
+            beta_dword = fx.Int32(
+                buf_load_scalar(raw_beta.rsrc, beta_idx >> fx.Int32(1), 1)
+            )
+            beta_shift = fx.Int32(16) - (beta_idx & fx.Int32(1)) * fx.Int32(16)
+            beta_value = ((beta_dword << beta_shift) & fx.Int32(-65536)).bitcast(
+                fx.Float32
+            )
             beta = fx.Float32(1.0) / (
                 fx.Float32(1.0) + fx.math.exp2(-beta_value * fx.Float32(_LOG2E))
             )
@@ -287,17 +327,23 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
 
                 sum_hk = fx.Vector(sum_hk_vec).reduce("add")
                 sum_hq = fx.Vector(sum_hq_vec).reduce("add")
-                for offset in (1, 2, 4):
-                    sum_hk = sum_hk + fx.gpu.shuffle_xor(
-                        sum_hk, fx.Int32(offset), width
-                    )
-                    sum_hq = sum_hq + fx.gpu.shuffle_xor(
-                        sum_hq, fx.Int32(offset), width
-                    )
-
+                if const_expr(dpp_reduce):
+                    for offset in (1, 2, 4):
+                        sum_hk = sum_hk + dpp_xor_f32(sum_hk, offset)
+                        sum_hq = sum_hq + dpp_xor_f32(sum_hq, offset)
+                else:
+                    for offset in (1, 2, 4):
+                        sum_hk = sum_hk + fx.gpu.shuffle_xor(
+                            sum_hk, fx.Int32(offset), width
+                        )
+                        sum_hq = sum_hq + fx.gpu.shuffle_xor(
+                            sum_hq, fx.Int32(offset), width
+                        )
                 conv_v = fx.Float32(fx.ptr_load(v_lds + global_v))
+                # conv_v, sum_hk and beta are each uniform across the 8-lane
+                # subgroup, so v_new already is; the old leader broadcast was
+                # a no-op ds_bpermute.
                 v_new = (conv_v - fx.Float32(sum_hk)) * beta
-                v_new = fx.gpu.shuffle_idx(v_new, subgroup_leader, width)
                 recurrent_value = fx.Float32(sum_hq) + fx.Float32(v_new) * fx.Float32(
                     dot_kq
                 )
@@ -327,10 +373,19 @@ def create_kimi_k3_kda_decode_kernel(norm_eps: float, lower_bound: float):
                 recurrent_bf16 = fx.ptr_load(out_lds + tid)
                 recurrent_f32 = fx.Float32(recurrent_bf16)
                 square = recurrent_f32 * recurrent_f32
-                for offset in (32, 16, 8, 4, 2, 1):
+                for offset in (32, 16, 8):
                     square = square + fx.gpu.shuffle_xor(
                         square, fx.Int32(offset), width
                     )
+                if const_expr(dpp_reduce):
+                    square = square + dpp_xor_f32(square, 4)
+                    square = square + dpp_xor_f32(square, 2)
+                    square = square + dpp_xor_f32(square, 1)
+                else:
+                    for offset in (4, 2, 1):
+                        square = square + fx.gpu.shuffle_xor(
+                            square, fx.Int32(offset), width
+                        )
                 if lane == fx.Int32(0):
                     fx.ptr_store(square, norm_lds + warp)
 
