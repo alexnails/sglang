@@ -103,6 +103,14 @@ logger = logging.getLogger(__name__)
 
 # Use aiter mla persist design for fp8-kv cache
 _use_mla_ps_kernel = get_bool_env_var("SGLANG_AITER_MLA_PERSIST", "True")
+# Kimi K3 decode-band optimization: dispatch the Gluon MLA kernel instead of
+# the asm persistent-split kernel in the shapes where it measurably wins
+# (pcap350d gfx950, fp8 KV, 12 zero-padded heads, energy-protocol A/B):
+#   decode qlen=1, bs<=4: 1.24-1.79x faster, 0.96-1.63x lower energy
+#     (ctx 1k-80k; bs>=8 flips to a 0.90-0.95x loss at long ctx);
+#   verify qlen=7, bs=1:  1.97-2.46x faster, 1.06-2.10x lower energy.
+# asm-PS stays for every other shape, so its metadata path is kept enabled.
+_k3_prefer_gluon_mla = get_bool_env_var("SGLANG_AITER_K3_OPT")
 
 # Use fp8 prefill only on gfx95
 _use_fp8_prefill_attn = (
@@ -1445,6 +1453,27 @@ class AiterAttnBackend(AttentionBackend):
         )
         return False
 
+    def _prefer_gluon_over_asm_ps(self, bs: int, qlen: int) -> bool:
+        """K3 opt-in: take the Gluon MLA kernel for the shapes where the
+        measured A/B has it winning (see module comment), keeping asm-PS for
+        the high-work cells where Gluon's current kernel regresses. Gluon
+        needs no PS schedule metadata, but the metadata stays enabled because
+        asm-PS remains reachable for other shapes. DCP keeps asm PS: Gluon is
+        not validated for gathered-head topologies."""
+        if not (
+            _k3_prefer_gluon_mla
+            and self.dcp_world_size <= 1
+            and prefer_mla_gluon_decode(
+                head_pad_mode=getattr(self, "head_pad_mode", "none"),
+                num_head=getattr(self, "num_head", 0),
+                kv_cache_dtype=self.kv_cache_dtype,
+            )
+        ):
+            return False
+        if qlen <= 1:
+            return bs <= 4
+        return bs * qlen <= 8
+
     def _asm_ps_supports_qlen(self, q_len: int) -> bool:
         """Whether the asm PS dispatch has a kernel for this query length."""
         return q_len <= _MLA_ASM_PS_MAX_QLEN or (
@@ -1744,14 +1773,17 @@ class AiterAttnBackend(AttentionBackend):
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         max_q_len = self.forward_metadata.max_q_len or 1
 
-        if prefer_mla_gluon_decode(
-            head_pad_mode=getattr(self, "head_pad_mode", "none"),
-            num_head=getattr(self, "num_head", layer.tp_q_head_num),
-            kv_cache_dtype=self.kv_cache_dtype,
-        ) and not (
-            _use_mla_ps_kernel
-            and self.mla_decode_backend == "asm"
-            and self._asm_ps_supports_qlen(max_q_len)
+        if self._prefer_gluon_over_asm_ps(q.shape[0] // max_q_len, max_q_len) or (
+            prefer_mla_gluon_decode(
+                head_pad_mode=getattr(self, "head_pad_mode", "none"),
+                num_head=getattr(self, "num_head", layer.tp_q_head_num),
+                kv_cache_dtype=self.kv_cache_dtype,
+            )
+            and not (
+                _use_mla_ps_kernel
+                and self.mla_decode_backend == "asm"
+                and self._asm_ps_supports_qlen(max_q_len)
+            )
         ):
             return mla_gluon_decode(
                 q=q,
@@ -4238,14 +4270,20 @@ class AiterAttnBackend(AttentionBackend):
                         )
                     return o
             elif forward_batch.forward_mode.is_target_verify():
-                if prefer_mla_gluon_decode(
-                    head_pad_mode=getattr(self, "head_pad_mode", "none"),
-                    num_head=getattr(self, "num_head", layer.tp_q_head_num),
-                    kv_cache_dtype=self.kv_cache_dtype,
-                ) and not (
-                    _use_mla_ps_kernel
-                    and self.mla_verify_backend == "asm"
-                    and self._asm_ps_supports_qlen(self.forward_metadata.max_q_len or 1)
+                if self._prefer_gluon_over_asm_ps(
+                    q.shape[0] // (self.forward_metadata.max_q_len or 1),
+                    self.forward_metadata.max_q_len or 1,
+                ) or (
+                    prefer_mla_gluon_decode(
+                        head_pad_mode=getattr(self, "head_pad_mode", "none"),
+                        num_head=getattr(self, "num_head", layer.tp_q_head_num),
+                        kv_cache_dtype=self.kv_cache_dtype,
+                    )
+                    and not (
+                        _use_mla_ps_kernel
+                        and self.mla_verify_backend == "asm"
+                        and self._asm_ps_supports_qlen(self.forward_metadata.max_q_len or 1)
+                    )
                 ):
                     return mla_gluon_decode(
                         q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
