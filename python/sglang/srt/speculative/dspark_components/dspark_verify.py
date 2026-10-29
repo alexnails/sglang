@@ -120,13 +120,20 @@ class TargetVerifyExecutor:
     ) -> None:
         self.target_worker = target_worker
         # candidate_max_seq_len_upper_bound only feeds the V4.1 candidate graphs.
-        self._target_is_dsv41 = (
-            getattr(
-                target_worker.model_runner.model_config.hf_text_config,
-                "model_type",
-                None,
-            )
-            == "deepseek_v41"
+        target_model_type = getattr(
+            target_worker.model_runner.model_config.hf_text_config,
+            "model_type",
+            None,
+        )
+        self._target_is_dsv41 = target_model_type == "deepseek_v41"
+        # Fused row-argmax for greedy verify is a per-target opt-in: the kernel
+        # does not reproduce torch.argmax's NaN selection (see
+        # dspark_accept._row_argmax), so it is enabled only for targets whose
+        # verify logits are finite in practice. Shapes/dtype/contiguity are
+        # still re-checked per call inside _row_argmax.
+        self._target_fused_argmax_ok = target_model_type in (
+            "deepseek_v41",
+            "kimi_k3",
         )
         self.gamma = int(gamma)
         self.verify_num_draft_tokens = verify_num_draft_tokens
@@ -177,7 +184,7 @@ class TargetVerifyExecutor:
             gamma=self.gamma,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             cutoff_layout=layout,
-            fused_argmax=self._target_is_dsv41,
+            fused_argmax=self._target_fused_argmax_ok,
             block_verification=self._block_verification,
         )
         sync_site = (

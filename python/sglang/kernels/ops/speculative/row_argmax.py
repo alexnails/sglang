@@ -132,8 +132,15 @@ def _medium_row_argmax(x, divisor=None):
 
 
 def row_argmax(x: torch.Tensor) -> torch.Tensor:
-    """``x.argmax(dim=-1)`` for FP32 speculative logits with a wide vocab."""
-    assert x.dim() == 2 and x.dtype == torch.float32 and x.stride(1) == 1
+    """``x.argmax(dim=-1)`` for speculative logits with a wide vocab.
+
+    FP32/BF16/FP16 inputs: low-precision loads compare exactly (ties still
+    resolve to the lowest index) and partial maxima upcast losslessly into
+    the FP32 tile buffers. NaN selection still differs from torch.argmax —
+    see ``_argmax_pair`` — so call sites opt in per target.
+    """
+    assert x.dim() == 2 and x.stride(1) == 1
+    assert x.dtype in (torch.float32, torch.bfloat16, torch.float16)
     rows, n = x.shape
     if rows > 64:
         return _medium_row_argmax(x)
