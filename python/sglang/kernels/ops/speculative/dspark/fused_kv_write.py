@@ -4,6 +4,19 @@ import torch
 import triton
 import triton.language as tl
 
+@triton.jit
+def _saturate_to_fp8_range(val):
+    """Clamp into the fp8_e4m3 range, leaving NaN untouched.
+
+    Mirrors ``saturate_to_fp8_range`` /
+    ``cache_move._saturate_to_fp8_range`` (the production KV-commit fp8
+    writers): comparisons against NaN are false, so NaN falls through both
+    arms into the fp8 NaN encoding. 448.0 (the fp8_e4m3fn finite max) is
+    exact in bf16, so clamping the bf16 value loses nothing.
+    """
+    val = tl.where(val > 448.0, 448.0, val).to(tl.bfloat16)
+    return tl.where(val < -448.0, -448.0, val).to(tl.bfloat16)
+
 
 @triton.jit
 def _fused_kv_norm_rope_write_kernel(
@@ -22,6 +35,7 @@ def _fused_kv_norm_rope_write_kernel(
     EPS: tl.constexpr,
     HAS_COMMIT_LENS: tl.constexpr,
     IS_NEOX: tl.constexpr,
+    IS_FP8: tl.constexpr,
 ):
     t = tl.program_id(0).to(tl.int64)
     l = tl.program_id(1).to(tl.int64)
@@ -52,8 +66,12 @@ def _fused_kv_norm_rope_write_kernel(
     knw1 = tl.load(knw_ptr + l * D + off1).to(tl.float32)
     knw2 = tl.load(knw_ptr + l * D + off2).to(tl.float32)
 
-    k_buf = tl.load(meta_ptr + l * 4 + 0).to(tl.pointer_type(tl.bfloat16))
-    v_buf = tl.load(meta_ptr + l * 4 + 1).to(tl.pointer_type(tl.bfloat16))
+    if IS_FP8:
+        k_buf = tl.load(meta_ptr + l * 4 + 0).to(tl.pointer_type(tl.float8e4nv))
+        v_buf = tl.load(meta_ptr + l * 4 + 1).to(tl.pointer_type(tl.float8e4nv))
+    else:
+        k_buf = tl.load(meta_ptr + l * 4 + 0).to(tl.pointer_type(tl.bfloat16))
+        v_buf = tl.load(meta_ptr + l * 4 + 1).to(tl.pointer_type(tl.bfloat16))
     ks0 = tl.load(meta_ptr + l * 4 + 2)
     vs0 = tl.load(meta_ptr + l * 4 + 3)
 
@@ -73,11 +91,21 @@ def _fused_kv_norm_rope_write_kernel(
         k2 = (tl.load(row + h * D + off2).to(tl.float32) * inv * knw2).to(tl.bfloat16)
         o1 = k1 * cos16 - k2 * sin16
         o2 = k2 * cos16 + k1 * sin16
-        tl.store(k_buf + loc * ks0 + h * D + off1, o1)
-        tl.store(k_buf + loc * ks0 + h * D + off2, o2)
-
         v = tl.load(row + KV + h * D + d_ar)
-        tl.store(v_buf + loc * vs0 + h * D + d_ar, v)
+        if IS_FP8:
+            # fp8 pool: match the production unit-scale eager path
+            # (MHATokenToKVPool.set_kv_buffer_* with k_scale/v_scale=None):
+            # saturate_to_fp8_range on the bf16 value, then the fp8 cast.
+            o1 = _saturate_to_fp8_range(o1)
+            o2 = _saturate_to_fp8_range(o2)
+            v = _saturate_to_fp8_range(v)
+            tl.store(k_buf + loc * ks0 + h * D + off1, o1.to(tl.float8e4nv))
+            tl.store(k_buf + loc * ks0 + h * D + off2, o2.to(tl.float8e4nv))
+            tl.store(v_buf + loc * vs0 + h * D + d_ar, v.to(tl.float8e4nv))
+        else:
+            tl.store(k_buf + loc * ks0 + h * D + off1, o1)
+            tl.store(k_buf + loc * ks0 + h * D + off2, o2)
+            tl.store(v_buf + loc * vs0 + h * D + d_ar, v)
 
 
 def fused_kv_norm_rope_write(
@@ -94,6 +122,7 @@ def fused_kv_norm_rope_write(
     commit_lens: Optional[torch.Tensor] = None,
     locs_row_width: Optional[int] = None,
     is_neox_style: bool = True,
+    is_fp8: bool = False,
 ) -> None:
     """Write per-layer normed+roped K and raw V rows into the KV pools.
 
@@ -103,6 +132,9 @@ def fused_kv_norm_rope_write(
     replacement for masking the tail columns to -1 on the host.
 
     is_neox_style selects the RoPE rotation pairing (neox or interleaved).
+    is_fp8 says the pool buffers pointed to by ``meta`` are fp8_e4m3fn
+    (unit-scale: values are saturated into the fp8 range and cast, matching
+    the pool's eager k_scale=None write path) instead of bfloat16.
     """
     T = kv.shape[0]
     if T == 0:
@@ -141,4 +173,5 @@ def fused_kv_norm_rope_write(
         EPS=eps,
         HAS_COMMIT_LENS=has_commit_lens,
         IS_NEOX=is_neox_style,
+        IS_FP8=is_fp8,
     )

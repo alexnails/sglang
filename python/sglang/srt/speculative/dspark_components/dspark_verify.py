@@ -79,6 +79,25 @@ class TargetVerifyResult(msgspec.Struct, frozen=True):
     can_run_cuda_graph: bool
 
 
+def _fused_argmax_ok_for_target(model_config) -> bool:
+    """Opt-in gate for the fused greedy-verify row-argmax.
+
+    The kernel does not reproduce torch.argmax's NaN selection (see
+    dspark_accept._row_argmax), so it is enabled only for targets whose
+    verify logits are finite in practice. Shapes/dtype/contiguity are still
+    re-checked per call inside _row_argmax.
+
+    Kimi-K3 is a composite config: the top-level hf_config reports model_type
+    "kimi_k3" while hf_text_config (the decoder) reports "kimi_linear" —
+    match either spelling, standalone or nested.
+    """
+    model_types = {
+        getattr(model_config.hf_text_config, "model_type", None),
+        getattr(model_config.hf_config, "model_type", None),
+    }
+    return bool(model_types & {"deepseek_v41", "kimi_k3", "kimi_linear"})
+
+
 def candidate_request_length_bound(
     reqs, pending_verify_tokens: int = 0
 ) -> Optional[int]:
@@ -126,14 +145,8 @@ class TargetVerifyExecutor:
             None,
         )
         self._target_is_dsv41 = target_model_type == "deepseek_v41"
-        # Fused row-argmax for greedy verify is a per-target opt-in: the kernel
-        # does not reproduce torch.argmax's NaN selection (see
-        # dspark_accept._row_argmax), so it is enabled only for targets whose
-        # verify logits are finite in practice. Shapes/dtype/contiguity are
-        # still re-checked per call inside _row_argmax.
-        self._target_fused_argmax_ok = target_model_type in (
-            "deepseek_v41",
-            "kimi_k3",
+        self._target_fused_argmax_ok = _fused_argmax_ok_for_target(
+            target_worker.model_runner.model_config
         )
         self.gamma = int(gamma)
         self.verify_num_draft_tokens = verify_num_draft_tokens

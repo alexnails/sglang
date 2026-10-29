@@ -600,6 +600,12 @@ class DSparkDraftMixin:
             if attn.qkv_proj.bias is not None:
                 return None
             if attn.attn.k_scale is not None or attn.attn.v_scale is not None:
+                # The fused writer implements the unit-scale path only
+                # (saturate + cast); calibrated per-tensor scales fall back.
+                logger.warning_once(
+                    "DSpark fused KV commit disabled: k_scale/v_scale set on "
+                    f"layer {attn.attn.layer_id}; using the unfused chain."
+                )
                 return None
             if attn.head_dim != head_dim or attn.kv_size != kv_size:
                 return None
@@ -614,8 +620,14 @@ class DSparkDraftMixin:
             k_buf = pool.get_key_buffer(attn.attn.layer_id)
             v_buf = pool.get_value_buffer(attn.attn.layer_id)
             nh = kv_size // head_dim
+            if k_buf.dtype != v_buf.dtype:
+                return None
             for buf in (k_buf, v_buf):
-                if buf.dtype != torch.bfloat16:
+                if buf.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+                    logger.warning_once(
+                        "DSpark fused KV commit disabled: unsupported pool "
+                        f"dtype {buf.dtype}; using the unfused chain."
+                    )
                     return None
                 if buf.shape[1:] != (nh, head_dim):
                     return None
@@ -637,7 +649,18 @@ class DSparkDraftMixin:
         # which dtype=torch.int64 rejects while unpacking; pack unsigned and view.
         meta = make_ptr_table(meta_rows, device=device)
         cos_sin = rotary.cos_sin_cache.to(device)
-        return (w_all, meta, knw, cos_sin, eps, len(layers), kv_size, head_dim)
+        is_fp8 = pool.get_key_buffer(attn0.attn.layer_id).dtype == torch.float8_e4m3fn
+        return (
+            w_all,
+            meta,
+            knw,
+            cos_sin,
+            eps,
+            len(layers),
+            kv_size,
+            head_dim,
+            is_fp8,
+        )
 
     def _stacked_ctx_kv_params(self) -> Optional[dict]:
         """Stack every layer's KV projection into one weight (exact: the input
@@ -700,7 +723,17 @@ class DSparkDraftMixin:
                 fused_kv_norm_rope_write,
             )
 
-            w_all, meta, knw, cos_sin, eps, num_layers, kv_size, head_dim = bundle
+            (
+                w_all,
+                meta,
+                knw,
+                cos_sin,
+                eps,
+                num_layers,
+                kv_size,
+                head_dim,
+                is_fp8,
+            ) = bundle
             kv_all = F.linear(ctx_hidden, w_all)
             if cache_loc_2d is not None and commit_lens is not None:
                 locs = cache_loc_2d.reshape(-1)
@@ -724,6 +757,7 @@ class DSparkDraftMixin:
                 commit_lens=write_commit_lens,
                 locs_row_width=locs_row_width,
                 is_neox_style=self.layers[0].self_attn.rotary_emb.is_neox_style,
+                is_fp8=is_fp8,
             )
             return
 
